@@ -439,7 +439,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         }
         const feedbackRules = await this.readFeedbackRules();
         const requests = chosen.length *
-            (((0, types_1.hasAnalysisTask)(effective) ? 1 : 0) + (effective.email ? 1 : 0));
+            (((0, types_1.needsAnalysisRequest)(tasks) ? 1 : 0) + (effective.email ? 1 : 0));
         const confirmed = await (0, confirm_1.confirm)(this.app, {
             title: "确认执行 AI 任务",
             confirmText: `确认执行（约 ${requests} 个请求）`,
@@ -3582,6 +3582,7 @@ exports.cloneTasks = cloneTasks;
 exports.hasAnalysisTask = hasAnalysisTask;
 exports.effectiveTasks = effectiveTasks;
 exports.anyTask = anyTask;
+exports.needsAnalysisRequest = needsAnalysisRequest;
 exports.EMAIL_STATUSES = [
     "Generated",
     "Revision",
@@ -3632,6 +3633,18 @@ function anyTask(tasks) {
         tasks.contactRecommendation ||
         tasks.email ||
         tasks.sendTime);
+}
+/**
+ * Whether a separate analysis request is needed.
+ *
+ * When only an email is requested, the email request already selects the
+ * recipient, so a second analysis call would be wasted tokens.
+ */
+function needsAnalysisRequest(tasks) {
+    return (tasks.customerType ||
+        tasks.opportunity ||
+        tasks.risk ||
+        (tasks.contactRecommendation && !tasks.email));
 }
 exports.TASK_LABELS = {
     customerType: "分析 Customer Type",
@@ -5667,7 +5680,7 @@ class Pipeline {
         const system = (0, prompt_1.buildSystemPrompt)();
         let analysis = null;
         let rawAnalysis = null;
-        if ((0, types_1.hasAnalysisTask)(tasks)) {
+        if ((0, types_1.needsAnalysisRequest)(tasks)) {
             const analysisPrompt = (0, prompt_1.buildAnalysisUserPrompt)({
                 knowledge: this.deps.knowledge,
                 feedbackRules: this.deps.feedbackRules,

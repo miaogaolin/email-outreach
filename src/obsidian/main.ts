@@ -57,6 +57,7 @@ import {
 	cloneTasks,
 	effectiveTasks,
 	hasAnalysisTask,
+	needsAnalysisRequest,
 	TASK_LABELS,
 } from "../core/types";
 import {
@@ -564,7 +565,7 @@ export default class EmailOutreachPlugin
 		const feedbackRules = await this.readFeedbackRules();
 		const requests =
 			chosen.length *
-			((hasAnalysisTask(effective) ? 1 : 0) + (effective.email ? 1 : 0));
+			((needsAnalysisRequest(tasks) ? 1 : 0) + (effective.email ? 1 : 0));
 
 		const confirmed = await confirm(this.app, {
 			title: "确认执行 AI 任务",

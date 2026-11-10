@@ -29,7 +29,7 @@ import type {
 	RunProgress,
 	TaskSelection,
 } from "../core/types";
-import { hasAnalysisTask } from "../core/types";
+import { hasAnalysisTask, needsAnalysisRequest } from "../core/types";
 import { AIClient, CanceledError, type CancelToken } from "./ai-client";
 import type { CustomerRepo } from "./customer-repo";
 import type { Settings } from "./settings";
@@ -241,7 +241,7 @@ export class Pipeline {
 		let analysis: AnalysisResult | null = null;
 		let rawAnalysis: string | null = null;
 
-		if (hasAnalysisTask(tasks)) {
+		if (needsAnalysisRequest(tasks)) {
 			const analysisPrompt = buildAnalysisUserPrompt({
 				knowledge: this.deps.knowledge,
 				feedbackRules: this.deps.feedbackRules,

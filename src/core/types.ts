@@ -144,6 +144,21 @@ export function anyTask(tasks: TaskSelection): boolean {
 	);
 }
 
+/**
+ * Whether a separate analysis request is needed.
+ *
+ * When only an email is requested, the email request already selects the
+ * recipient, so a second analysis call would be wasted tokens.
+ */
+export function needsAnalysisRequest(tasks: TaskSelection): boolean {
+	return (
+		tasks.customerType ||
+		tasks.opportunity ||
+		tasks.risk ||
+		(tasks.contactRecommendation && !tasks.email)
+	);
+}
+
 export const TASK_LABELS: Record<keyof TaskSelection, string> = {
 	customerType: "分析 Customer Type",
 	opportunity: "评估 Opportunity（Fit / Intent / Potential）",
