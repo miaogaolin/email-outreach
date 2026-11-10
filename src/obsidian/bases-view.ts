@@ -265,8 +265,15 @@ export interface BasesRegistrar {
 export function registerBasesView(
 	plugin: OutreachPluginApi & BasesRegistrar,
 ): boolean {
-	// Loaded lazily so the plugin still boots on Obsidian versions without Bases.
-	const runtime = require("obsidian") as { BasesView?: unknown };
+	// Loaded lazily so the plugin still boots on Obsidian versions without
+	// Bases (or on mobile, where require may not exist).
+	if (typeof require !== "function") return false;
+	let runtime: { BasesView?: unknown };
+	try {
+		runtime = require("obsidian") as { BasesView?: unknown };
+	} catch {
+		return false;
+	}
 	const BaseClass = runtime.BasesView as
 		| (new (controller: unknown) => {
 				type: string;

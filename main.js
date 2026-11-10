@@ -4089,8 +4089,17 @@ function renderBasesRoot(root, view, plugin) {
  * (1.10+). Returns false when the view could not be registered.
  */
 function registerBasesView(plugin) {
-    // Loaded lazily so the plugin still boots on Obsidian versions without Bases.
-    const runtime = require("obsidian");
+    // Loaded lazily so the plugin still boots on Obsidian versions without
+    // Bases (or on mobile, where require may not exist).
+    if (typeof require !== "function")
+        return false;
+    let runtime;
+    try {
+        runtime = require("obsidian");
+    }
+    catch (_a) {
+        return false;
+    }
     const BaseClass = runtime.BasesView;
     if (!BaseClass || typeof plugin.registerBasesView !== "function") {
         return false;

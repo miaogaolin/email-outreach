@@ -2,6 +2,7 @@ node_modules/
 .test-build/
 .npm-cache/
 data.json
+.write-probe
 *.log
 *.tsbuildinfo
 .DS_Store
