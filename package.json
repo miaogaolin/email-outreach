@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-email-outreach",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI outreach workbench for Obsidian: filter customers, parse contacts, analyze with AI, review and save outreach emails as Markdown.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node scripts/build.mjs --dev",
+    "build": "node scripts/build.mjs",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "test": "node scripts/test.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "ai",
+    "email",
+    "outreach"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "obsidian": "^1.14.4",
+    "typescript": "^5.9.3"
+  }
+}
