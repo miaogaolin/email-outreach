@@ -14,7 +14,18 @@ const TAG_RE = /#[A-Za-z0-9_][A-Za-z0-9_/-]*/g;
 const PHONE_RE = /\+?\d[\d\s().-]{5,}\d/g;
 const ROLE_LINE_RE =
 	/^\s*(?:\*\*)?(职位|职位名称|职务|role|title)(?:\*\*)?\s*[：:]\s*(.+)$/i;
-const ROLE_PAREN_RE = /^(.*?)[（(]\s*([^（）()]+?)\s*[）)]\s*$/;
+/** 一段小括号（中英文均可）；只匹配不嵌套的写法。 */
+const PAREN_GROUP_RE = /[（(]([^（）()]*)[）)]/g;
+const CJK_RE = /[\u3400-\u9fff]/;
+/**
+ * 括号在行中出现时，只有括号内容像职位才当成身份，避免把
+ * `Alena (Ingram) Godfrey 采购` 这种名字里的中间名误判成职位。
+ */
+const ROLE_WORD_RE =
+	/\b(?:ceo|cto|cfo|coo|cio|cpo|owner|founder|co-?founder|president|vice[ -]?president|vp|manager|director|directora|buyer|purchas\w*|procure\w*|sourc\w*|engineer|supervisor|partner|head|lead|chief|officer|sales|account|representative|assistant|admin\w*|coordinator|specialist|analyst|consultant|gerente|jefe|presidente)\b/i;
+/** `姓名(身份)` 开头；用于判定带备注的姓名行（备注可以很长或以句号结尾）。 */
+const NAMED_ROLE_LINE_RE =
+	/^([^（()）]{1,40}?)[ \t\u3000]*[（(]\s*([^（）()]{1,40}?)\s*[）)]/;
 
 interface TokenBag {
 	emails: string[];
@@ -131,24 +142,53 @@ function extractTokens(text: string): TokenBag {
 function cleanText(text: string): string {
 	return text
 		.replace(/\*\*/g, "")
-		.replace(/[ \t]+/g, " ")
+		.replace(/[\u200b-\u200d\ufeff]/g, "")
+		.replace(/\s+/g, " ")
 		.replace(/^[\s\-–—:：,，、|]+/, "")
 		.replace(/[\s\-–—:：,，、|]+$/, "")
 		.trim();
 }
 
+/**
+ * Split a contact line into name / parenthesized role / trailing remark.
+ *
+ * Supported shapes (both full-width and ASCII parentheses, spaces allowed
+ * between the name and the parenthesis):
+ * - `Daniel Mueller(采购)`
+ * - `Daniel Mueller （采购） — 负责德国`
+ * - `John Smith (Buyer) intro call next week`
+ *
+ * The text after the parenthesis is returned as `rest` so callers can keep it
+ * as a note. A mid-line parenthesis only counts as a role when its content
+ * looks like one, so `Alena (Ingram) Godfrey 采购` keeps its full name.
+ */
 function splitNameAndRole(text: string): {
 	name: string;
 	role: string | null;
+	rest: string;
 } {
 	const cleaned = cleanText(text);
-	const paren = cleaned.match(ROLE_PAREN_RE);
-	if (paren) {
-		const name = cleanText(paren[1] ?? "");
-		const role = cleanText(paren[2] ?? "");
-		return { name, role: role || null };
+	for (const match of cleaned.matchAll(PAREN_GROUP_RE)) {
+		const role = cleanText(match[1] ?? "");
+		if (!role) continue;
+		const index = match.index ?? 0;
+		const before = cleanText(cleaned.slice(0, index));
+		const after = cleanText(cleaned.slice(index + match[0].length));
+		const atEnd = after.length === 0;
+		const looksLikeRole = CJK_RE.test(role) || ROLE_WORD_RE.test(role);
+		if (!atEnd && !looksLikeRole) continue;
+		return { name: before, role, rest: after };
 	}
-	return { name: cleaned, role: null };
+	return { name: cleaned, role: null, rest: "" };
+}
+
+/** 名称行里括号身份后面的备注 + 标签，一起收进联系人备注。 */
+function contactNotes(rest: string, tags: string[]): string[] {
+	const notes: string[] = [];
+	// 括号后面只剩句末标点时不算备注。
+	if (rest && !/^[。.!！?？;；]+$/.test(rest)) notes.push(rest);
+	if (tags.length > 0) notes.push(`标签：${tags.join(" ")}`);
+	return notes;
 }
 
 function normalizeIndent(line: string): string {
@@ -235,12 +275,34 @@ export function parseContacts(markdown: string): ContactParseResult {
 		plainMode = false;
 	};
 
+	/**
+	 * `姓名(身份)` 开头的行即使备注很长、以句号结尾，也仍然按姓名行处理，
+	 * 否则括号后的备注会让整条联系人被当成散文吞掉。
+	 */
+	const looksLikeNamedRoleLine = (value: string): boolean => {
+		if (value.length > 120) return false;
+		if (/^[|>]/.test(value)) return false;
+		const match = value.match(NAMED_ROLE_LINE_RE);
+		if (!match) return false;
+		const namePart = (match[1] ?? "").trim();
+		const rolePart = (match[2] ?? "").trim();
+		if (!namePart || !rolePart) return false;
+		// 中文和英文混在姓名里更像散文（“我们和 John”），不当联系人。
+		if (CJK_RE.test(namePart) && /[A-Za-z]/.test(namePart)) return false;
+		return CJK_RE.test(rolePart) || ROLE_WORD_RE.test(rolePart);
+	};
+
 	const looksLikeNameLine = (text: string): boolean => {
 		const value = text.trim();
-		if (!value || value.length > 60) return false;
-		if (/[。.!！?？；;:：]$/.test(value)) return false;
-		if (/^[|>]/.test(value)) return false;
-		return true;
+		if (!value) return false;
+		if (
+			value.length <= 60 &&
+			!/[。.!！?？；;:：]$/.test(value) &&
+			!/^[|>]/.test(value)
+		) {
+			return true;
+		}
+		return looksLikeNamedRoleLine(value);
 	};
 
 	const nextNonEmptyIndent = (from: number): number => {
@@ -283,7 +345,7 @@ export function parseContacts(markdown: string): ContactParseResult {
 				emails: tokens.emails,
 				phones: tokens.phones,
 				links: tokens.links,
-				notes: tokens.tags.length > 0 ? [`标签：${tokens.tags.join(" ")}`] : [],
+				notes: contactNotes(split.rest, tokens.tags),
 				line: i + 1,
 			};
 			plainMode = true;
@@ -302,15 +364,15 @@ export function parseContacts(markdown: string): ContactParseResult {
 					nextNonEmptyIndent(i + 1) > 0);
 			if (looksLikeNewBulletContact) {
 				flush();
+				const split = splitNameAndRole(preview.rest);
 				current = {
 					raw: trimmed.replace(/^[-*+]\s+/, ""),
-					name: splitNameAndRole(preview.rest).name,
-					role: splitNameAndRole(preview.rest).role,
+					name: split.name,
+					role: split.role,
 					emails: preview.emails,
 					phones: preview.phones,
 					links: preview.links,
-					notes:
-						preview.tags.length > 0 ? [`标签：${preview.tags.join(" ")}`] : [],
+					notes: contactNotes(split.rest, preview.tags),
 					line: i + 1,
 				};
 				plainMode = false;

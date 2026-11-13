@@ -115,6 +115,92 @@ test("parenthesized role on the name line", () => {
 	assert(contact.phones.length === 1, "电话");
 });
 
+const ROLE_REMARKS = `## Contact
+- Collin See(工程师) 合伙人
+	- collin@example.com
+- Don Swope（首席运营官） 合伙人
+	- don@example.com
+- Dave Kuehneman（销售市场总监）— 负责美国西部
+	- dave@example.com
+- John Smith (Buyer) intro call next week
+	- john@example.com
+- Daniel Mueller(采购)，老客户，德国
+	- daniel@example.com
+- Maria Lopez(老板) 老客户 maria@example.com
+	- maria.alt@example.com
+- Peter Pan(采购)。
+	- peter@example.com
+`;
+
+test("parenthesized role with a trailing remark", () => {
+	const result = parseContacts(ROLE_REMARKS);
+	assertEqual(result.contacts.length, 7, "七段联系人");
+	const collin = result.contacts[0]!;
+	assertEqual(collin.name, "Collin See", "括号前的姓名");
+	assertEqual(collin.role, "工程师", "括号里的身份");
+	assert(collin.notes.includes("合伙人"), "括号后的备注");
+	assertEqual(result.contacts[1]!.name, "Don Swope", "全角括号姓名");
+	assertEqual(result.contacts[1]!.role, "首席运营官", "全角括号身份");
+	assert(result.contacts[1]!.notes.includes("合伙人"), "全角括号后备注");
+	assertEqual(result.contacts[2]!.role, "销售市场总监", "破折号后备注");
+	assert(result.contacts[2]!.notes.includes("负责美国西部"), "破折号备注保留");
+	assertEqual(result.contacts[3]!.role, "Buyer", "英文身份");
+	assert(
+		result.contacts[3]!.notes.some((note) => note.includes("intro call next week")),
+		"英文备注",
+	);
+	assertEqual(result.contacts[4]!.role, "采购", "逗号分隔备注");
+	assert(result.contacts[4]!.notes.includes("老客户，德国"), "逗号后备注");
+	assertEqual(result.contacts[5]!.role, "老板", "姓名行带邮箱");
+	assertEqual(
+		result.contacts[5]!.emails,
+		["maria@example.com", "maria.alt@example.com"],
+		"姓名行和子项邮箱都在",
+	);
+	assert(result.contacts[5]!.notes.includes("老客户"), "邮箱前面的备注");
+	assertEqual(result.contacts[6]!.role, "采购", "句号结尾仍识别身份");
+	assertEqual(result.contacts[6]!.notes.length, 0, "只有句号不算备注");
+});
+
+test("parenthesized role tolerates spaces before the parenthesis", () => {
+	const result = parseContacts(`## 联系人
+- Daniel Mueller (采购) 备注
+	- daniel@example.com
+- Anna Schmidt\u3000（采购/供应链）负责德国
+	- anna@example.com
+`);
+	assertEqual(result.contacts.length, 2, "两段联系人");
+	assertEqual(result.contacts[0]!.name, "Daniel Mueller", "半角括号前有空格");
+	assertEqual(result.contacts[0]!.role, "采购", "半角括号身份");
+	assert(result.contacts[0]!.notes.includes("备注"), "半角括号后备注");
+	assertEqual(result.contacts[1]!.name, "Anna Schmidt", "全角空格不算姓名");
+	assertEqual(result.contacts[1]!.role, "采购/供应链", "全角空格 + 全角括号");
+	assert(result.contacts[1]!.notes.includes("负责德国"), "全角括号后备注");
+});
+
+test("a middle-name parenthesis is not mistaken for a role", () => {
+	const result = parseContacts(
+		"## 联系人\n- Alena (Ingram) Godfrey 采购\n\t- godfreya@example.com\n",
+	);
+	assertEqual(result.contacts.length, 1, "一个联系人");
+	assertEqual(
+		result.contacts[0]!.name,
+		"Alena (Ingram) Godfrey 采购",
+		"中间名保留在姓名里",
+	);
+	assertEqual(result.contacts[0]!.role, null, "中间名不当身份");
+});
+
+test("parenthesized role on a plain name line keeps the remark", () => {
+	const result = parseContacts(
+		"## 联系人\n\nAndrew Bender(老板) 老客户\n- ab@anchortex.com\n",
+	);
+	assertEqual(result.contacts.length, 1, "一个联系人");
+	assertEqual(result.contacts[0]!.name, "Andrew Bender", "姓名");
+	assertEqual(result.contacts[0]!.role, "老板", "括号身份");
+	assert(result.contacts[0]!.notes.includes("老客户"), "备注");
+});
+
 test("top-level items that are only emails", () => {
 	const result = parseContacts(CESSA);
 	assertEqual(result.contacts.length, 2, "两个邮箱联系人");
