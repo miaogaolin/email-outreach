@@ -242,6 +242,53 @@ function safeTimezone(value: string | null | undefined): string | null {
 }
 
 /**
+ * 把「客户当地时间 + 客户时区」换算成北京时间，用于界面展示。
+ *
+ * 落盘仍然保存客户当地时间 + 时区，这样跟进节奏和客户作息不变；
+ * 展示时统一换算，避免团队每次自己心算时差。
+ */
+export function formatBeijingTime(
+	suggestedTime: string | null | undefined,
+	timezone?: string | null,
+): string | null {
+	if (typeof suggestedTime !== "string") return null;
+	const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(
+		suggestedTime.trim(),
+	);
+	if (!match) return null;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const hour = Number(match[4]);
+	const minute = Number(match[5]);
+	if (
+		month < 1 ||
+		month > 12 ||
+		day < 1 ||
+		day > 31 ||
+		hour > 23 ||
+		minute > 59
+	) {
+		return null;
+	}
+	const check = new Date(Date.UTC(year, month - 1, day));
+	if (
+		check.getUTCFullYear() !== year ||
+		check.getUTCMonth() !== month - 1 ||
+		check.getUTCDate() !== day
+	) {
+		return null;
+	}
+	const sourceZone = safeTimezone(timezone) ?? BEIJING_TIMEZONE;
+	const target = zonedTimeToUtc(
+		{ year, month, day, hour, minute },
+		sourceZone,
+	);
+	const beijing = partsInZone(target, BEIJING_TIMEZONE);
+	return `${formatDate(beijing)} ${pad(beijing.hour)}:${pad(beijing.minute)}`;
+}
+
+/**
  * 根据「地区」解析客户时区。
  * 多时区国家先看城市/区域关键词，再看国家默认时区，最后回退北京时间。
  */

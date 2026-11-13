@@ -332,7 +332,7 @@ export class Pipeline {
 			emailHistory: existingEmails,
 		});
 		const outcome = await this.requestValidated(
-			buildSystemPrompt(MAX_EMAILS_PER_CUSTOMER),
+			buildSystemPrompt(settings.emailSystemPrompt, MAX_EMAILS_PER_CUSTOMER),
 			emailPrompt,
 			validationContext,
 			options.token,

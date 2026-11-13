@@ -1,4 +1,8 @@
 import type { FilterConfig } from "../core/filters";
+import {
+	DEFAULT_EMAIL_SYSTEM_PROMPT,
+	DEFAULT_RULE_SYSTEM_PROMPT,
+} from "../core/prompt";
 
 export interface ColumnPreference {
 	key: string;
@@ -45,6 +49,10 @@ export interface Settings {
 	maxKnowledgeFiles: number;
 	knowledgeDepth: number;
 
+	// System prompts（可在设置里动态调整；空字符串表示用内置默认值）
+	emailSystemPrompt: string;
+	ruleSystemPrompt: string;
+
 	// Session-ish state that must survive restarts
 	selectedCustomers: string[];
 }
@@ -78,6 +86,9 @@ export const DEFAULT_SETTINGS: Settings = {
 	maxKnowledgeChars: 60000,
 	maxKnowledgeFiles: 20,
 	knowledgeDepth: 2,
+
+	emailSystemPrompt: DEFAULT_EMAIL_SYSTEM_PROMPT,
+	ruleSystemPrompt: DEFAULT_RULE_SYSTEM_PROMPT,
 
 	selectedCustomers: [],
 };

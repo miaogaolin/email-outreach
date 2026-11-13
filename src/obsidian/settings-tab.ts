@@ -10,6 +10,10 @@ import {
 	formatAILogTime,
 	type AILogEntry,
 } from "../core/ai-log";
+import {
+	DEFAULT_EMAIL_SYSTEM_PROMPT,
+	DEFAULT_RULE_SYSTEM_PROMPT,
+} from "../core/prompt";
 import { getConfigProblems, type WorkbenchMode } from "./settings";
 import type { OutreachPluginApi } from "./plugin-api";
 import { confirm } from "./modals/confirm";
@@ -53,11 +57,77 @@ async function copyText(text: string): Promise<void> {
 }
 
 export class EmailOutreachSettingTab extends PluginSettingTab {
+	private promptSaveTimer: number | null = null;
+
 	constructor(
 		app: App,
 		private host: SettingsHost,
 	) {
 		super(app, host as unknown as import("obsidian").Plugin);
+	}
+
+	/** 系统提示词很长：输入时先更新内存，停止输入后再落盘。 */
+	private updatePromptSetting(apply: () => void): void {
+		apply();
+		if (this.promptSaveTimer !== null) {
+			window.clearTimeout(this.promptSaveTimer);
+		}
+		this.promptSaveTimer = window.setTimeout(() => {
+			this.promptSaveTimer = null;
+			void this.host.saveSettings();
+		}, 500);
+	}
+
+	private flushPromptSave(): void {
+		if (this.promptSaveTimer === null) return;
+		window.clearTimeout(this.promptSaveTimer);
+		this.promptSaveTimer = null;
+		void this.host.saveSettings();
+	}
+
+	hide(): void {
+		this.flushPromptSave();
+		super.hide();
+	}
+
+	/**
+	 * 系统提示词编辑器：标题用 Setting，输入框和按钮占满整行。
+	 * 用 Setting.addTextArea 时输入框会被右侧按钮挤窄，长提示词不好编辑。
+	 */
+	private renderPromptEditor(
+		containerEl: HTMLElement,
+		options: {
+			name: string;
+			desc: string;
+			rows: number;
+			value: string;
+			onChange: (value: string) => void;
+			onReset: () => Promise<void>;
+		},
+	): void {
+		new Setting(containerEl).setName(options.name).setDesc(options.desc);
+		const textarea = containerEl.createEl("textarea", {
+			cls: "eo-prompt-textarea",
+		});
+		textarea.rows = options.rows;
+		textarea.value = options.value;
+		textarea.addEventListener("input", () => {
+			this.updatePromptSetting(() => options.onChange(textarea.value));
+		});
+		const actions = containerEl.createDiv({ cls: "eo-prompt-actions" });
+		actions
+			.createEl("button", { text: "恢复默认" })
+			.addEventListener("click", () => {
+				void (async () => {
+					try {
+						await options.onReset();
+					} catch (error) {
+						new Notice(
+							`恢复默认失败：${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+				})();
+			});
 	}
 
 	display(): void {
@@ -409,6 +479,42 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 						await this.host.saveSettings();
 					}),
 			);
+
+		new Setting(containerEl).setName("系统提示词").setHeading();
+		containerEl.createDiv({
+			cls: "eo-muted",
+			text: "提示词会作为 system 消息原样发送，改完立即生效，不用重新构建插件。留空 = 使用内置默认值。",
+		});
+
+		this.renderPromptEditor(containerEl, {
+			name: "邮件生成系统提示词",
+			desc: "{{MAX_EMAILS}} 会替换为每客户最多邮件数。下方 JSON 字段契约必须保留，改动字段会导致 AI 返回无法通过程序校验。",
+			rows: 18,
+			value: this.host.settings.emailSystemPrompt,
+			onChange: (value) => {
+				this.host.settings.emailSystemPrompt = value;
+			},
+			onReset: async () => {
+				this.host.settings.emailSystemPrompt = DEFAULT_EMAIL_SYSTEM_PROMPT;
+				await this.host.saveSettings();
+				this.display();
+			},
+		});
+
+		this.renderPromptEditor(containerEl, {
+			name: "规则提炼系统提示词",
+			desc: "「保存为长期规则」时使用。字段固定为 rule_title、rule_text、scope，请勿改动字段名。",
+			rows: 10,
+			value: this.host.settings.ruleSystemPrompt,
+			onChange: (value) => {
+				this.host.settings.ruleSystemPrompt = value;
+			},
+			onReset: async () => {
+				this.host.settings.ruleSystemPrompt = DEFAULT_RULE_SYSTEM_PROMPT;
+				await this.host.saveSettings();
+				this.display();
+			},
+		});
 
 		new Setting(containerEl).setName("工具").setHeading();
 

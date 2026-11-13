@@ -1,4 +1,5 @@
 import {
+	formatBeijingTime,
 	planSendTime,
 	resolveTimezone,
 	sendHistoryFrom,
@@ -141,6 +142,34 @@ test("未来的最近联系时间按今天处理", () => {
 		},
 	});
 	assertEqual(plan.suggestedTime, "2026-11-13 09:30", "不排到未来日期");
+});
+
+test("建议发送时间换算成北京时间展示", () => {
+	assertEqual(
+		formatBeijingTime("2026-11-13 09:30", "America/New_York"),
+		"2026-11-13 22:30",
+		"EST 换算",
+	);
+	assertEqual(
+		formatBeijingTime("2026-03-09 09:30", "America/New_York"),
+		"2026-03-09 21:30",
+		"EDT 换算",
+	);
+	assertEqual(
+		formatBeijingTime("2026-11-13 09:30", "Asia/Shanghai"),
+		"2026-11-13 09:30",
+		"北京时间不变",
+	);
+	assertEqual(
+		formatBeijingTime("2026-11-13 09:30", "Mars/Olympus"),
+		"2026-11-13 09:30",
+		"未知时区回退北京时间",
+	);
+	assertEqual(
+		formatBeijingTime("不是时间", "America/New_York"),
+		null,
+		"无法解析返回 null",
+	);
 });
 
 test("sendHistoryFrom 只统计已发送邮件", () => {

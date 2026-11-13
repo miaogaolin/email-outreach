@@ -796,6 +796,23 @@
 	resize: vertical;
 }
 
+/* 设置页：系统提示词编辑框（占满整行，长文本好编辑） */
+.eo-prompt-textarea {
+	width: 100%;
+	min-height: 220px;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	line-height: 1.6;
+	resize: vertical;
+}
+
+.eo-prompt-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin: 8px 0 18px;
+}
+
 .eo-detail-actions {
 	display: flex;
 	gap: 8px;

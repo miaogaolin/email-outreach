@@ -4,6 +4,7 @@ import {
 	summarizeRunStatuses,
 	statusLabel,
 } from "../core/run-status";
+import { formatBeijingTime } from "../core/send-time";
 import type { EmailRow, EmailStatus } from "../core/types";
 import { EMAIL_STATUSES } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
@@ -174,7 +175,7 @@ export class EmailListView extends ItemView {
 			"联系人",
 			"邮箱",
 			"中文摘要",
-			"建议发送时间",
+			"建议发送时间（北京）",
 			"状态",
 			"更新时间",
 			"版本",
@@ -211,6 +212,18 @@ export class EmailListView extends ItemView {
 
 			const summaryCell = tr.createEl("td", { cls: "eo-summary-cell" });
 			summaryCell.setText(row.record.summaryZh || "（无摘要）");
+			const beijingTime = formatBeijingTime(
+				row.record.suggestedTime,
+				row.record.timezone,
+			);
+			const timeTitle = [
+				row.record.suggestedTime
+					? `客户当地时间 ${row.record.suggestedTime}${row.record.timezone ? ` · ${row.record.timezone}` : ""}`
+					: "",
+				row.record.timeReason ?? "",
+			]
+				.filter(Boolean)
+				.join("\n");
 			this.preview.attach(summaryCell, (popover) => {
 				popover.createEl("div", {
 					cls: "eo-preview-subject",
@@ -219,14 +232,10 @@ export class EmailListView extends ItemView {
 				const meta = popover.createDiv({ cls: "eo-preview-meta" });
 				meta.setText(
 					`${row.record.languageLabel || row.record.language} · ${
-						row.record.suggestedTime
-							? `${row.record.suggestedTime}${row.record.timezone ? ` ${row.record.timezone}` : ""}`
-							: "未建议时间"
+						beijingTime ? `北京时间 ${beijingTime}` : "未建议时间"
 					}`,
 				);
-				if (row.record.timeReason) {
-					meta.setAttr("title", row.record.timeReason);
-				}
+				if (timeTitle) meta.setAttr("title", timeTitle);
 				const excerpt = popover.createEl("pre", { cls: "eo-preview-body" });
 				excerpt.setText(
 					row.record.body.length > 500
@@ -236,13 +245,9 @@ export class EmailListView extends ItemView {
 			});
 
 			const timeCell = tr.createEl("td", {
-				text: row.record.suggestedTime
-					? `${row.record.suggestedTime}${row.record.timezone ? ` · ${row.record.timezone}` : ""}`
-					: "—",
+				text: beijingTime ? `北京时间 ${beijingTime}` : "—",
 			});
-			if (row.record.timeReason) {
-				timeCell.setAttr("title", row.record.timeReason);
-			}
+			if (timeTitle) timeCell.setAttr("title", timeTitle);
 			const statusCell = tr.createEl("td");
 			statusCell.createSpan({
 				cls: `eo-status eo-status-${row.record.status.toLowerCase()}`,

@@ -1,7 +1,12 @@
 import { currentEmailVersion, parseCustomerAIFile } from "../src/core/ai-file";
 import {
+	DEFAULT_EMAIL_SYSTEM_PROMPT,
 	buildEmailRevisionPrompt,
 	buildEmailUserPrompt,
+	buildRuleSystemPrompt,
+	buildSystemPrompt,
+	emailEditIntent,
+	renderSystemPrompt,
 } from "../src/core/prompt";
 import { assert, assertEqual, suite, test } from "./harness";
 
@@ -115,15 +120,49 @@ test("提示词只使用输出目录里已落盘的版本", () => {
 	assert(!prompt.includes("Old body from v1."), "不得夹带更早的版本正文");
 });
 
-test("没有修改意见时给出默认指令", () => {
+test("没有修改意见时给出默认重写指令", () => {
 	const prompt = buildEmailRevisionPrompt({
 		basePrompt: BASE_PROMPT,
 		original: { subject: "s", body: "b" },
 		comment: "   ",
 	});
-	assert(prompt.includes("没有具体意见"), "空意见走默认文案");
+	assert(prompt.includes("本次是重新生成现有邮件"), "空意见走重新生成");
+	assert(prompt.includes("没有具体修改意见"), "空意见给出默认文案");
 	assert(prompt.includes("当前版本"), "没有版本号时不写 vN");
 	assert(prompt.includes("contact_id 使用联系人列表中的 id"), "保留 contact_id 约束");
+	assertEqual(emailEditIntent("  "), "regenerate", "空意见 = 重新生成");
+	assertEqual(emailEditIntent("语气再客气一点"), "modify", "有意见 = 修改");
+});
+
+test("自定义系统提示词替换变量并回退默认", () => {
+	assert(
+		DEFAULT_EMAIL_SYSTEM_PROMPT.includes("{{MAX_EMAILS}}"),
+		"默认模板保留变量占位",
+	);
+	assert(
+		buildSystemPrompt("你是自定义助手，最多 {{MAX_EMAILS}} 封", 3).includes(
+			"最多 3 封",
+		),
+		"替换变量",
+	);
+	assertEqual(
+		buildSystemPrompt("", 2),
+		renderSystemPrompt(DEFAULT_EMAIL_SYSTEM_PROMPT, { maxEmails: 2 }),
+		"留空回退默认",
+	);
+	assert(
+		buildSystemPrompt("  ", 5).includes("最多 5 封"),
+		"纯空白也回退默认",
+	);
+	assertEqual(
+		buildRuleSystemPrompt(" 自定义规则提示 "),
+		"自定义规则提示",
+		"规则系统提示词可配置",
+	);
+	assert(
+		buildRuleSystemPrompt("").includes("外贸开发信写作教练"),
+		"空规则提示词回退默认",
+	);
 });
 
 test("重新生成时提示词聚焦原联系人", () => {

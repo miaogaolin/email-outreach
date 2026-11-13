@@ -855,7 +855,10 @@ export default class EmailOutreachPlugin
 			`模型 ${this.settings.model} · 依据已保存的 v${version} · 超时 ${Math.round(this.settings.timeoutMs / 1000)} 秒`,
 		);
 		const raw = await this.client.complete(
-			buildSystemPrompt(MAX_EMAILS_PER_CUSTOMER),
+			buildSystemPrompt(
+				this.settings.emailSystemPrompt,
+				MAX_EMAILS_PER_CUSTOMER,
+			),
 			prompt,
 			undefined,
 			{
@@ -1053,7 +1056,7 @@ export default class EmailOutreachPlugin
 			return;
 		}
 		const raw = await this.client.complete(
-			buildRuleSystemPrompt(),
+			buildRuleSystemPrompt(this.settings.ruleSystemPrompt),
 			buildRuleUserPrompt({
 				knowledge: loaded.bundle,
 				email: row.record,

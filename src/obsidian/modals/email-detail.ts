@@ -4,6 +4,8 @@ import {
 	emailUpdatedAt,
 	versionSnapshotText,
 } from "../../core/ai-file";
+import { emailEditIntent } from "../../core/prompt";
+import { formatBeijingTime } from "../../core/send-time";
 import type { CustomerAIFile, EmailRow } from "../../core/types";
 import { confirm } from "./confirm";
 
@@ -52,6 +54,7 @@ export class EmailDetailModal extends Modal {
 	private subjectInput: HTMLInputElement | null = null;
 	private bodyInput: HTMLTextAreaElement | null = null;
 	private commentInput: HTMLTextAreaElement | null = null;
+	private actionButton: HTMLButtonElement | null = null;
 	private dirtyEl: HTMLElement | null = null;
 	private progressEl: HTMLElement | null = null;
 	private progressStepEl: HTMLElement | null = null;
@@ -107,7 +110,24 @@ export class EmailDetailModal extends Modal {
 		if (!dirty) return;
 		const version = currentEmailVersion(this.row.record);
 		this.dirtyEl.setText(
-			`有未保存的 Subject / Body 修改：重新生成只使用输出目录里已保存的 v${version}，这些修改不会发给 AI。`,
+			`有未保存的 Subject / Body 修改：填写修改意见提交时，会先保存为 v${version + 1} 再让 AI 按意见改写；不填意见直接提交会重新生成，这些改动会被丢弃。`,
+		);
+	}
+
+	private commentValue(): string {
+		return this.commentInput?.value.trim() ?? "";
+	}
+
+	/** 合并入口：意见有内容 = 按意见修改；留空 = 重新生成。 */
+	private updateActionLabel(): void {
+		if (!this.actionButton) return;
+		const modify = emailEditIntent(this.commentValue()) === "modify";
+		this.actionButton.setText(modify ? "按意见修改" : "重新生成");
+		this.actionButton.setAttr(
+			"title",
+			modify
+				? "先保存当前 Subject / Body（如有改动），再让 AI 按修改意见改写"
+				: "没有修改意见：直接让 AI 重新生成，未保存的改动会被丢弃",
 		);
 	}
 
@@ -163,11 +183,11 @@ export class EmailDetailModal extends Modal {
 		}
 	}
 
-	private showProgressError(message: string): void {
+	private showProgressError(message: string, step = "操作失败"): void {
 		if (!this.progressEl || this.closed) return;
 		this.progressEl.hidden = false;
 		this.progressEl.addClass("is-error");
-		if (this.progressStepEl) this.progressStepEl.setText("重新生成失败");
+		if (this.progressStepEl) this.progressStepEl.setText(step);
 		if (this.progressDetailEl) this.progressDetailEl.setText(message);
 		if (this.progressTimeEl) this.progressTimeEl.setText("");
 		if (this.progressBarEl) {
@@ -183,6 +203,7 @@ export class EmailDetailModal extends Modal {
 		this.subjectInput = null;
 		this.bodyInput = null;
 		this.commentInput = null;
+		this.actionButton = null;
 		this.dirtyEl = null;
 		this.progressEl = null;
 		this.progressStepEl = null;
@@ -214,12 +235,25 @@ export class EmailDetailModal extends Modal {
 		addMeta("联系人", record.contact);
 		addMeta("邮箱", record.email);
 		addMeta("邮件语言", `${record.languageLabel || ""}（${record.language}）`);
+		const beijingTime = formatBeijingTime(
+			record.suggestedTime,
+			record.timezone,
+		);
 		addMeta(
 			"建议发送时间",
-			record.suggestedTime
-				? `${record.suggestedTime}${record.timezone ? ` · ${record.timezone}` : ""}`
-				: "",
+			beijingTime ? `北京时间 ${beijingTime}` : "",
 		);
+		if (
+			beijingTime &&
+			record.suggestedTime &&
+			record.timezone &&
+			record.timezone !== "Asia/Shanghai"
+		) {
+			addMeta(
+				"客户当地时间",
+				`${record.suggestedTime} · ${record.timezone}`,
+			);
+		}
 		addMeta("时间理由", record.timeReason ?? "");
 		addMeta("中文摘要", record.summaryZh);
 		// 只有一个「更新时间」：首次生成时是创建时间，之后每次改动都会刷新。
@@ -251,13 +285,16 @@ export class EmailDetailModal extends Modal {
 
 		const commentGroup = contentEl.createDiv({ cls: "eo-detail-field" });
 		commentGroup.createEl("label", {
-			text: "修改意见（用于重新生成 / 沉淀规则）",
+			text: "修改意见（填写后按意见修改；留空则重新生成）",
 		});
 		this.commentInput = commentGroup.createEl("textarea", {
 			cls: "eo-detail-comment",
 		});
 		this.commentInput.value = "";
 		this.commentInput.rows = 3;
+		this.commentInput.addEventListener("input", () =>
+			this.updateActionLabel(),
+		);
 
 		const progress = contentEl.createDiv({ cls: "eo-detail-progress" });
 		progress.hidden = true;
@@ -302,24 +339,10 @@ export class EmailDetailModal extends Modal {
 			return button;
 		};
 
-		addButton("保存修改", async () => {
-			const subject = this.subjectInput?.value.trim() ?? "";
-			const body = this.bodyInput?.value ?? "";
-			if (!subject || !body.trim()) {
-				new Notice("Subject 和 Body 都不能为空");
-				return;
-			}
-			if (subject === record.subject && body === record.body) {
-				new Notice("没有改动");
-				return;
-			}
-			await this.host.saveEmailEdit(this.row, subject, body);
-			await this.afterAction();
+		this.actionButton = addButton("重新生成", async () => {
+			await this.submit();
 		});
-
-		addButton("重新生成", async () => {
-			await this.regenerate();
-		});
+		this.updateActionLabel();
 
 		addButton(
 			"验收通过",
@@ -394,25 +417,60 @@ export class EmailDetailModal extends Modal {
 			.addEventListener("click", () => this.close());
 	}
 
-	private async regenerate(): Promise<void> {
+	/**
+	 * 合并入口：
+	 * - 修改意见有内容 → 先保存当前 Subject / Body（如有改动）作为新版本，再按意见修改；
+	 * - 修改意见为空 → 重新生成（未保存的改动需要用户确认丢弃）。
+	 */
+	private async submit(): Promise<void> {
 		if (this.busy) return;
+		const comment = this.commentValue();
+		const intent = emailEditIntent(comment);
+		if (this.row.record.sent) {
+			new Notice("已发送的邮件不能修改或重新生成");
+			return;
+		}
+		const subject = this.subjectInput?.value.trim() ?? "";
+		const body = this.bodyInput?.value ?? "";
+		if (!subject || !body.trim()) {
+			new Notice("Subject 和 Body 都不能为空");
+			return;
+		}
+		if (intent === "modify" && this.isDirty()) {
+			await this.host.saveEmailEdit(this.row, subject, body);
+			const updated = this.host.getRow(this.row.key);
+			if (updated) this.row = updated;
+			this.updateDirtyHint();
+		}
+		await this.regenerate(comment);
+	}
+
+	private async regenerate(comment: string): Promise<void> {
+		if (this.busy) return;
+		const modify = emailEditIntent(comment) === "modify";
 		const record = this.row.record;
 		const version = currentEmailVersion(record);
-		const comment = this.commentInput?.value.trim() ?? "";
 		if (this.isDirty()) {
 			const confirmed = await confirm(this.app, {
 				title: "有未保存的修改",
-				confirmText: "继续生成",
+				confirmText: modify ? "继续修改" : "继续生成",
 				build: (container) => {
 					container.createEl("p", {
-						text: `弹窗里的 Subject / Body 还没有保存。重新生成只会把输出目录里已保存的 v${version} 发给 AI，未保存的修改会被丢弃。`,
+						text: `弹窗里的 Subject / Body 还没有保存。${
+							modify
+								? "按意见修改只使用输出目录里已保存的内容"
+								: "重新生成只使用输出目录里已保存的内容"
+						}，未保存的修改会被丢弃。`,
 					});
 				},
 			});
 			if (!confirmed) return;
 		}
 		this.setBusy(true);
-		this.showProgress("正在重新生成邮件…", `依据输出目录里已保存的 v${version}`);
+		this.showProgress(
+			modify ? "正在按修改意见修改邮件…" : "正在重新生成邮件…",
+			`依据输出目录里已保存的 v${version}`,
+		);
 		this.startElapsedTimer();
 		try {
 			const wrote = await this.host.regenerateEmail(
@@ -431,7 +489,10 @@ export class EmailDetailModal extends Modal {
 		} catch (error) {
 			this.stopElapsedTimer();
 			const message = error instanceof Error ? error.message : String(error);
-			this.showProgressError(message);
+			this.showProgressError(
+				message,
+				modify ? "按意见修改失败" : "重新生成失败",
+			);
 			this.setBusy(false);
 			new Notice(message, 9000);
 		}
