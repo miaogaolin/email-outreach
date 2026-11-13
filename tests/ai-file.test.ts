@@ -1,7 +1,10 @@
 import {
 	addEmailVersion,
 	appendEmailToContent,
+	appendEmailsToContent,
 	createEmailRecord,
+	emailUpdatedAt,
+	formatEmailTime,
 	nextEmailId,
 	parseCustomerAIFile,
 	renderCustomerAIFile,
@@ -42,6 +45,87 @@ test("append + parse keeps every field", () => {
 	assertEqual(email.body, first.body, "Body");
 	assertEqual(email.versions.length, 1, "一个版本");
 	assertEqual(email.sent, false, "未发送");
+	assertEqual(email.updatedAt, first.updatedAt, "更新时间落盘后不变");
+});
+
+test("更新时间：首次是创建时间，之后取最新一次改动", () => {
+	const base = record();
+	assertEqual(emailUpdatedAt(base), base.updatedAt, "新建邮件用创建时间");
+
+	const revised = addEmailVersion(base, {
+		subject: "Revised",
+		body: "Revised body",
+		action: "Edited",
+		comment: "",
+		status: "Revision",
+		now: new Date("2026-11-12T09:30:00+08:00"),
+	});
+	assert(
+		emailUpdatedAt(revised) === revised.updatedAt,
+		"有新版本时用更新时间",
+	);
+	assert(emailUpdatedAt(revised) !== base.updatedAt, "更新时间确实刷新了");
+});
+
+test("更新时间：老文件按 generated_at / 版本时间回退", () => {
+	const base = record();
+	assertEqual(
+		emailUpdatedAt({
+			...base,
+			updatedAt: "",
+			generatedAt: "2026-11-10T18:00:00+08:00",
+		}),
+		"2026-11-10T18:00:00+08:00",
+		"缺少 updated_at 时回退到创建时间",
+	);
+	const versions = [
+		{
+			version: 1,
+			at: "2026-11-10 18:00",
+			action: "Generated",
+			userComment: "",
+			subject: "s",
+			body: "b",
+		},
+		{
+			version: 2,
+			at: "2026-11-11 09:15",
+			action: "Edited",
+			userComment: "",
+			subject: "s2",
+			body: "b2",
+		},
+	];
+	assertEqual(
+		emailUpdatedAt({
+			...base,
+			updatedAt: "",
+			generatedAt: "",
+			versions,
+		}),
+		"2026-11-11 09:15",
+		"连创建时间都没有时取最后一版时间",
+	);
+	assertEqual(
+		emailUpdatedAt({ ...base, updatedAt: "", generatedAt: "", versions: [] }),
+		"",
+		"没有任何时间时为空",
+	);
+});
+
+test("更新时间显示到分钟", () => {
+	assertEqual(
+		formatEmailTime("2026-11-10T20:19:28+08:00"),
+		"2026-11-10 20:19",
+		"ISO 去掉秒和时区",
+	);
+	assertEqual(
+		formatEmailTime("2026-11-10 18:42"),
+		"2026-11-10 18:42",
+		"版本时间保持原样",
+	);
+	assertEqual(formatEmailTime(""), "", "空值保持为空");
+	assertEqual(formatEmailTime("昨天"), "昨天", "无法解析时原样返回");
 });
 
 test("render(parse(content)) is stable", () => {
@@ -66,6 +150,37 @@ test("second email gets id 002 and lives in one file", () => {
 	assertEqual(parsed.file.emails.length, 2, "同一文件两封邮件");
 	assertEqual(parsed.file.emails[1]!.id, "002", "第二个 ID");
 	assertEqual(nextEmailId(parsed.file.emails), "003", "下一个 ID");
+});
+
+test("batch append writes several emails with sequential ids", () => {
+	const content = appendEmailsToContent(
+		null,
+		"Gallaway Safety & Supply",
+		[
+			record(),
+			record({
+				contactRaw: "Colin Gallaway 老板",
+				email: "colin@gallawaysafety.com",
+				subject: "Second subject",
+				body: "Second body",
+			}),
+			record({
+				contactRaw: "Kim Lucas 采购",
+				email: "kim@example.com",
+				subject: "Third subject",
+				body: "Third body",
+			}),
+		],
+	);
+	const parsed = parseCustomerAIFile(content);
+	assertEqual(parsed.file.emails.length, 3, "三封邮件");
+	assertEqual(
+		parsed.file.emails.map((email) => email.id),
+		["001", "002", "003"],
+		"ID 连续",
+	);
+	assertEqual(parsed.file.emails[2]!.subject, "Third subject", "第三封内容");
+	assertEqual(parsed.file.emailCount, 3, "email_count");
 });
 
 test("version history survives a save cycle", () => {

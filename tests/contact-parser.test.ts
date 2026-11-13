@@ -1,4 +1,9 @@
-import { parseContacts, contactsWithEmail, extractContactSection } from "../src/core/contact-parser";
+import {
+	parseContacts,
+	contactsWithEmail,
+	extractContactSection,
+	findContactByEmail,
+} from "../src/core/contact-parser";
 import { suite, test, assert, assertEqual } from "./harness";
 
 const GALLOWAY = `---
@@ -153,4 +158,16 @@ test("extractContactSection returns the raw section", () => {
 	assert(section.startsWith("## Contact"), "从标题开始");
 	assert(section.includes("kim.lucas@gallawaysafety.com"), "包含邮箱");
 	assert(!section.includes("地区"), "不包含 frontmatter");
+});
+
+test("findContactByEmail matches case-insensitively and falls back to raw", () => {
+	const result = parseContacts(GALLOWAY);
+	const byEmail = findContactByEmail(
+		result.contacts,
+		"KIM.LUCAS@GALLAWAYSAFETY.COM",
+	);
+	assert(byEmail?.raw.includes("Kim Lucas"), "按邮箱大小写匹配");
+	const byRaw = findContactByEmail(result.contacts, "", "Kim Lucas 采购 ");
+	assert(byRaw?.raw.includes("Kim Lucas"), "按联系人原文兜底");
+	assertEqual(findContactByEmail(result.contacts, "nobody@x.com"), null, "找不到");
 });

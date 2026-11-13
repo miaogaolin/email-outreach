@@ -1,6 +1,4 @@
 import type { FilterConfig } from "../core/filters";
-import type { TaskSelection } from "../core/types";
-import { NO_TASKS } from "../core/types";
 
 export interface ColumnPreference {
 	key: string;
@@ -15,6 +13,8 @@ export interface Settings {
 	apiBaseUrl: string;
 	apiKey: string;
 	model: string;
+	/** 上次从 `GET /models` 获取到的模型 id；用于设置页下拉框，空表示还没获取过。 */
+	availableModels: string[];
 	temperature: number;
 	timeoutMs: number;
 	concurrency: number;
@@ -38,7 +38,6 @@ export interface Settings {
 	builtinColumns: ColumnPreference[] | null;
 	builtinFilters: FilterConfig;
 	builtinSort: { key: string; dir: 1 | -1 } | null;
-	lastTasks: TaskSelection;
 
 	// Prompt budget
 	truncateBodyChars: number;
@@ -53,7 +52,8 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
 	apiBaseUrl: "https://api.deepseek.com",
 	apiKey: "",
-	model: "deepseek-chat",
+	model: "deepseek-flash",
+	availableModels: [],
 	temperature: 0.3,
 	timeoutMs: 120000,
 	concurrency: 2,
@@ -73,7 +73,6 @@ export const DEFAULT_SETTINGS: Settings = {
 	builtinColumns: null,
 	builtinFilters: { conditions: [], showExcluded: false },
 	builtinSort: null,
-	lastTasks: { ...NO_TASKS },
 
 	truncateBodyChars: 6000,
 	maxKnowledgeChars: 60000,

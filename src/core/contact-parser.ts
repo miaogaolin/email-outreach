@@ -409,3 +409,25 @@ export function findContact(
 	if (!contactId) return null;
 	return contacts.find((contact) => contact.id === contactId) ?? null;
 }
+
+/** 根据已落盘邮件里的邮箱/联系人原文找到原联系人（重新生成用）。 */
+export function findContactByEmail(
+	contacts: Contact[],
+	email: string | null | undefined,
+	contactRaw?: string | null,
+): Contact | null {
+	const normalizedEmail = (email ?? "").trim().toLowerCase();
+	if (normalizedEmail) {
+		const byEmail = contacts.find((contact) =>
+			contact.emails.some(
+				(address) => address.toLowerCase() === normalizedEmail,
+			),
+		);
+		if (byEmail) return byEmail;
+	}
+	const raw = (contactRaw ?? "").trim();
+	if (!raw) return null;
+	return (
+		contacts.find((contact) => contact.raw.trim() === raw) ?? null
+	);
+}

@@ -1,13 +1,33 @@
 import { App, Modal, Notice } from "obsidian";
-import { versionSnapshotText } from "../../core/ai-file";
+import {
+	currentEmailVersion,
+	emailUpdatedAt,
+	versionSnapshotText,
+} from "../../core/ai-file";
 import type { CustomerAIFile, EmailRow } from "../../core/types";
+import { confirm } from "./confirm";
+
+/** 「重新生成」过程中回传给弹窗的进度事件。 */
+export interface RegenerateProgressEvent {
+	/** 正在做什么，一句短说明。 */
+	step: string;
+	/** 补充信息：依据哪一版、模型、错误原因等。 */
+	detail?: string;
+	/** 0–1 的确定进度；缺省表示进度不确定（显示滚动条）。 */
+	fraction?: number;
+}
 
 export interface EmailDetailHost {
 	app: App;
 	getRow(key: string): EmailRow | null;
 	getAIFile(path: string): CustomerAIFile | null;
 	saveEmailEdit(row: EmailRow, subject: string, body: string): Promise<void>;
-	regenerateEmail(row: EmailRow, comment: string): Promise<void>;
+	/** 返回是否真的写入了新版本（配置不全、已发送等情况返回 false）。 */
+	regenerateEmail(
+		row: EmailRow,
+		comment: string,
+		onProgress?: (event: RegenerateProgressEvent) => void,
+	): Promise<boolean>;
 	acceptEmail(row: EmailRow): Promise<void>;
 	rejectEmail(row: EmailRow): Promise<void>;
 	markEmailSent(row: EmailRow): Promise<void>;
@@ -23,11 +43,26 @@ const STATUS_LABELS: Record<string, string> = {
 	Rejected: "已拒绝",
 };
 
+function normalizeText(value: string): string {
+	return value.replace(/\r\n?/g, "\n").trim();
+}
+
 export class EmailDetailModal extends Modal {
 	private row: EmailRow;
 	private subjectInput: HTMLInputElement | null = null;
 	private bodyInput: HTMLTextAreaElement | null = null;
 	private commentInput: HTMLTextAreaElement | null = null;
+	private dirtyEl: HTMLElement | null = null;
+	private progressEl: HTMLElement | null = null;
+	private progressStepEl: HTMLElement | null = null;
+	private progressDetailEl: HTMLElement | null = null;
+	private progressTimeEl: HTMLElement | null = null;
+	private progressBarEl: HTMLElement | null = null;
+	private buttons: HTMLButtonElement[] = [];
+	private busy = false;
+	private closed = false;
+	private elapsedTimer: number | null = null;
+	private startedAt = 0;
 
 	constructor(
 		app: App,
@@ -44,6 +79,7 @@ export class EmailDetailModal extends Modal {
 
 	private async afterAction(): Promise<void> {
 		await this.host.refreshEmails();
+		if (this.closed) return;
 		const updated = this.host.getRow(this.row.key);
 		if (!updated) {
 			this.close();
@@ -53,10 +89,113 @@ export class EmailDetailModal extends Modal {
 		this.render();
 	}
 
+	// ------------------------------------------------------------ dirty state
+
+	private isDirty(): boolean {
+		if (!this.subjectInput || !this.bodyInput) return false;
+		const record = this.row.record;
+		return (
+			normalizeText(this.subjectInput.value) !== normalizeText(record.subject) ||
+			normalizeText(this.bodyInput.value) !== normalizeText(record.body)
+		);
+	}
+
+	private updateDirtyHint(): void {
+		if (!this.dirtyEl) return;
+		const dirty = this.isDirty();
+		this.dirtyEl.hidden = !dirty;
+		if (!dirty) return;
+		const version = currentEmailVersion(this.row.record);
+		this.dirtyEl.setText(
+			`有未保存的 Subject / Body 修改：重新生成只使用输出目录里已保存的 v${version}，这些修改不会发给 AI。`,
+		);
+	}
+
+	// -------------------------------------------------------------- progress
+
+	private setBusy(busy: boolean): void {
+		this.busy = busy;
+		for (const button of this.buttons) {
+			button.disabled = busy || button.dataset.eoInitialDisabled === "1";
+		}
+		// 运行期间锁住 Subject / Body：结果回填时会被覆盖，边跑边改没有意义。
+		if (this.subjectInput) this.subjectInput.readOnly = busy;
+		if (this.bodyInput) this.bodyInput.readOnly = busy;
+	}
+
+	private startElapsedTimer(): void {
+		this.stopElapsedTimer();
+		this.startedAt = Date.now();
+		const tick = (): void => {
+			if (!this.progressTimeEl) return;
+			const seconds = (Date.now() - this.startedAt) / 1000;
+			this.progressTimeEl.setText(`已等待 ${seconds.toFixed(1)} 秒`);
+		};
+		tick();
+		this.elapsedTimer = window.setInterval(tick, 100);
+	}
+
+	private stopElapsedTimer(): void {
+		if (this.elapsedTimer !== null) {
+			window.clearInterval(this.elapsedTimer);
+			this.elapsedTimer = null;
+		}
+	}
+
+	private showProgress(
+		step: string,
+		detail = "",
+		fraction?: number,
+	): void {
+		if (!this.progressEl || this.closed) return;
+		this.progressEl.hidden = false;
+		this.progressEl.removeClass("is-error");
+		if (this.progressStepEl) this.progressStepEl.setText(step);
+		if (this.progressDetailEl) this.progressDetailEl.setText(detail);
+		if (!this.progressBarEl) return;
+		if (typeof fraction === "number") {
+			const clamped = Math.min(1, Math.max(0, fraction));
+			this.progressBarEl.addClass("is-determinate");
+			this.progressBarEl.style.width = `${Math.round(clamped * 100)}%`;
+		} else {
+			this.progressBarEl.removeClass("is-determinate");
+			this.progressBarEl.style.width = "";
+		}
+	}
+
+	private showProgressError(message: string): void {
+		if (!this.progressEl || this.closed) return;
+		this.progressEl.hidden = false;
+		this.progressEl.addClass("is-error");
+		if (this.progressStepEl) this.progressStepEl.setText("重新生成失败");
+		if (this.progressDetailEl) this.progressDetailEl.setText(message);
+		if (this.progressTimeEl) this.progressTimeEl.setText("");
+		if (this.progressBarEl) {
+			this.progressBarEl.removeClass("is-determinate");
+			this.progressBarEl.style.width = "";
+		}
+	}
+
+	// ----------------------------------------------------------------- render
+
 	private render(): void {
 		const { contentEl } = this;
+		this.subjectInput = null;
+		this.bodyInput = null;
+		this.commentInput = null;
+		this.dirtyEl = null;
+		this.progressEl = null;
+		this.progressStepEl = null;
+		this.progressDetailEl = null;
+		this.progressTimeEl = null;
+		this.progressBarEl = null;
+		this.buttons = [];
+		this.busy = false;
+		this.stopElapsedTimer();
+
 		contentEl.empty();
-		contentEl.addClass("eo-modal eo-email-detail");
+		contentEl.addClass("eo-modal");
+		contentEl.addClass("eo-email-detail");
 		const record = this.row.record;
 
 		const header = contentEl.createDiv({ cls: "eo-detail-header" });
@@ -81,7 +220,10 @@ export class EmailDetailModal extends Modal {
 				? `${record.suggestedTime}${record.timezone ? ` · ${record.timezone}` : ""}`
 				: "",
 		);
+		addMeta("时间理由", record.timeReason ?? "");
 		addMeta("中文摘要", record.summaryZh);
+		// 只有一个「更新时间」：首次生成时是创建时间，之后每次改动都会刷新。
+		addMeta("更新时间", emailUpdatedAt(record));
 		addMeta("已发送", record.sent ? `是（${record.sentAt ?? ""}）` : "否");
 
 		const subjectGroup = contentEl.createDiv({ cls: "eo-detail-field" });
@@ -99,6 +241,14 @@ export class EmailDetailModal extends Modal {
 		this.bodyInput.value = record.body;
 		this.bodyInput.rows = 14;
 
+		this.dirtyEl = contentEl.createDiv({
+			cls: "eo-warning-box eo-detail-dirty",
+		});
+		this.dirtyEl.hidden = true;
+
+		this.subjectInput.addEventListener("input", () => this.updateDirtyHint());
+		this.bodyInput.addEventListener("input", () => this.updateDirtyHint());
+
 		const commentGroup = contentEl.createDiv({ cls: "eo-detail-field" });
 		commentGroup.createEl("label", {
 			text: "修改意见（用于重新生成 / 沉淀规则）",
@@ -109,6 +259,24 @@ export class EmailDetailModal extends Modal {
 		this.commentInput.value = "";
 		this.commentInput.rows = 3;
 
+		const progress = contentEl.createDiv({ cls: "eo-detail-progress" });
+		progress.hidden = true;
+		const progressHead = progress.createDiv({ cls: "eo-detail-progress-head" });
+		this.progressStepEl = progressHead.createSpan({
+			cls: "eo-detail-progress-step",
+		});
+		this.progressTimeEl = progressHead.createSpan({
+			cls: "eo-detail-progress-time",
+		});
+		const progressBar = progress.createDiv({ cls: "eo-progress-bar" });
+		this.progressBarEl = progressBar.createDiv({
+			cls: "eo-progress-bar-inner",
+		});
+		this.progressDetailEl = progress.createDiv({
+			cls: "eo-detail-progress-detail",
+		});
+		this.progressEl = progress;
+
 		const actions = contentEl.createDiv({ cls: "eo-detail-actions" });
 		const addButton = (
 			label: string,
@@ -118,6 +286,8 @@ export class EmailDetailModal extends Modal {
 		): HTMLButtonElement => {
 			const button = actions.createEl("button", { text: label, cls });
 			button.disabled = disabled;
+			button.dataset.eoInitialDisabled = disabled ? "1" : "0";
+			this.buttons.push(button);
 			button.addEventListener("click", () => {
 				void (async () => {
 					try {
@@ -148,9 +318,7 @@ export class EmailDetailModal extends Modal {
 		});
 
 		addButton("重新生成", async () => {
-			const comment = this.commentInput?.value.trim() ?? "";
-			await this.host.regenerateEmail(this.row, comment);
-			await this.afterAction();
+			await this.regenerate();
 		});
 
 		addButton(
@@ -226,7 +394,52 @@ export class EmailDetailModal extends Modal {
 			.addEventListener("click", () => this.close());
 	}
 
+	private async regenerate(): Promise<void> {
+		if (this.busy) return;
+		const record = this.row.record;
+		const version = currentEmailVersion(record);
+		const comment = this.commentInput?.value.trim() ?? "";
+		if (this.isDirty()) {
+			const confirmed = await confirm(this.app, {
+				title: "有未保存的修改",
+				confirmText: "继续生成",
+				build: (container) => {
+					container.createEl("p", {
+						text: `弹窗里的 Subject / Body 还没有保存。重新生成只会把输出目录里已保存的 v${version} 发给 AI，未保存的修改会被丢弃。`,
+					});
+				},
+			});
+			if (!confirmed) return;
+		}
+		this.setBusy(true);
+		this.showProgress("正在重新生成邮件…", `依据输出目录里已保存的 v${version}`);
+		this.startElapsedTimer();
+		try {
+			const wrote = await this.host.regenerateEmail(
+				this.row,
+				comment,
+				(event) => this.showProgress(event.step, event.detail, event.fraction),
+			);
+			this.stopElapsedTimer();
+			if (!wrote) {
+				this.setBusy(false);
+				if (this.progressEl) this.progressEl.hidden = true;
+				return;
+			}
+			this.showProgress("已生成新版本", "正在刷新列表…", 1);
+			await this.afterAction();
+		} catch (error) {
+			this.stopElapsedTimer();
+			const message = error instanceof Error ? error.message : String(error);
+			this.showProgressError(message);
+			this.setBusy(false);
+			new Notice(message, 9000);
+		}
+	}
+
 	onClose(): void {
+		this.closed = true;
+		this.stopElapsedTimer();
 		this.contentEl.empty();
 	}
 }

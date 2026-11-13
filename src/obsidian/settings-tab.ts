@@ -6,6 +6,7 @@ export interface SettingsHost extends OutreachPluginApi {
 	getKnowledgeSummary(): Promise<string>;
 	clearSelection(): void;
 	clearApiKey(): Promise<void>;
+	listModels(): Promise<string[]>;
 	reloadBasesView(): void;
 }
 
@@ -45,7 +46,12 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 					.setPlaceholder("https://api.deepseek.com")
 					.setValue(this.host.settings.apiBaseUrl)
 					.onChange(async (value) => {
-						this.host.settings.apiBaseUrl = value.trim();
+						const next = value.trim();
+						if (next !== this.host.settings.apiBaseUrl) {
+							// 模型列表随服务商变化，换地址后旧列表不再可信。
+							this.host.settings.availableModels = [];
+						}
+						this.host.settings.apiBaseUrl = next;
 						await this.host.saveSettings();
 					}),
 			);
@@ -67,13 +73,65 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("模型名称")
-			.setDesc("例如 deepseek-chat")
+			.setDesc(
+				"可手动填写；也可点右侧按钮，从该 API 服务读取实际可用的模型列表。",
+			)
 			.addText((text) =>
 				text.setValue(this.host.settings.model).onChange(async (value) => {
 					this.host.settings.model = value.trim();
 					await this.host.saveSettings();
 				}),
+			)
+			.addButton((button) =>
+				button.setButtonText("获取模型列表").onClick(async () => {
+					button.setDisabled(true).setButtonText("获取中…");
+					try {
+						const models = await this.host.listModels();
+						if (!this.host.settings.model.trim() && models.length === 1) {
+							this.host.settings.model = models[0]!;
+							await this.host.saveSettings();
+						}
+						new Notice(
+							`已获取 ${models.length} 个模型：\n${models.join("、")}`,
+							12000,
+						);
+						this.display();
+					} catch (error) {
+						new Notice(
+							error instanceof Error ? error.message : String(error),
+							12000,
+						);
+						button.setDisabled(false);
+						button.setButtonText("获取模型列表");
+					}
+				}),
 			);
+
+		const availableModels = this.host.settings.availableModels ?? [];
+		if (availableModels.length > 0) {
+			const current = this.host.settings.model.trim();
+			const missing = current !== "" && !availableModels.includes(current);
+			new Setting(containerEl)
+				.setName("可用模型")
+				.setDesc(
+					missing
+						? `接口返回 ${availableModels.length} 个模型；当前填写的「${current}」不在列表里，可能已下线，建议从下面重新选择。`
+						: `接口返回 ${availableModels.length} 个模型。选择后会同时更新上面的模型名称。`,
+				)
+				.addDropdown((dropdown) => {
+					const options: Record<string, string> = { "": "— 选择模型 —" };
+					for (const id of availableModels) options[id] = id;
+					dropdown.addOptions(options);
+					dropdown.setValue(availableModels.includes(current) ? current : "");
+					dropdown.onChange(async (value) => {
+						if (!value) return;
+						this.host.settings.model = value;
+						await this.host.saveSettings();
+						new Notice(`模型已改为 ${value}`);
+						this.display();
+					});
+				});
+		}
 
 		new Setting(containerEl)
 			.setName("温度")
@@ -122,7 +180,7 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("AI 主指令文件")
 			.setDesc(
-				"指向一个 Markdown 文件。插件会读取它和其中 [[双链]] 指向的知识文章。",
+				"指向一个 Markdown 文件。可省略 .md 扩展名，也接受 [[双链]] 写法；插件会读取它和其中 [[双链]] 指向的知识文章。",
 			)
 			.addText((text) =>
 				text
@@ -151,7 +209,7 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("输出目录")
 			.setDesc(
-				"每个客户在这里生成一个「客户名 - AI开发信息.md」，保存分析、全部邮件和修改历史。",
+				"每个客户在这里生成一个「客户名 - AI开发信息.md」，保存全部邮件和修改历史。",
 			)
 			.addText((text) =>
 				text

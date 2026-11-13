@@ -13,7 +13,7 @@ export class ContactModal extends Modal {
 
 	onOpen(): void {
 		const { contentEl } = this;
-		contentEl.addClass("eo-modal eo-contact-modal");
+		contentEl.addClass("eo-modal", "eo-contact-modal");
 		contentEl.createEl("h2", { text: `${this.record.name} · 联系人` });
 		contentEl.createEl("p", {
 			cls: "eo-muted",

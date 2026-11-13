@@ -10,7 +10,7 @@ export class SelfCheckModal extends Modal {
 
 	onOpen(): void {
 		const { contentEl } = this;
-		contentEl.addClass("eo-modal eo-selfcheck-modal");
+		contentEl.addClass("eo-modal", "eo-selfcheck-modal");
 		contentEl.createEl("h2", { text: "Email Outreach 自检" });
 		const pre = contentEl.createEl("pre", { cls: "eo-selfcheck" });
 		pre.setText(this.report);

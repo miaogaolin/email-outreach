@@ -1,12 +1,19 @@
 import type { App, TFile } from "obsidian";
 import { isExcluded } from "../core/filters";
+import {
+	summarizeRunStatuses,
+	statusLabel,
+	statusLevel,
+} from "../core/run-status";
 import type { CustomerRecord } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
-import { renderTaskBar } from "./task-bar";
+import { fillContactCounts } from "./contact-counts";
+import { renderRunBar, type RunBarHandle } from "./run-bar";
 import {
 	renderCustomerTable,
 	type CustomerColumn,
 	type CustomerRow,
+	type CustomerStatus,
 } from "./table";
 
 export const BASES_VIEW_TYPE = "email-outreach-customers";
@@ -116,8 +123,13 @@ function renderBasesRoot(
 		.createEl("button", { text: "内置工作台" })
 		.addEventListener("click", () => plugin.openWorkbench());
 
+	// 搜索/排除开关会重复调用 drawTable；每次只重画这一块，避免表格叠加。
+	const body = root.createDiv({ cls: "eo-bases-body" });
 	let showExcluded = false;
+	let drawToken = 0;
 	const drawTable = (): void => {
+		const token = ++drawToken;
+		body.empty();
 		const search = searchInput.value.trim().toLowerCase();
 		const rules = {
 			tags: plugin.settings.excludeTags,
@@ -179,40 +191,56 @@ function renderBasesRoot(
 		}
 
 		if (propertyColumns.length === 0) {
-			const hint = root.createDiv({ cls: "eo-muted eo-bases-hint" });
+			const hint = body.createDiv({ cls: "eo-muted eo-bases-hint" });
 			hint.setText(
 				"还没有选择属性列：在 Base 工具栏的「属性」菜单里勾选要显示的字段。",
 			);
 		}
 
-		const tableContainer = root.createDiv({ cls: "eo-table-wrap" });
-		const selected = plugin.getSelected();
-		renderCustomerTable(tableContainer, {
+		renderBasesRunBanner(body, plugin);
+		const tableContainer = body.createDiv({ cls: "eo-table-wrap" });
+		// Base 的筛选/搜索变化后，隐藏的客户不能继续留在选区里。
+		const selected = plugin.pruneSelection(rows.map((row) => row.key));
+		let runBar: RunBarHandle | null = null;
+		const applySelection = (): void => {
+			plugin.setSelected(selected);
+			table.updateSelection(selected);
+			runBar?.updateSelectedCount(selected.size);
+		};
+		const table = renderCustomerTable(tableContainer, {
 			columns,
 			rows,
 			selected,
 			onToggle: (key, checked) => {
 				if (checked) selected.add(key);
 				else selected.delete(key);
-				plugin.setSelected(selected);
+				applySelection();
 			},
 			onToggleAll: (checked) => {
 				for (const row of rows) {
 					if (checked) selected.add(row.key);
 					else selected.delete(row.key);
 				}
-				plugin.setSelected(selected);
+				applySelection();
 			},
-			onRowClick: (row) => void plugin.openContacts(row.record),
-			statusText: (row) =>
-				row.record.fm[plugin.settings.linkPropertyName] ? "✓" : "—",
+			contactCount: (row) => plugin.repo.getContactCount(row.record),
+			onOpenContacts: (row) => {
+				void plugin.openContacts(row.record);
+			},
+			status: (row) => statusForCustomer(plugin, row),
 			emptyText:
 				entries.length === 0
 					? "当前 Base 没有匹配的客户。请在 Base 里调整筛选条件。"
 					: "没有符合当前搜索/排除条件的客户",
 		});
+		fillContactCounts(
+			plugin.repo,
+			rows,
+			table,
+			() => token === drawToken,
+		);
 
-		const info = root.createDiv({ cls: "eo-muted eo-bases-info" });
+		const info = body.createDiv({ cls: "eo-muted eo-bases-info" });
 		const sort = view.config?.getSort?.() ?? [];
 		const sortText =
 			sort.length > 0
@@ -227,22 +255,17 @@ function renderBasesRoot(
 			`共 ${rows.length} 家 · 已排除 ${excludedCount} 家 · 排序：${sortText}（由 Base 控制）`,
 		);
 
-		const footer = root.createDiv({ cls: "eo-footer" });
+		const footer = body.createDiv({ cls: "eo-footer" });
 		const taskContainer = footer.createDiv({ cls: "eo-taskbar-container" });
-		renderTaskBar(taskContainer, {
-			tasks: plugin.getTaskSelection(),
+		runBar = renderRunBar(taskContainer, {
 			selectedCount: selected.size,
-			onChange: (tasks) => {
-				plugin.setTaskSelection(tasks);
-				renderBasesRoot(root, view, plugin);
-			},
 			onRun: () => {
 				const chosen = selected.size
 					? allRows
 							.filter(({ record }) => selected.has(record.path))
 							.map(({ record }) => record)
 					: [];
-				void plugin.runTasks(chosen, plugin.getTaskSelection());
+				void plugin.runTasks(chosen);
 			},
 		});
 		void excludedCount;
@@ -251,6 +274,72 @@ function renderBasesRoot(
 	searchInput.addEventListener("input", drawTable);
 	excludeToggle.addEventListener("change", drawTable);
 	drawTable();
+}
+
+function statusForCustomer(
+	plugin: OutreachPluginApi,
+	row: CustomerRow,
+): CustomerStatus {
+	const status = plugin.getCustomerDevStatus(row.record.path);
+	if (status) {
+		return {
+			text: statusLabel(status),
+			level: statusLevel(status),
+			title: status.message,
+		};
+	}
+	return {
+		text: row.record.fm[plugin.settings.linkPropertyName] ? "✓" : "—",
+	};
+}
+
+function renderBasesRunBanner(
+	container: HTMLElement,
+	plugin: OutreachPluginApi,
+): void {
+	const run = plugin.getLastRunStatus();
+	if (!run) return;
+	const summary = summarizeRunStatuses(run.customers);
+	if (summary.generatedCustomers === 0 && summary.attention.length === 0) {
+		return;
+	}
+	const banner = container.createDiv({ cls: "eo-run-banner" });
+	const parts: string[] = [];
+	if (summary.generatedCustomers > 0) {
+		parts.push(
+			`已生成 ${summary.generatedEmailCount} 封（${summary.generatedCustomers} 家）`,
+		);
+	}
+	if (summary.attention.length > 0) {
+		const names = summary.attention
+			.slice(0, 8)
+			.map((status) => `${status.customerName}（${statusLabel(status)}）`)
+			.join("、");
+		const more =
+			summary.attention.length > 8
+				? ` 等 ${summary.attention.length} 家`
+				: "";
+		parts.push(`未生成邮件：${names}${more}`);
+	}
+	banner.setText(`上次执行：${parts.join("；")}。`);
+}
+
+interface RefreshableBasesView {
+	refresh(): boolean;
+}
+
+const liveBasesViews = new Set<RefreshableBasesView>();
+
+/** 运行结束后刷新所有仍然挂载的 Bases 视图，让「开发状态」列立即更新。 */
+export function refreshBasesViews(): void {
+	for (const view of [...liveBasesViews]) {
+		try {
+			if (!view.refresh()) liveBasesViews.delete(view);
+		} catch (error) {
+			console.error("[email-outreach] 刷新 Bases 视图失败", error);
+			liveBasesViews.delete(view);
+		}
+	}
 }
 
 export interface BasesRegistrar {
@@ -283,18 +372,37 @@ export function registerBasesView(
 	if (!BaseClass || typeof plugin.registerBasesView !== "function") {
 		return false;
 	}
-	class OutreachBasesView extends BaseClass {
+	class OutreachBasesView extends BaseClass implements RefreshableBasesView {
 		readonly type = BASES_VIEW_TYPE;
 		private rootEl: HTMLElement;
 
-		constructor(controller: unknown, parentEl: HTMLElement) {
+		constructor(
+			controller: unknown,
+			parentEl: HTMLElement,
+			private pluginApi: OutreachPluginApi,
+		) {
 			super(controller);
 			this.rootEl = parentEl.createDiv({ cls: "eo-bases-host" });
-			renderBasesRoot(this.rootEl, this as unknown as BasesViewLike, plugin);
+			liveBasesViews.add(this);
+			renderBasesRoot(
+				this.rootEl,
+				this as unknown as BasesViewLike,
+				this.pluginApi,
+			);
+		}
+
+		refresh(): boolean {
+			if (!this.rootEl.isConnected) return false;
+			renderBasesRoot(
+				this.rootEl,
+				this as unknown as BasesViewLike,
+				this.pluginApi,
+			);
+			return true;
 		}
 
 		onDataUpdated(): void {
-			renderBasesRoot(this.rootEl, this as unknown as BasesViewLike, plugin);
+			this.refresh();
 		}
 	}
 
@@ -304,7 +412,7 @@ export function registerBasesView(
 				name: BASES_VIEW_NAME,
 				icon: "mail",
 				factory: (controller: unknown, parentEl: HTMLElement) =>
-					new OutreachBasesView(controller, parentEl),
+					new OutreachBasesView(controller, parentEl, plugin),
 			}),
 		);
 	} catch (error) {

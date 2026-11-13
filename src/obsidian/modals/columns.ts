@@ -38,7 +38,7 @@ export class ColumnsModal extends Modal {
 
 	onOpen(): void {
 		const { contentEl } = this;
-		contentEl.addClass("eo-modal eo-columns-modal");
+		contentEl.addClass("eo-modal", "eo-columns-modal");
 		contentEl.createEl("h2", { text: "工作台显示哪些属性" });
 		contentEl.createEl("p", {
 			cls: "eo-muted",
@@ -47,6 +47,12 @@ export class ColumnsModal extends Modal {
 		const list = contentEl.createDiv({ cls: "eo-columns-list" });
 		const render = (): void => {
 			list.empty();
+			if (this.preferences.length === 0) {
+				list.createDiv({
+					cls: "eo-empty",
+					text: "没有可显示的属性：请确认客户目录里已有带 frontmatter 的客户笔记。",
+				});
+			}
 			this.preferences.forEach((preference, index) => {
 				const row = list.createDiv({ cls: "eo-columns-row" });
 				const label = row.createEl("label");

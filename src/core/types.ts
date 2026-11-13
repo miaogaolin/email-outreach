@@ -64,109 +64,39 @@ export interface AnalysisResult {
 	languageSuggestion: LanguageSuggestion | null;
 }
 
+/** AI 产出的邮件草稿；发送时间由程序计算，不由 AI 返回。 */
 export interface EmailDraft {
 	contactId: string;
 	language: string;
 	emailSummaryZh: string;
 	subject: string;
 	body: string;
-	suggestedSendTime: string | null;
-	timezone: string | null;
-	timeReason: string | null;
 }
 
-export interface AIResult {
-	analysis: AnalysisResult | null;
-	email: EmailDraft | null;
+/** 每个客户每次最多生成多少封邮件。 */
+export const MAX_EMAILS_PER_CUSTOMER = 5;
+
+export type CustomerDevStatusKind =
+	| "generated"
+	| "no_contact"
+	| "no_suitable"
+	| "failed";
+
+/** 上次执行后某个客户的开发结果，用于列表里的提醒。 */
+export interface CustomerDevStatus {
+	kind: CustomerDevStatusKind;
+	customerName: string;
+	emailCount: number;
+	message: string;
+	at: string;
 }
 
-export interface TaskSelection {
-	customerType: boolean;
-	opportunity: boolean;
-	risk: boolean;
-	contactRecommendation: boolean;
-	email: boolean;
-	sendTime: boolean;
+export type DevStatusMap = Record<string, CustomerDevStatus>;
+
+export interface RunStatusFile {
+	at: string;
+	customers: DevStatusMap;
 }
-
-export const NO_TASKS: TaskSelection = {
-	customerType: false,
-	opportunity: false,
-	risk: false,
-	contactRecommendation: false,
-	email: false,
-	sendTime: false,
-};
-
-export const ALL_TASKS: TaskSelection = {
-	customerType: true,
-	opportunity: true,
-	risk: true,
-	contactRecommendation: true,
-	email: true,
-	sendTime: true,
-};
-
-export function cloneTasks(tasks: TaskSelection): TaskSelection {
-	return { ...tasks };
-}
-
-/** True when at least one analysis-side task is selected. */
-export function hasAnalysisTask(tasks: TaskSelection): boolean {
-	return (
-		tasks.customerType ||
-		tasks.opportunity ||
-		tasks.risk ||
-		tasks.contactRecommendation
-	);
-}
-
-/** The task list the AI is actually asked to perform, with dependencies added. */
-export function effectiveTasks(tasks: TaskSelection): TaskSelection {
-	const result = cloneTasks(tasks);
-	if (result.email) {
-		result.contactRecommendation = true;
-	}
-	if (result.sendTime && !result.email) {
-		result.sendTime = false;
-	}
-	return result;
-}
-
-export function anyTask(tasks: TaskSelection): boolean {
-	return (
-		tasks.customerType ||
-		tasks.opportunity ||
-		tasks.risk ||
-		tasks.contactRecommendation ||
-		tasks.email ||
-		tasks.sendTime
-	);
-}
-
-/**
- * Whether a separate analysis request is needed.
- *
- * When only an email is requested, the email request already selects the
- * recipient, so a second analysis call would be wasted tokens.
- */
-export function needsAnalysisRequest(tasks: TaskSelection): boolean {
-	return (
-		tasks.customerType ||
-		tasks.opportunity ||
-		tasks.risk ||
-		(tasks.contactRecommendation && !tasks.email)
-	);
-}
-
-export const TASK_LABELS: Record<keyof TaskSelection, string> = {
-	customerType: "分析 Customer Type",
-	opportunity: "评估 Opportunity（Fit / Intent / Potential）",
-	risk: "识别客户风险（Risk）",
-	contactRecommendation: "推荐优先联系的联系人",
-	email: "生成开发邮件",
-	sendTime: "推荐邮件发送时间及理由",
-};
 
 export interface CustomerRecord {
 	path: string;
@@ -181,13 +111,13 @@ export interface EmailRunResult {
 	customer: CustomerRecord;
 	contacts: Contact[];
 	contactWarnings: ParseWarning[];
-	analysis: AnalysisResult | null;
-	email: EmailDraft | null;
+	/** 本次已落盘的邮件（可能不止一封）。 */
+	emails: EmailRecord[];
 	errors: string[];
 	warnings: string[];
-	rawAnalysis: string | null;
 	rawEmail: string | null;
 	emailPath: string | null;
+	status: CustomerDevStatus;
 }
 
 export interface RunProgress {

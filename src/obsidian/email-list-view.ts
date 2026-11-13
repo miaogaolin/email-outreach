@@ -1,4 +1,9 @@
-import { ItemView, type WorkspaceLeaf } from "obsidian";
+import { ItemView, Notice, type WorkspaceLeaf } from "obsidian";
+import { emailUpdatedAt, formatEmailTime } from "../core/ai-file";
+import {
+	summarizeRunStatuses,
+	statusLabel,
+} from "../core/run-status";
 import type { EmailRow, EmailStatus } from "../core/types";
 import { EMAIL_STATUSES } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
@@ -93,9 +98,31 @@ export class EmailListView extends ItemView {
 			.createEl("button", { text: "客户工作台" })
 			.addEventListener("click", () => this.plugin.openWorkbench());
 
+		this.renderRunBanner(container);
 		this.tableContainer = container.createDiv({ cls: "eo-table-wrap" });
 		this.renderTable(container);
 		void rows;
+	}
+
+	private renderRunBanner(container: HTMLElement): void {
+		const run = this.plugin.getLastRunStatus();
+		if (!run) return;
+		const summary = summarizeRunStatuses(run.customers);
+		if (summary.attention.length === 0) return;
+		const banner = container.createDiv({ cls: "eo-run-banner" });
+		const names = summary.attention
+			.slice(0, 5)
+			.map((status) => `${status.customerName}（${statusLabel(status)}）`)
+			.join("、");
+		const more =
+			summary.attention.length > 5
+				? ` 等 ${summary.attention.length} 家`
+				: "";
+		banner.setText(
+			`上次执行有 ${summary.attention.length} 家客户没有生成邮件：${names}${more}。可回到客户工作台查看「开发状态」列。`,
+		);
+		const button = banner.createEl("button", { text: "客户工作台" });
+		button.addEventListener("click", () => this.plugin.openWorkbench());
 	}
 
 	private tableContainer: HTMLElement | null = null;
@@ -149,6 +176,7 @@ export class EmailListView extends ItemView {
 			"中文摘要",
 			"建议发送时间",
 			"状态",
+			"更新时间",
 			"版本",
 		]) {
 			head.createEl("th", { text: label });
@@ -160,7 +188,24 @@ export class EmailListView extends ItemView {
 			tr.addEventListener("click", () => {
 				this.plugin.openEmailDetail(row.key);
 			});
-			tr.createEl("td", { text: row.customerName });
+
+			const customerCell = tr.createEl("td");
+			if (row.customerLink) {
+				const link = customerCell.createEl("a", {
+					cls: "internal-link",
+					text: row.customerName || row.customerLink,
+					attr: { href: "#", "data-href": row.customerLink },
+				});
+				link.setAttr("title", `打开客户：${row.customerLink}`);
+				link.addEventListener("click", (event) => {
+					event.preventDefault();
+					event.stopPropagation();
+					this.openCustomer(row);
+				});
+			} else {
+				customerCell.setText(row.customerName || "（未关联客户）");
+			}
+
 			tr.createEl("td", { text: row.record.contact });
 			tr.createEl("td", { text: row.record.email });
 
@@ -179,6 +224,9 @@ export class EmailListView extends ItemView {
 							: "未建议时间"
 					}`,
 				);
+				if (row.record.timeReason) {
+					meta.setAttr("title", row.record.timeReason);
+				}
 				const excerpt = popover.createEl("pre", { cls: "eo-preview-body" });
 				excerpt.setText(
 					row.record.body.length > 500
@@ -187,18 +235,40 @@ export class EmailListView extends ItemView {
 				);
 			});
 
-			tr.createEl("td", {
+			const timeCell = tr.createEl("td", {
 				text: row.record.suggestedTime
 					? `${row.record.suggestedTime}${row.record.timezone ? ` · ${row.record.timezone}` : ""}`
 					: "—",
 			});
+			if (row.record.timeReason) {
+				timeCell.setAttr("title", row.record.timeReason);
+			}
 			const statusCell = tr.createEl("td");
 			statusCell.createSpan({
 				cls: `eo-status eo-status-${row.record.status.toLowerCase()}`,
 				text: STATUS_LABELS[row.record.status],
 			});
+			const updatedAt = emailUpdatedAt(row.record);
+			const updatedCell = tr.createEl("td", {
+				cls: "eo-updated-cell",
+				text: updatedAt ? formatEmailTime(updatedAt) : "—",
+			});
+			if (updatedAt) updatedCell.setAttr("title", updatedAt);
 			tr.createEl("td", { text: String(row.record.versions.length) });
 		}
 		void container;
+	}
+
+	/** 客户列是双链：点开客户笔记，而不是进入邮件详情。 */
+	private openCustomer(row: EmailRow): void {
+		const target = this.app.metadataCache.getFirstLinkpathDest(
+			row.customerLink,
+			row.filePath,
+		);
+		if (!target) {
+			new Notice(`找不到客户文件：${row.customerName || row.customerLink}`);
+			return;
+		}
+		void this.plugin.openFile(target.path);
 	}
 }

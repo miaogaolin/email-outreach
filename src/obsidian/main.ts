@@ -7,30 +7,25 @@ import {
 import {
 	analysisRecordToResult,
 	addEmailVersion,
-	emptyCustomerAIFile,
-	nextEmailId,
+	currentEmailVersion,
 	parseCustomerAIFile,
-	renderCustomerAIFile,
 	setEmailStatus,
-	updateAnalysisInContent,
-	updateEmailInContent,
 } from "../core/ai-file";
-import { findContact, parseContacts } from "../core/contact-parser";
+import { findContactByEmail } from "../core/contact-parser";
 import {
 	collectPropertyKeys,
 	isExcluded,
 } from "../core/filters";
 import {
-	aiFileName,
-	aiFilePath,
 	feedbackFilePath,
 	isoNow,
 	localStamp,
 	normalizeDir,
-	shortStamp,
 } from "../core/filenames";
+import { nextFollowUpCount } from "../core/follow-up";
 import { guessLanguage, languageLabel } from "../core/language";
 import {
+	buildEmailRevisionPrompt,
 	buildEmailUserPrompt,
 	buildRuleSystemPrompt,
 	buildRuleUserPrompt,
@@ -41,31 +36,29 @@ import {
 	type PromptCustomer,
 	type RuleDraft,
 } from "../core/prompt";
+import { summarizeRunStatuses } from "../core/run-status";
 import { parseJsonLoose, validateAIResult } from "../core/schema";
-import { selectedPatch, nextFollowUpCount, buildCandidates } from "../core/merge";
+import { pruneSelection } from "../core/selection";
+import { planSendTime, sendHistoryFrom } from "../core/send-time";
 import type {
-	AnalysisRecord,
-	AnalysisResult,
 	CustomerAIFile,
+	CustomerDevStatus,
 	CustomerRecord,
+	DevStatusMap,
 	EmailRow,
 	RunOutcome,
-	TaskSelection,
+	RunStatusFile,
 } from "../core/types";
+import { MAX_EMAILS_PER_CUSTOMER } from "../core/types";
 import {
-	ALL_TASKS,
-	cloneTasks,
-	effectiveTasks,
-	hasAnalysisTask,
-	needsAnalysisRequest,
-	TASK_LABELS,
-} from "../core/types";
-import {
-	parseSingleWikilink,
 	toWikilink,
 } from "../core/wikilinks";
 import { AIClient, CanceledError } from "./ai-client";
-import { registerBasesView, BASES_VIEW_TYPE } from "./bases-view";
+import {
+	registerBasesView,
+	refreshBasesViews,
+	BASES_VIEW_TYPE,
+} from "./bases-view";
 import { CustomerRepo } from "./customer-repo";
 import { EmailStore } from "./email-store";
 import { EmailListView } from "./email-list-view";
@@ -81,12 +74,15 @@ import { EmailOutreachSettingTab, type SettingsHost } from "./settings-tab";
 import { StateStore } from "./state-store";
 import { VaultAdapter } from "./vault-adapter";
 import { WorkbenchView } from "./workbench-view";
-import { AnalysisReviewModal, type AnalysisPlan } from "./modals/analysis-review";
 import { BaseStarterModal } from "./modals/base-starter";
 import { ColumnsModal } from "./modals/columns";
 import { confirm, ProgressModal } from "./modals/confirm";
 import { ContactModal } from "./modals/contacts";
-import { EmailDetailModal, type EmailDetailHost } from "./modals/email-detail";
+import {
+	EmailDetailModal,
+	type EmailDetailHost,
+	type RegenerateProgressEvent,
+} from "./modals/email-detail";
 import { LanguageModal } from "./modals/language";
 import { RuleModal } from "./modals/rule";
 import { SelfCheckModal } from "./modals/self-check";
@@ -123,10 +119,14 @@ export default class EmailOutreachPlugin
 	private selected = new Set<string>();
 	private saveChain: Promise<void> = Promise.resolve();
 	private refreshTimer: number | null = null;
+	private selectionSaveTimer: number | null = null;
+	private devStatus: DevStatusMap = {};
+	private lastRunStatusFile: RunStatusFile | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.initializeServices();
+		await this.loadDevStatus();
 
 		this.registerView(WORKBENCH_VIEW_TYPE, (leaf: WorkspaceLeaf) =>
 			new WorkbenchView(leaf, this),
@@ -190,6 +190,11 @@ export default class EmailOutreachPlugin
 		if (this.refreshTimer !== null) {
 			window.clearTimeout(this.refreshTimer);
 		}
+		if (this.selectionSaveTimer !== null) {
+			window.clearTimeout(this.selectionSaveTimer);
+			this.selectionSaveTimer = null;
+			void this.saveSettings();
+		}
 	}
 
 	private async loadViewsOnce(): Promise<void> {
@@ -218,6 +223,36 @@ export default class EmailOutreachPlugin
 			() => this.settings.outputDir,
 			this.adapter,
 		);
+	}
+
+	private async loadDevStatus(): Promise<void> {
+		try {
+			const file = await this.state.loadLastRunStatus();
+			if (!file) return;
+			this.lastRunStatusFile = file;
+			this.devStatus = file.customers;
+		} catch (error) {
+			console.error("[email-outreach] 加载上次执行状态失败", error);
+		}
+	}
+
+	getCustomerDevStatus(path: string): CustomerDevStatus | null {
+		return this.devStatus[path] ?? null;
+	}
+
+	getLastRunStatus(): RunStatusFile | null {
+		return this.lastRunStatusFile;
+	}
+
+	private async persistDevStatus(results: RunOutcome["results"]): Promise<void> {
+		if (results.length === 0) return;
+		const customers: DevStatusMap = {};
+		for (const result of results) {
+			customers[result.customer.path] = result.status;
+		}
+		this.devStatus = customers;
+		this.lastRunStatusFile = { at: isoNow(), customers };
+		await this.state.saveLastRunStatus(customers);
 	}
 
 	private registerEvents(): void {
@@ -266,16 +301,14 @@ export default class EmailOutreachPlugin
 
 	private async loadSettings(): Promise<void> {
 		const stored = (await this.loadData()) as Partial<Settings> | null;
-		const merged = { ...DEFAULT_SETTINGS, ...(stored ?? {}) };
+		const merged: Settings = { ...DEFAULT_SETTINGS, ...(stored ?? {}) };
 		merged.builtinFilters = {
 			conditions: [],
 			showExcluded: false,
 			...(stored?.builtinFilters ?? {}),
 		};
-		merged.lastTasks = {
-			...DEFAULT_SETTINGS.lastTasks,
-			...(stored?.lastTasks ?? {}),
-		};
+		// 旧版本保存过 lastTasks；任务选择已经删除，这里顺手清掉。
+		delete (merged as unknown as Record<string, unknown>).lastTasks;
 		if (!Array.isArray(merged.excludeTags)) {
 			merged.excludeTags = [...DEFAULT_SETTINGS.excludeTags];
 		}
@@ -283,6 +316,7 @@ export default class EmailOutreachPlugin
 			merged.excludeProgressPrefixes = [];
 		}
 		if (!Array.isArray(merged.selectedCustomers)) merged.selectedCustomers = [];
+		if (!Array.isArray(merged.availableModels)) merged.availableModels = [];
 		this.settings = merged;
 
 		const secret = this.secretStorage();
@@ -344,6 +378,13 @@ export default class EmailOutreachPlugin
 		await this.saveSettings();
 	}
 
+	async listModels(): Promise<string[]> {
+		const models = await this.client.listModels();
+		this.settings.availableModels = models;
+		await this.saveSettings();
+		return models;
+	}
+
 	// --------------------------------------------------------------- selection
 
 	getSelected(): Set<string> {
@@ -353,22 +394,25 @@ export default class EmailOutreachPlugin
 	setSelected(paths: Set<string>): void {
 		this.selected = new Set(paths);
 		this.settings.selectedCustomers = Array.from(this.selected);
-		void this.saveSettings();
+		// 连续勾选时合并写入 data.json；每次点击都写盘会拖慢复选框。
+		if (this.selectionSaveTimer !== null) {
+			window.clearTimeout(this.selectionSaveTimer);
+		}
+		this.selectionSaveTimer = window.setTimeout(() => {
+			this.selectionSaveTimer = null;
+			void this.saveSettings();
+		}, 300);
 	}
 
-	getTaskSelection(): TaskSelection {
-		return cloneTasks(this.settings.lastTasks ?? ALL_TASKS);
-	}
-
-	setTaskSelection(tasks: TaskSelection): void {
-		this.settings.lastTasks = cloneTasks(tasks);
-		void this.saveSettings();
+	pruneSelection(allowed: Iterable<string>): Set<string> {
+		const next = pruneSelection(this.selected, allowed);
+		if (next.size === this.selected.size) return this.selected;
+		this.setSelected(next);
+		return next;
 	}
 
 	clearSelection(): void {
-		this.selected = new Set();
-		this.settings.selectedCustomers = [];
-		void this.saveSettings();
+		this.setSelected(new Set());
 		this.refreshWorkbenchViews();
 	}
 
@@ -377,6 +421,7 @@ export default class EmailOutreachPlugin
 			const view = leaf.view;
 			if (view instanceof WorkbenchView) view.refresh();
 		}
+		refreshBasesViews();
 	}
 
 	// ------------------------------------------------------------------- views
@@ -515,10 +560,7 @@ export default class EmailOutreachPlugin
 
 	// -------------------------------------------------------------------- run
 
-	async runTasks(
-		records: CustomerRecord[],
-		tasks: TaskSelection,
-	): Promise<void> {
+	async runTasks(records: CustomerRecord[]): Promise<void> {
 		const problems = getConfigProblems(this.settings);
 		if (problems.length > 0) {
 			new Notice(
@@ -533,18 +575,15 @@ export default class EmailOutreachPlugin
 			new Notice("请先在客户列表里勾选客户");
 			return;
 		}
-		const effective = effectiveTasks(tasks);
 
 		let languageOverrides = new Map<string, string>();
-		if (effective.email) {
-			const unknown = chosen.filter(
-				(record) => !guessLanguage(record.fm["地区"]),
-			);
-			if (unknown.length > 0) {
-				const result = await new LanguageModal(this.app, unknown).openAndWait();
-				if (result === null) return;
-				languageOverrides = result;
-			}
+		const unknown = chosen.filter(
+			(record) => !guessLanguage(record.fm["地区"]),
+		);
+		if (unknown.length > 0) {
+			const result = await new LanguageModal(this.app, unknown).openAndWait();
+			if (result === null) return;
+			languageOverrides = result;
 		}
 
 		let knowledge: KnowledgeBundle;
@@ -563,20 +602,21 @@ export default class EmailOutreachPlugin
 		}
 
 		const feedbackRules = await this.readFeedbackRules();
-		const requests =
-			chosen.length *
-			((needsAnalysisRequest(tasks) ? 1 : 0) + (effective.email ? 1 : 0));
-
 		const confirmed = await confirm(this.app, {
-			title: "确认执行 AI 任务",
-			confirmText: `确认执行（约 ${requests} 个请求）`,
+			title: "生成开发邮件",
+			confirmText: `开始生成（最多 ${chosen.length} 个请求）`,
 			build: (container) => {
 				container.createEl("p", { text: `客户数量：${chosen.length} 家` });
 				const list = container.createEl("ul");
-				for (const key of Object.keys(TASK_LABELS) as (keyof TaskSelection)[]) {
-					if (!effective[key]) continue;
-					list.createEl("li", { text: `✓ ${TASK_LABELS[key]}` });
-				}
+				list.createEl("li", {
+					text: "只为有邮箱且适合的联系人生成，一个客户可能生成多封（最多 5 封）",
+				});
+				list.createEl("li", {
+					text: "发送时间按客户地区时区、跟进次数和已发送记录自动计算",
+				});
+				list.createEl("li", {
+					text: "没有可用联系人的客户不会调用 AI，并会在列表里标记",
+				});
 				container.createEl("p", {
 					cls: "eo-muted",
 					text: `知识库：${knowledge.mainPath} + ${knowledge.articles.length} 篇关联文章（${knowledge.totalChars} 字）`,
@@ -586,9 +626,6 @@ export default class EmailOutreachPlugin
 						cls: "eo-muted",
 						text: "本次会参考已确认的 Feedback 规则。",
 					});
-				}
-				if (!hasAnalysisTask(effective) && !effective.email) {
-					container.createEl("p", { text: "没有勾选任何可执行任务。" });
 				}
 			},
 		});
@@ -616,7 +653,6 @@ export default class EmailOutreachPlugin
 		try {
 			outcome = await pipeline.run({
 				customers: chosen,
-				tasks: effective,
 				languageOverrides,
 				token,
 				onProgress: (event) => {
@@ -640,116 +676,35 @@ export default class EmailOutreachPlugin
 			progress.close();
 		}
 
+		await this.persistDevStatus(outcome.results);
+		this.refreshWorkbenchViews();
 		await this.refreshEmailList();
-		if (outcome.canceled) {
-			new Notice("已取消；已经生成的内容已保存在磁盘上");
-		}
 		if (outcome.errors.length > 0) {
 			console.error("[email-outreach] 本次执行错误", outcome.errors);
 		}
-		const withAnalysis = outcome.results.filter((result) => result.analysis);
-		if (withAnalysis.length > 0) {
-			new AnalysisReviewModal(
-				this.app,
-				withAnalysis,
-				effective,
-				async (plans) => {
-					await this.applyAnalysis(plans);
-				},
-				() => void this.openEmailList(),
-			).open();
-		} else if (outcome.writtenFiles.length > 0) {
-			new Notice(
-				`已生成 ${outcome.writtenFiles.length} 封邮件草稿，请到邮件列表审核`,
-				8000,
-			);
-		}
-		if (outcome.errors.length > 0) {
-			new Notice(
-				`有 ${outcome.errors.length} 个客户出现错误，详情见分析确认窗口或控制台`,
-				9000,
-			);
-		}
-	}
 
-	private async applyAnalysis(plans: AnalysisPlan[]): Promise<void> {
-		let writtenCustomers = 0;
-		let skipped = 0;
-		for (const plan of plans) {
-			const patch = selectedPatch(plan.candidates);
-			const keys = Object.keys(patch);
-			if (keys.length === 0) {
-				skipped++;
-				continue;
-			}
-			const customer = plan.result.customer;
-			const analysis = plan.result.analysis;
-			if (!analysis) continue;
-			try {
-				await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
-					for (const key of keys) {
-						frontmatter[key] = patch[key];
-					}
-				});
-				const history = keys
-					.map((key) => {
-						const candidate = plan.candidates.find((item) => item.key === key);
-						const before =
-							candidate?.oldValue === undefined ||
-							candidate?.oldValue === null ||
-							String(candidate.oldValue).trim() === ""
-								? "无"
-								: String(candidate.oldValue);
-						return `${key} ${before} → ${String(patch[key])}`;
-					})
-					.join(" · ");
-				await this.writeAnalysisBack(
-					customer,
-					analysis,
-					`${shortStamp()} · ${history}`,
-				);
-				writtenCustomers++;
-			} catch (error) {
-				new Notice(
-					`写入 ${customer.name} 失败：${error instanceof Error ? error.message : String(error)}`,
-					9000,
-				);
-			}
-		}
-		new Notice(
-			`已更新 ${writtenCustomers} 家客户的属性${skipped > 0 ? `，${skipped} 家跳过` : ""}`,
+		const summary = summarizeRunStatuses(
+			outcome.results.length > 0 ? this.devStatus : {},
 		);
-		this.refreshWorkbenchViews();
-	}
-
-	private async writeAnalysisBack(
-		customer: CustomerRecord,
-		analysis: AnalysisResult,
-		historyLine: string,
-	): Promise<void> {
-		const path = aiFilePath(this.settings.outputDir, customer.name);
-		const record: AnalysisRecord = {
-			customerType: analysis.customerType,
-			fit: analysis.fit,
-			intent: analysis.intent,
-			potential: analysis.potential,
-			risk: analysis.risk,
-			riskNotes: analysis.riskNotes,
-			unknownFields: analysis.unknownFields,
-			notes: analysis.analysisNotes,
-		};
-		if (this.adapter.exists(path)) {
-			const content = await this.adapter.read(path);
-			await this.adapter.write(
-				path,
-				updateAnalysisInContent(content, record, historyLine),
+		const parts: string[] = [];
+		if (summary.generatedCustomers > 0) {
+			parts.push(
+				`已生成 ${summary.generatedEmailCount} 封（${summary.generatedCustomers} 家）`,
 			);
-			return;
 		}
-		const file = emptyCustomerAIFile(customer.name);
-		file.analysis = record;
-		file.analysisHistory = [historyLine];
-		await this.adapter.write(path, renderCustomerAIFile(file));
+		if (summary.noContact > 0) {
+			parts.push(`${summary.noContact} 家无可用联系人`);
+		}
+		if (summary.noSuitable > 0) {
+			parts.push(`${summary.noSuitable} 家未找到合适联系人`);
+		}
+		if (summary.failed > 0) {
+			parts.push(`${summary.failed} 家失败，详情见开发状态列和控制台`);
+		}
+		if (outcome.canceled) {
+			parts.push("已取消，已完成的内容已保存");
+		}
+		new Notice(parts.length > 0 ? parts.join("；") : "本次没有生成邮件", 9000);
 	}
 
 	// -------------------------------------------------------------- email flow
@@ -775,20 +730,43 @@ export default class EmailOutreachPlugin
 		await this.refreshEmailList();
 	}
 
-	async regenerateEmail(row: EmailRow, comment: string): Promise<void> {
+	async regenerateEmail(
+		row: EmailRow,
+		comment: string,
+		onProgress?: (event: RegenerateProgressEvent) => void,
+	): Promise<boolean> {
+		const report = (
+			step: string,
+			detail?: string,
+			fraction?: number,
+		): void => {
+			onProgress?.({ step, detail, fraction });
+		};
 		if (row.record.sent) {
 			new Notice("已发送的邮件不能重新生成");
-			return;
+			return false;
 		}
 		const problems = getConfigProblems(this.settings);
 		if (problems.length > 0) {
 			new Notice(problems.map((problem) => problem.message).join("\n"));
-			return;
+			return false;
 		}
+		report("读取输出目录里已保存的版本", row.filePath, 0.05);
+		// 重新生成只认输出目录里的真实内容；界面里未保存的编辑一律不参与。
 		const content = await this.adapter.read(row.filePath);
 		const parsed = parseCustomerAIFile(content);
 		const record = parsed.file.emails.find((item) => item.id === row.record.id);
 		if (!record) throw new Error("AI 文件中找不到这封邮件");
+		if (record.sent) {
+			new Notice("已发送的邮件不能重新生成");
+			return false;
+		}
+		const version = currentEmailVersion(record);
+		report(
+			"准备客户资料",
+			`已保存版本 v${version} · ${record.subject || "（无 Subject）"}`,
+			0.12,
+		);
 		const customer = await this.resolveCustomer(row.filePath, parsed.file.customerLink);
 		if (!customer) throw new Error("客户文件链接失效，无法重新生成");
 		const loaded = await this.knowledgeLoader.load();
@@ -798,6 +776,14 @@ export default class EmailOutreachPlugin
 			Math.max(500, this.settings.truncateBodyChars),
 		);
 		const contacts = payload.contacts.contacts;
+		const focusContact = findContactByEmail(
+			contacts,
+			record.email,
+			record.contact,
+		);
+		if (!focusContact || focusContact.emails.length === 0) {
+			throw new Error("找不到原邮件联系人，无法重新生成");
+		}
 		const validationContext = {
 			contactIds: new Set(contacts.map((contact) => contact.id)),
 			contactEmails: new Map(
@@ -828,30 +814,52 @@ export default class EmailOutreachPlugin
 			contacts,
 			analysis: analysisRecordToResult(parsed.file.analysis),
 			language,
-			sendTimeRequested: Boolean(record.suggestedTime),
+			maxEmails: MAX_EMAILS_PER_CUSTOMER,
+			focusContactId: focusContact.id,
+			emailHistory: parsed.file.emails.filter(
+				(item) => item.id !== record.id,
+			),
 		});
-		const prompt =
-			`${basePrompt}\n\n## 本次是修改现有邮件\n` +
-			`原邮件 Subject：${record.subject}\n` +
-			`原邮件 Body：\n${record.body}\n\n` +
-			`用户修改意见：${comment.trim() || "没有具体意见，请写得更准确、更有说服力"}\n` +
-			"请输出修改后的完整邮件 JSON；contact_id 使用联系人列表中的 id。";
-		const raw = await this.client.complete(buildSystemPrompt(), prompt);
+		const prompt = buildEmailRevisionPrompt({
+			basePrompt,
+			original: {
+				subject: record.subject,
+				body: record.body,
+				version,
+			},
+			comment,
+		});
+		report(
+			"AI 正在重新生成邮件",
+			`模型 ${this.settings.model} · 依据已保存的 v${version} · 超时 ${Math.round(this.settings.timeoutMs / 1000)} 秒`,
+		);
+		const raw = await this.client.complete(
+			buildSystemPrompt(MAX_EMAILS_PER_CUSTOMER),
+			prompt,
+		);
+		report("校验 AI 返回", undefined, 0.85);
 		const validation = validateAIResult(
 			parseJsonLoose(raw),
 			validationContext,
-			"email",
 		);
-		if (!validation.ok || !validation.email) {
+		const draft = validation.emails.find(
+			(item) => item.contactId === focusContact.id,
+		);
+		if (!validation.ok || !draft) {
 			throw new Error(
-				`AI 返回未通过校验：${validation.errors.map((error) => error.message).join("；")}`,
+				`AI 返回未通过校验：${validation.errors.map((error) => error.message).join("；") || "没有为原联系人生成邮件"}`,
 			);
 		}
-		const draft = validation.email;
-		const contact = findContact(contacts, draft.contactId);
-		if (!contact || contact.emails.length === 0) {
-			throw new Error("找不到修改后邮件的收件人邮箱");
-		}
+		const history = sendHistoryFrom(
+			customer.fm,
+			parsed.file.emails.filter((item) => item.id !== record.id),
+		);
+		const plan = planSendTime({
+			region: customer.fm["地区"],
+			now: new Date(),
+			history,
+			sequence: 0,
+		});
 		let updated = addEmailVersion(record, {
 			subject: draft.subject,
 			body: draft.body,
@@ -864,15 +872,18 @@ export default class EmailOutreachPlugin
 			summaryZh: draft.emailSummaryZh,
 			language: draft.language,
 			languageLabel: languageLabel(draft.language),
-			contact: contact.raw,
-			email: contact.emails[0]!,
-			suggestedTime: draft.suggestedSendTime,
-			timezone: draft.timezone,
-			timeReason: draft.timeReason,
+			contact: focusContact.raw,
+			email: focusContact.emails[0]!,
+			suggestedTime: plan.suggestedTime,
+			timezone: plan.timezone,
+			timeReason: plan.timeReason,
 		};
+		report("写入输出目录", row.filePath, 0.95);
 		await this.emailStore.saveRecord(row.filePath, updated);
+		report("完成", `已写入 v${currentEmailVersion(updated)}`, 1);
 		new Notice("已生成新版本");
 		await this.refreshEmailList();
+		return true;
 	}
 
 	async acceptEmail(row: EmailRow): Promise<void> {
@@ -988,7 +999,8 @@ export default class EmailOutreachPlugin
 			},
 		});
 		if (!confirmed) return;
-		const updated = { ...row.record, sent: true, sentAt: isoNow() };
+		const sentAt = isoNow();
+		const updated = { ...row.record, sent: true, sentAt, updatedAt: sentAt };
 		await this.emailStore.saveRecord(row.filePath, updated);
 		try {
 			await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
@@ -1144,9 +1156,15 @@ export default class EmailOutreachPlugin
 			`[目录] 输出目录 ${outputDir || "（空）"}：${outputDir && this.adapter.isFolder(outputDir) ? "存在" : "尚未创建（首次生成时自动创建）"}`,
 		);
 		if (this.settings.instructionFile.trim()) {
-			lines.push(
-				`[指令文件] ${this.settings.instructionFile}：${this.adapter.getFile(this.settings.instructionFile) ? "存在" : "不存在"}`,
+			const resolution = this.knowledgeLoader.resolveMainFile(
+				this.settings.instructionFile,
 			);
+			const state = resolution.file
+				? `存在 → ${resolution.file.path}`
+				: resolution.duplicates.length > 0
+					? `同名文件有多个：${resolution.duplicates.join("、")}`
+					: `不存在（已尝试：${resolution.tried.join("、")}）`;
+			lines.push(`[指令文件] ${this.settings.instructionFile}：${state}`);
 		}
 
 		const knowledge = await this.getKnowledgeSummary();

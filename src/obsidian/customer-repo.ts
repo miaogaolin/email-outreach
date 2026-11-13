@@ -54,6 +54,9 @@ export class CustomerRepo {
 	private cache: CustomerRecord[] = [];
 	private cacheKey = "";
 	private cacheTime = 0;
+	/** 联系人数量按 path + mtime 缓存，避免每次刷新工作台都重读所有客户笔记。 */
+	private contactCounts = new Map<string, { mtime: number; count: number }>();
+	private contactCountLoads = new Map<string, Promise<number>>();
 
 	constructor(
 		private app: App,
@@ -115,6 +118,40 @@ export class CustomerRepo {
 		return this.list().find((record) => record.path === path) ?? null;
 	}
 
+	/** 已缓存的联系人数量；null 表示还没读取或文件已变化。 */
+	getContactCount(record: CustomerRecord): number | null {
+		const cached = this.contactCounts.get(record.path);
+		if (!cached || cached.mtime !== record.mtime) return null;
+		return cached.count;
+	}
+
+	/** 读取并缓存一个客户的联系人数量。并发调用同一个文件时只读一次。 */
+	async loadContactCount(record: CustomerRecord): Promise<number> {
+		const cached = this.getContactCount(record);
+		if (cached !== null) return cached;
+		// key 里带上 mtime：文件刚改过时不能复用旧内容的读取任务。
+		const key = `${record.path}\u0000${record.mtime}`;
+		const inFlight = this.contactCountLoads.get(key);
+		if (inFlight) return inFlight;
+		const promise = this.readContactCount(record).finally(() => {
+			if (this.contactCountLoads.get(key) === promise) {
+				this.contactCountLoads.delete(key);
+			}
+		});
+		this.contactCountLoads.set(key, promise);
+		return promise;
+	}
+
+	private async readContactCount(record: CustomerRecord): Promise<number> {
+		const file = this.adapter.getFile(record.path) as TFile | null;
+		const content = file
+			? await this.app.vault.cachedRead(file)
+			: await this.adapter.read(record.path);
+		const count = parseContacts(content).contacts.length;
+		this.contactCounts.set(record.path, { mtime: record.mtime, count });
+		return count;
+	}
+
 	async load(
 		record: CustomerRecord,
 		truncateChars: number,
@@ -124,6 +161,10 @@ export class CustomerRepo {
 			? await this.app.vault.cachedRead(file)
 			: await this.adapter.read(record.path);
 		const contacts = parseContacts(content);
+		this.contactCounts.set(record.path, {
+			mtime: record.mtime,
+			count: contacts.contacts.length,
+		});
 		const contactSection = extractContactSection(content);
 		let body = stripFrontmatter(content);
 		if (contactSection) {

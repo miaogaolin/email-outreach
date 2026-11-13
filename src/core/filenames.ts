@@ -19,6 +19,38 @@ export function normalizeDir(dir: string): string {
 	return dir.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "").trim();
 }
 
+/**
+ * Candidate vault paths for a file the user typed into settings.
+ *
+ * People paste paths in many shapes: a wikilink, a quoted path, a Windows
+ * path, or (most often) a path without the `.md` extension. Returning several
+ * candidates lets the caller try them against the vault instead of failing on
+ * a path that looks correct to the user.
+ */
+export function fileSettingCandidates(raw: string): string[] {
+	let value = raw
+		.trim()
+		.replace(/^\uFEFF/, "")
+		.replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+		.trim();
+	const link = /^!?\[\[([^\]]+)\]\]$/.exec(value);
+	if (link) {
+		value = (link[1] ?? "").split("|")[0]!.split("#")[0]!.trim();
+	}
+	value = value
+		.replace(/\\/g, "/")
+		.replace(/^\.\/+/, "")
+		.replace(/^\/+/, "")
+		.replace(/\/{2,}/g, "/")
+		.replace(/\/+$/, "");
+	if (!value) return [];
+	const candidates = [value];
+	// The instruction file is always Markdown. Append `.md` unless it is
+	// already there, so names such as "AI 2.0" keep their dots.
+	if (!/\.md$/i.test(value)) candidates.push(`${value}.md`);
+	return candidates;
+}
+
 export function joinPath(...parts: string[]): string {
 	return parts
 		.filter((part) => part !== undefined && part !== null && part !== "")

@@ -1,18 +1,13 @@
 import { findContact } from "../core/contact-parser";
 import {
 	analysisRecordToResult,
-	appendEmailToContent,
+	appendEmailsToContent,
 	createEmailRecord,
 	parseCustomerAIFile,
 } from "../core/ai-file";
-import {
-	aiFilePath,
-	isoNow,
-	sanitizeFileName,
-} from "../core/filenames";
+import { aiFilePath, isoNow, sanitizeFileName } from "../core/filenames";
 import { guessLanguage, languageLabel } from "../core/language";
 import {
-	buildAnalysisUserPrompt,
 	buildEmailUserPrompt,
 	buildSystemPrompt,
 	type KnowledgeBundle,
@@ -20,16 +15,22 @@ import {
 	type PromptCustomer,
 } from "../core/prompt";
 import { parseJsonLoose, validateAIResult } from "../core/schema";
+import {
+	planSendTime,
+	sendHistoryFrom,
+} from "../core/send-time";
 import type {
 	AnalysisResult,
+	Contact,
+	CustomerDevStatus,
 	CustomerRecord,
 	EmailDraft,
+	EmailRecord,
 	EmailRunResult,
 	RunOutcome,
 	RunProgress,
-	TaskSelection,
 } from "../core/types";
-import { hasAnalysisTask, needsAnalysisRequest } from "../core/types";
+import { MAX_EMAILS_PER_CUSTOMER } from "../core/types";
 import { AIClient, CanceledError, type CancelToken } from "./ai-client";
 import type { CustomerRepo } from "./customer-repo";
 import type { Settings } from "./settings";
@@ -50,7 +51,6 @@ export interface PipelineDeps {
 
 export interface PipelineOptions {
 	customers: CustomerRecord[];
-	tasks: TaskSelection;
 	languageOverrides: Map<string, string>;
 	token: CancelToken;
 	onProgress?: (event: RunProgress) => void;
@@ -60,8 +60,8 @@ export interface PipelineOptions {
 interface RequestOutcome {
 	raw: string;
 	ok: boolean;
-	analysis: AnalysisResult | null;
-	email: EmailDraft | null;
+	emails: EmailDraft[];
+	noSuitableContactReason: string | null;
 	errors: string[];
 	warnings: string[];
 }
@@ -70,7 +70,7 @@ export class Pipeline {
 	constructor(private deps: PipelineDeps) {}
 
 	async run(options: PipelineOptions): Promise<RunOutcome> {
-		const { customers, tasks } = options;
+		const { customers } = options;
 		const batchId = `${Date.now()}`;
 		const results: EmailRunResult[] = new Array(customers.length);
 		const writtenFiles: string[] = [];
@@ -97,7 +97,6 @@ export class Pipeline {
 				try {
 					result = await this.processCustomer(
 						customer,
-						tasks,
 						options,
 						batchId,
 					);
@@ -128,12 +127,12 @@ export class Pipeline {
 		const ordered = results.filter((item): item is EmailRunResult => Boolean(item));
 		await this.deps.state.saveRun(batchId, {
 			at: isoNow(),
-			tasks,
 			results: ordered.map((result) => ({
 				customer: result.customer.path,
+				status: result.status,
+				emails: result.emails.map((email) => email.id),
 				errors: result.errors,
 				warnings: result.warnings,
-				rawAnalysis: result.rawAnalysis,
 				rawEmail: result.rawEmail,
 				emailPath: result.emailPath,
 			})),
@@ -149,27 +148,63 @@ export class Pipeline {
 		};
 	}
 
+	private failedStatus(
+		customer: CustomerRecord,
+		message: string,
+	): CustomerDevStatus {
+		return {
+			kind: "failed",
+			customerName: customer.name,
+			emailCount: 0,
+			message,
+			at: isoNow(),
+		};
+	}
+
 	private failedResult(
 		customer: CustomerRecord,
 		error: unknown,
 	): EmailRunResult {
+		const message = error instanceof Error ? error.message : String(error);
 		return {
 			customer,
 			contacts: [],
 			contactWarnings: [],
-			analysis: null,
-			email: null,
-			errors: [error instanceof Error ? error.message : String(error)],
+			emails: [],
+			errors: [message],
 			warnings: [],
-			rawAnalysis: null,
 			rawEmail: null,
 			emailPath: null,
+			status: this.failedStatus(customer, message),
+		};
+	}
+
+	private resultWith(
+		customer: CustomerRecord,
+		contacts: Contact[],
+		contactWarnings: EmailRunResult["contactWarnings"],
+		emails: EmailRecord[],
+		errors: string[],
+		warnings: string[],
+		rawEmail: string | null,
+		emailPath: string | null,
+		status: CustomerDevStatus,
+	): EmailRunResult {
+		return {
+			customer,
+			contacts,
+			contactWarnings,
+			emails,
+			errors,
+			warnings,
+			rawEmail,
+			emailPath,
+			status,
 		};
 	}
 
 	private async processCustomer(
 		customer: CustomerRecord,
-		tasks: TaskSelection,
 		options: PipelineOptions,
 		batchId: string,
 	): Promise<EmailRunResult> {
@@ -184,6 +219,34 @@ export class Pipeline {
 			(warning) => `第 ${warning.line} 行：${warning.message}`,
 		);
 		const errors: string[] = [];
+
+		const emailContacts = contacts.filter(
+			(contact) => contact.emails.length > 0,
+		);
+		if (emailContacts.length === 0) {
+			const message =
+				contacts.length === 0
+					? "没有解析到联系人区段，未调用 AI"
+					: "联系人都没有可用邮箱，未调用 AI";
+			const status: CustomerDevStatus = {
+				kind: "no_contact",
+				customerName: customer.name,
+				emailCount: 0,
+				message,
+				at: isoNow(),
+			};
+			return this.resultWith(
+				customer,
+				contacts,
+				payload.contacts.warnings,
+				[],
+				errors,
+				[...warnings, message],
+				null,
+				null,
+				status,
+			);
+		}
 
 		const promptCustomer: PromptCustomer = {
 			name: customer.name,
@@ -205,15 +268,30 @@ export class Pipeline {
 		const aiPath = aiFilePath(settings.outputDir, customer.name);
 		let existingFileContent: string | null = null;
 		let existingAnalysis: AnalysisResult | null = null;
+		let existingEmails: EmailRecord[] = [];
 		if (adapter.exists(aiPath)) {
 			try {
-				existingFileContent = await adapter.read(aiPath);
-				const parsed = parseCustomerAIFile(existingFileContent);
+				const content = await adapter.read(aiPath);
+				const parsed = parseCustomerAIFile(content);
 				existingAnalysis = analysisRecordToResult(parsed.file.analysis);
+				existingEmails = parsed.file.emails;
+				existingFileContent = content;
 				warnings.push(...parsed.file.warnings);
 			} catch (error) {
-				warnings.push(
-					`读取已有 AI 文件失败：${error instanceof Error ? error.message : String(error)}`,
+				const message = `读取已有 AI 文件失败，未写入：${
+					error instanceof Error ? error.message : String(error)
+				}`;
+				errors.push(message);
+				return this.resultWith(
+					customer,
+					contacts,
+					payload.contacts.warnings,
+					[],
+					errors,
+					warnings,
+					null,
+					null,
+					this.failedStatus(customer, message),
 				);
 			}
 		}
@@ -237,124 +315,174 @@ export class Pipeline {
 					}
 				: null;
 
-		const system = buildSystemPrompt();
-		let analysis: AnalysisResult | null = null;
-		let rawAnalysis: string | null = null;
-
-		if (needsAnalysisRequest(tasks)) {
-			const analysisPrompt = buildAnalysisUserPrompt({
-				knowledge: this.deps.knowledge,
-				feedbackRules: this.deps.feedbackRules,
-				customer: promptCustomer,
-				contacts,
-				tasks: {
-					...tasks,
-					email: false,
-					sendTime: false,
-				},
-				existingAnalysis,
-				regionLanguage: language,
-			});
-			const outcome = await this.requestValidated(
-				system,
-				analysisPrompt,
-				validationContext,
-				"analysis",
-				options.token,
-			);
-			rawAnalysis = outcome.raw;
-			analysis = outcome.analysis;
-			errors.push(...outcome.errors);
-			warnings.push(...outcome.warnings);
-			if (!outcome.ok) {
-				await this.deps.state.saveRaw(
-					batchId,
-					customer.name,
-					"analysis",
-					outcome.raw,
-				);
-			}
-		}
-
-		let email: EmailDraft | null = null;
-		let rawEmail: string | null = null;
-		let emailPath: string | null = null;
-
-		if (tasks.email) {
-			const emailPrompt = buildEmailUserPrompt({
-				knowledge: this.deps.knowledge,
-				feedbackRules: this.deps.feedbackRules,
-				customer: promptCustomer,
-				contacts,
-				analysis: analysis ?? existingAnalysis,
-				language,
-				sendTimeRequested: tasks.sendTime,
-			});
-			const outcome = await this.requestValidated(
-				system,
-				emailPrompt,
-				validationContext,
+		const emailPrompt = buildEmailUserPrompt({
+			knowledge: this.deps.knowledge,
+			feedbackRules: this.deps.feedbackRules,
+			customer: promptCustomer,
+			contacts,
+			analysis: existingAnalysis,
+			language,
+			maxEmails: MAX_EMAILS_PER_CUSTOMER,
+			focusContactId: null,
+			emailHistory: existingEmails,
+		});
+		const outcome = await this.requestValidated(
+			buildSystemPrompt(MAX_EMAILS_PER_CUSTOMER),
+			emailPrompt,
+			validationContext,
+			options.token,
+		);
+		errors.push(...outcome.errors);
+		warnings.push(...outcome.warnings);
+		if (!outcome.ok) {
+			await this.deps.state.saveRaw(
+				batchId,
+				customer.name,
 				"email",
-				options.token,
+				outcome.raw,
 			);
-			rawEmail = outcome.raw;
-			email = outcome.email;
-			errors.push(...outcome.errors);
-			warnings.push(...outcome.warnings);
-			if (!outcome.ok || !outcome.email) {
-				await this.deps.state.saveRaw(
-					batchId,
-					customer.name,
-					"email",
-					outcome.raw,
-				);
-			} else {
-				const contact = findContact(contacts, outcome.email.contactId);
-				if (!contact || contact.emails.length === 0) {
-					errors.push("校验通过但找不到对应联系人邮箱");
-				} else {
-					const record = createEmailRecord({
-						contactRaw: contact.raw,
-						email: contact.emails[0]!,
-						language: outcome.email.language,
-						languageLabel: languageLabel(outcome.email.language),
-						summaryZh: outcome.email.emailSummaryZh,
-						subject: outcome.email.subject,
-						body: outcome.email.body,
-						suggestedTime: outcome.email.suggestedSendTime,
-						timezone: outcome.email.timezone,
-						timeReason: outcome.email.timeReason,
-					});
-					try {
-						const content = appendEmailToContent(
-							existingFileContent,
-							customer.name,
-							record,
-						);
-						await adapter.write(aiPath, content);
-						existingFileContent = content;
-						emailPath = aiPath;
-					} catch (error) {
-						errors.push(
-							`写入 AI 文件失败：${error instanceof Error ? error.message : String(error)}`,
-						);
-					}
-				}
-			}
+			const message = `AI 返回未通过校验：${outcome.errors
+				.map((error) => error)
+				.join("；")}`;
+			return this.resultWith(
+				customer,
+				contacts,
+				payload.contacts.warnings,
+				[],
+				errors.length > 0 ? errors : [message],
+				warnings,
+				outcome.raw,
+				null,
+				this.failedStatus(customer, message),
+			);
 		}
 
-		return {
+		if (outcome.emails.length === 0) {
+			const reason =
+				outcome.noSuitableContactReason ??
+				"AI 未找到适合发送开发邮件的联系人";
+			const status: CustomerDevStatus = {
+				kind: "no_suitable",
+				customerName: customer.name,
+				emailCount: 0,
+				message: reason,
+				at: isoNow(),
+			};
+			return this.resultWith(
+				customer,
+				contacts,
+				payload.contacts.warnings,
+				[],
+				errors,
+				[...warnings, reason],
+				outcome.raw,
+				null,
+				status,
+			);
+		}
+
+		const now = new Date();
+		const history = sendHistoryFrom(customer.fm, existingEmails);
+		const records: EmailRecord[] = [];
+		outcome.emails.forEach((draft, index) => {
+			const contact = findContact(contacts, draft.contactId);
+			if (!contact || contact.emails.length === 0) {
+				errors.push(`找不到联系人 ${draft.contactId} 的邮箱，已跳过这封邮件`);
+				return;
+			}
+			const plan = planSendTime({
+				region,
+				now,
+				history,
+				sequence: index,
+			});
+			records.push(
+				createEmailRecord({
+					contactRaw: contact.raw,
+					email: contact.emails[0]!,
+					language: draft.language,
+					languageLabel: languageLabel(draft.language),
+					summaryZh: draft.emailSummaryZh,
+					subject: draft.subject,
+					body: draft.body,
+					suggestedTime: plan.suggestedTime,
+					timezone: plan.timezone,
+					timeReason: plan.timeReason,
+				}),
+			);
+		});
+
+		if (records.length === 0) {
+			const message = "校验通过但没有可落盘的邮件";
+			errors.push(message);
+			await this.deps.state.saveRaw(
+				batchId,
+				customer.name,
+				"email",
+				outcome.raw,
+			);
+			return this.resultWith(
+				customer,
+				contacts,
+				payload.contacts.warnings,
+				[],
+				errors,
+				warnings,
+				outcome.raw,
+				null,
+				this.failedStatus(customer, message),
+			);
+		}
+
+		try {
+			const content = appendEmailsToContent(
+				existingFileContent,
+				customer.name,
+				records,
+			);
+			await adapter.write(aiPath, content);
+		} catch (error) {
+			const message = `写入 AI 文件失败：${
+				error instanceof Error ? error.message : String(error)
+			}`;
+			errors.push(message);
+			return this.resultWith(
+				customer,
+				contacts,
+				payload.contacts.warnings,
+				[],
+				errors,
+				warnings,
+				outcome.raw,
+				null,
+				this.failedStatus(customer, message),
+			);
+		}
+
+		const partial = outcome.warnings.some(
+			(warning) =>
+				warning.includes("已跳过") || warning.includes("只采用前"),
+		);
+		const status: CustomerDevStatus = {
+			kind: "generated",
+			customerName: customer.name,
+			emailCount: records.length,
+			message: partial
+				? `已生成 ${records.length} 封（部分邮件未通过校验）`
+				: `已生成 ${records.length} 封`,
+			at: isoNow(),
+		};
+		return this.resultWith(
 			customer,
 			contacts,
-			contactWarnings: payload.contacts.warnings,
-			analysis,
-			email,
+			payload.contacts.warnings,
+			records,
 			errors,
 			warnings,
-			rawAnalysis,
-			rawEmail,
-			emailPath,
-		};
+			outcome.raw,
+			aiPath,
+			status,
+		);
 	}
 
 	private async requestValidated(
@@ -365,16 +493,11 @@ export class Pipeline {
 			contactEmails: Map<string, string[]>;
 			maxBodyChars: number;
 		},
-		mode: "analysis" | "email",
 		token: CancelToken,
 	): Promise<RequestOutcome> {
 		const client = this.deps.client;
 		let raw = await client.complete(system, prompt, token);
-		let validation = validateAIResult(
-			parseJsonLoose(raw),
-			context,
-			mode,
-		);
+		let validation = validateAIResult(parseJsonLoose(raw), context);
 		if (!validation.ok) {
 			const detail = validation.errors
 				.map((error) => `${error.field}: ${error.message}`)
@@ -385,17 +508,13 @@ export class Pipeline {
 				`上次输出（已截断）：\n${raw.slice(0, 4000)}\n\n` +
 				"请根据错误修正，仍然只输出完整 JSON。";
 			raw = await client.complete(system, repairPrompt, token);
-			validation = validateAIResult(
-				parseJsonLoose(raw),
-				context,
-				mode,
-			);
+			validation = validateAIResult(parseJsonLoose(raw), context);
 		}
 		return {
 			raw,
 			ok: validation.ok,
-			analysis: validation.analysis,
-			email: validation.email,
+			emails: validation.emails,
+			noSuitableContactReason: validation.noSuitableContactReason,
 			errors: validation.errors.map(
 				(error) => `${error.field}: ${error.message}`,
 			),

@@ -14,7 +14,10 @@ export type FilterOp =
 export interface FilterCondition {
 	key: string;
 	op: FilterOp;
+	/** 单值条件的值。文本类条件也兼容旧数据：没有 values 时按单值处理。 */
 	value: string;
+	/** 文本类条件的多个值；任一命中即匹配（neq/not_contains 表示全部不命中）。 */
+	values?: string[];
 	value2?: string;
 }
 
@@ -59,6 +62,36 @@ const PREFERRED_KEYS = [
 	"邮箱",
 	"tags",
 ];
+
+/** 文本比较类操作可以同时选多个值；数值/为空类操作仍只用单值。 */
+export function supportsMultipleValues(op: FilterOp): boolean {
+	return op === "eq" || op === "neq" || op === "contains" || op === "not_contains";
+}
+
+/**
+ * 条件实际参与比较的值。新数据用 `values` 保存多选，旧数据只有 `value`。
+ * 去空白、忽略大小写去重，并保留用户输入时的原始大小写。
+ */
+export function conditionValues(condition: FilterCondition): string[] {
+	const source =
+		Array.isArray(condition.values) && condition.values.length > 0
+			? condition.values
+			: condition.value
+				? [condition.value]
+				: [];
+	const result: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of source) {
+		if (typeof raw !== "string") continue;
+		const value = raw.trim();
+		if (!value) continue;
+		const key = value.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		result.push(value);
+	}
+	return result;
+}
 
 export function normalizeTag(tag: string): string {
 	return tag.trim().replace(/^#/, "").toLowerCase();
@@ -138,25 +171,43 @@ function stringContains(left: unknown, right: string): boolean {
 	return valueToString(left).toLowerCase().includes(right.trim().toLowerCase());
 }
 
+/**
+ * 多选文本条件按「任一命中」匹配。没有有效值时保持旧行为：
+ * `eq ""` 匹配空值，`contains ""` 匹配所有值。
+ */
+function matchesAnyTarget(
+	values: unknown[],
+	targets: string[],
+	compare: (left: unknown, right: string) => boolean,
+): boolean {
+	if (targets.length === 0) {
+		return values.some((value) => compare(value, ""));
+	}
+	return values.some((value) =>
+		targets.some((target) => compare(value, target)),
+	);
+}
+
 export function matchCondition(
 	record: CustomerRecord,
 	condition: FilterCondition,
 ): boolean {
 	const values = asArray(record.fm[condition.key]);
-	const target = condition.value ?? "";
+	const targets = conditionValues(condition);
+	const target = targets[0] ?? condition.value ?? "";
 	switch (condition.op) {
 		case "empty":
 			return values.length === 0 || values.every(isEmptyValue);
 		case "not_empty":
 			return values.some((value) => !isEmptyValue(value));
 		case "eq":
-			return values.some((value) => stringEquals(value, target));
+			return matchesAnyTarget(values, targets, stringEquals);
 		case "neq":
-			return !values.some((value) => stringEquals(value, target));
+			return !matchesAnyTarget(values, targets, stringEquals);
 		case "contains":
-			return values.some((value) => stringContains(value, target));
+			return matchesAnyTarget(values, targets, stringContains);
 		case "not_contains":
-			return !values.some((value) => stringContains(value, target));
+			return !matchesAnyTarget(values, targets, stringContains);
 		case "gt": {
 			const threshold = toNumber(target);
 			if (threshold === null) return true;

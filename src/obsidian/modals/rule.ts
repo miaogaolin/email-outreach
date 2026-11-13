@@ -16,7 +16,7 @@ export class RuleModal extends Modal {
 
 	onOpen(): void {
 		const { contentEl } = this;
-		contentEl.addClass("eo-modal eo-rule-modal");
+		contentEl.addClass("eo-modal", "eo-rule-modal");
 		contentEl.createEl("h2", { text: "保存为长期规则" });
 		contentEl.createEl("p", {
 			cls: "eo-muted",

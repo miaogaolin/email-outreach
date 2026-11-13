@@ -1,14 +1,18 @@
 import {
 	applyFilters,
 	collectPropertyKeys,
+	conditionValues,
 	distinctValues,
 	inferPropertyType,
 	isExcluded,
+	supportsMultipleValues,
 } from "../src/core/filters";
+import { pruneSelection, selectionSummary } from "../src/core/selection";
 import { guessLanguage, languageLabel } from "../src/core/language";
 import { extractWikiLinks, parseSingleWikilink, pathToLinkTarget } from "../src/core/wikilinks";
 import { summaryWarnings, looksChinese } from "../src/core/summary";
-import { aiFileName, aiFilePath, sanitizeFileName } from "../src/core/filenames";
+import { aiFileName, aiFilePath, fileSettingCandidates, sanitizeFileName } from "../src/core/filenames";
+import { nextFollowUpCount, parseFollowUpCount } from "../src/core/follow-up";
 import type { CustomerRecord } from "../src/core/types";
 import { suite, test, assert, assertEqual } from "./harness";
 
@@ -98,6 +102,82 @@ test("numeric and text conditions combine with AND", () => {
 	assertEqual(result.included.map((item) => item.name), ["Gallaway Safety & Supply"], "组合筛选");
 });
 
+test("multiple values on one property match with OR", () => {
+	const rules = { tags: [], progressPrefixes: [] };
+	const byRegion = applyFilters(
+		records,
+		{
+			conditions: [
+				{ key: "地区", op: "eq", value: "", values: ["美国", "俄罗斯"] },
+			],
+			showExcluded: true,
+		},
+		rules,
+	);
+	assertEqual(
+		byRegion.included.map((item) => item.name),
+		["Gallaway Safety & Supply", "Airgas Store", "lablte.ru"],
+		"地区多选任意命中",
+	);
+
+	const byTag = applyFilters(
+		records,
+		{
+			conditions: [
+				{ key: "tags", op: "contains", value: "", values: ["公海", "五星"] },
+			],
+			showExcluded: true,
+		},
+		rules,
+	);
+	assertEqual(byTag.included.length, 4, "标签多选任意命中");
+
+	const notRegion = applyFilters(
+		records,
+		{
+			conditions: [
+				{ key: "地区", op: "neq", value: "", values: ["美国", "德国"] },
+			],
+			showExcluded: true,
+		},
+		rules,
+	);
+	assertEqual(
+		notRegion.included.map((item) => item.name),
+		["lablte.ru"],
+		"不等于多个值表示全部不命中",
+	);
+});
+
+test("multiple-value conditions still accept legacy single values", () => {
+	const legacy = applyFilters(
+		records,
+		{
+			conditions: [{ key: "地区", op: "eq", value: "美国" }],
+			showExcluded: true,
+		},
+		{ tags: [], progressPrefixes: [] },
+	);
+	assertEqual(legacy.included.length, 2, "旧数据单值行为不变");
+	assertEqual(
+		conditionValues({ key: "tags", op: "contains", value: " 五星 " }),
+		["五星"],
+		"value 兼容并去空白",
+	);
+	assertEqual(
+		conditionValues({
+			key: "tags",
+			op: "contains",
+			value: "",
+			values: ["五星", " 公海 ", "五星"],
+		}),
+		["五星", "公海"],
+		"values 去空白并按大小写去重",
+	);
+	assert(supportsMultipleValues("contains"), "包含支持多值");
+	assert(!supportsMultipleValues("gt"), "数值比较不支持多值");
+});
+
 test("progress prefix exclusion", () => {
 	const rules = { tags: [], progressPrefixes: ["2.初步开发"] };
 	assert(isExcluded(records[0]!, rules), "前缀命中");
@@ -110,6 +190,43 @@ test("property keys are ordered and typed", () => {
 	assertEqual(inferPropertyType(records, "最近联系时间"), "date", "日期类型");
 	assertEqual(inferPropertyType(records, "tags"), "tags", "标签类型");
 	assert(distinctValues(records, "地区").includes("美国"), "去重值");
+});
+
+suite("selection");
+test("pruneSelection drops paths hidden by the current filter", () => {
+	assertEqual(
+		Array.from(pruneSelection(["a", "b", "c"], ["b", "c", "d"])),
+		["b", "c"],
+		"只保留可见客户",
+	);
+	assertEqual(
+		Array.from(pruneSelection(["a"], [])),
+		[],
+		"没有可见客户时清空",
+	);
+});
+
+test("selectionSummary 只统计当前可见行", () => {
+	assertEqual(
+		selectionSummary(["a", "b"], new Set(["a", "b"])),
+		{ checked: true, indeterminate: false, selectedCount: 2 },
+		"全部勾选",
+	);
+	assertEqual(
+		selectionSummary(["a", "b"], new Set(["a", "hidden"])),
+		{ checked: false, indeterminate: true, selectedCount: 1 },
+		"部分勾选时隐藏项不参与统计",
+	);
+	assertEqual(
+		selectionSummary(["a", "b"], new Set(["hidden"])),
+		{ checked: false, indeterminate: false, selectedCount: 0 },
+		"不可见项不算全选",
+	);
+	assertEqual(
+		selectionSummary([], new Set()),
+		{ checked: false, indeterminate: false, selectedCount: 0 },
+		"没有可见行",
+	);
 });
 
 suite("language");
@@ -154,4 +271,50 @@ test("sanitizes names and builds the AI file path", () => {
 		"4. AI Output/邮件开发/Gallaway Safety & Supply - AI开发信息.md",
 		"完整路径",
 	);
+});
+
+suite("file setting paths");
+test("accepts missing extension, wikilinks, quotes and Windows separators", () => {
+	assertEqual(
+		fileSettingCandidates("2. Permanent/AI邮件开发说明"),
+		["2. Permanent/AI邮件开发说明", "2. Permanent/AI邮件开发说明.md"],
+		"缺省 .md",
+	);
+	assertEqual(
+		fileSettingCandidates('  "2. Permanent\\AI邮件开发说明.md"  '),
+		["2. Permanent/AI邮件开发说明.md"],
+		"Windows 分隔符与引号",
+	);
+	assertEqual(
+		fileSettingCandidates("[[2. Permanent/AI邮件开发说明|主指令]]"),
+		["2. Permanent/AI邮件开发说明", "2. Permanent/AI邮件开发说明.md"],
+		"双链与别名",
+	);
+	assertEqual(
+		fileSettingCandidates("/2. Permanent/AI邮件开发说明.md"),
+		["2. Permanent/AI邮件开发说明.md"],
+		"去掉开头的斜杠",
+	);
+	assertEqual(
+		fileSettingCandidates("AI邮件开发说明.MD"),
+		["AI邮件开发说明.MD"],
+		"已有扩展名不重复追加",
+	);
+	assertEqual(
+		fileSettingCandidates("AI 2.0"),
+		["AI 2.0", "AI 2.0.md"],
+		"文件名里的点不当作扩展名",
+	);
+	assertEqual(fileSettingCandidates("   "), [], "空路径");
+});
+
+suite("follow-up");
+test("跟进次数解析与 +1", () => {
+	assertEqual(parseFollowUpCount(2), 2, "数字");
+	assertEqual(parseFollowUpCount("3"), 3, "字符串");
+	assertEqual(parseFollowUpCount("  "), 0, "空值");
+	assertEqual(parseFollowUpCount("abc"), 0, "非法值");
+	assertEqual(parseFollowUpCount(-1), 0, "负数");
+	assertEqual(nextFollowUpCount(undefined), 1, "第一次跟进");
+	assertEqual(nextFollowUpCount("2"), 3, "已有次数 +1");
 });

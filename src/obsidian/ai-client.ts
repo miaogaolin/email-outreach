@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import { modelsEndpoint, parseModelList } from "../core/models";
 import type { Settings } from "./settings";
 
 export class AIError extends Error {
@@ -61,6 +62,13 @@ function buildEndpoint(baseUrl: string): string {
 	return `${trimmed}/chat/completions`;
 }
 
+/** 与 chat 端点同源：去掉 `/chat/completions`，补 `/models`。 */
+function buildModelsEndpoint(baseUrl: string): string {
+	const endpoint = modelsEndpoint(baseUrl);
+	if (!endpoint) throw new AIError("未设置 API 地址", false);
+	return endpoint;
+}
+
 export class AIClient {
 	constructor(private getSettings: () => Settings) {}
 
@@ -85,6 +93,51 @@ export class AIClient {
 		}
 		if (lastError instanceof Error) throw lastError;
 		throw new AIError("AI 请求失败", false);
+	}
+
+	/**
+	 * 读取 OpenAI 兼容接口的 `GET /models`，返回该服务实际提供的模型 id。
+	 * 不支持的服务（如部分只做 chat 的中转）会抛错，调用方保留手动填写入口。
+	 */
+	async listModels(): Promise<string[]> {
+		const settings = this.getSettings();
+		const endpoint = buildModelsEndpoint(settings.apiBaseUrl);
+		const headers: Record<string, string> = { Accept: "application/json" };
+		const key = settings.apiKey.trim();
+		if (key) headers.Authorization = `Bearer ${key}`;
+
+		const response = await withTimeout(
+			requestUrl({
+				url: endpoint,
+				method: "GET",
+				headers,
+				throw: false,
+			}),
+			Math.min(30000, Math.max(10000, settings.timeoutMs)),
+		);
+
+		if (response.status < 200 || response.status >= 300) {
+			const detail = (response.text ?? "").slice(0, 300);
+			throw new AIError(
+				`获取模型列表失败：接口返回 ${response.status}${detail ? `：${detail}` : ""}`,
+				false,
+			);
+		}
+
+		let data: unknown = null;
+		try {
+			data = response.json;
+		} catch {
+			data = null;
+		}
+		const models = parseModelList(data);
+		if (models.length === 0) {
+			throw new AIError(
+				"接口没有返回模型列表；该服务可能不支持 /models，请手动填写模型名称",
+				false,
+			);
+		}
+		return models;
 	}
 
 	private async requestOnce(

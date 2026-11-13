@@ -4,11 +4,13 @@
 
 ## 定位与边界
 
-- 插件只做：筛选客户、解析联系人、调用 AI、审核、把结果写回 Markdown。
+- 插件只做：筛选客户、解析联系人、调用 AI 生成开发邮件、审核、把邮件写回 Markdown。
 - **不发送邮件**，不监控回复，不抓客户网站。
-- 客户原始笔记只允许写：`客户类型`、`fit`、`indent`、`potential`、`risk`、`AI开发信息`、`跟进次数`、`最近联系时间`。
-  - 前 6 项必须经过用户在「分析确认」里逐字段勾选。
+- 一个客户可以针对多位适合的联系人各生成一封邮件（每客户每次最多 5 封）；本地没有带邮箱联系人不调用 AI，AI 判断没有合适联系人时只标记提醒。
+- 客户原始笔记只允许写：`AI开发信息`、`跟进次数`、`最近联系时间`。
+  - `AI开发信息` 只在验收通过时写入一个双链。
   - `跟进次数` / `最近联系时间` 只能由「标记已发送」更新。
+- 旧 AI 文件里的 `## AI 分析` 区段仍会解析，作为写邮件的参考上下文；新生成不再产生分析结果，也不再自动写客户分析字段。
 - AI 输出结构由插件定义（`src/core/schema.ts`），指令文件只能提供业务知识，不能改变字段。
 
 ## 目录结构
@@ -39,17 +41,19 @@ node scripts/smoke-load.cjs
 1. `src/core/**` 不得 `import "obsidian"`；所有 Obsidian API 只能在 `src/obsidian/**`。
 2. AI 返回必须先 `parseJsonLoose` → `validateAIResult` → 才能落盘。禁止跳过校验。
 3. 收件邮箱只能来自本地联系人解析结果；AI 返回的邮箱仅用于比对。
-4. 写客户 frontmatter 只能经 `adapter.updateFrontmatter`，且写入值来自用户勾选的 `FieldCandidate`。
+4. 写客户 frontmatter 只能经 `adapter.updateFrontmatter`，且只允许写验收双链与「标记已发送」的跟进字段。
 5. 修改邮件只能在原邮件块上追加版本（`addEmailVersion`），不新建「副本文件」。
 6. 一个客户 = 一个 `{客户名} - AI开发信息.md`；客户属性只放一个双链（默认 `AI开发信息`）。
-7. API 失败/取消不得删除已生成内容；未确认分析写 `{输出目录}/.state/`。
+7. API 失败/取消不得删除已生成内容；失败原始响应写 `{输出目录}/.state/`；已有 AI 文件无法解析时不得覆盖。
 
 ## 数据契约不变式
 
 - AI 开发信息文件：`src/core/ai-file.ts` 的 `renderCustomerAIFile` / `parseCustomerAIFile` 必须保持往返一致（`tests/ai-file.test.ts`）。
 - 邮件块标题格式：`### 邮件 NNN · 联系人 · 状态`；元数据为 `- key: value`；版本用动态加长反引号围栏。
+- 一个客户可以有多封邮件（多位适合联系人），全部追加在同一个 AI 开发信息文件里，ID 连续。
+- 发送时间由 `src/core/send-time.ts` 计算，不从 AI 接收；依据客户地区时区、`跟进次数`、`最近联系时间`、已发送邮件记录。
 - 不写 `customer_path`；客户定位只用 `customer: "[[...]]"`。
-- 评分 1–10（允许 .5）；`unknown_fields` 中的字段一律按 null 处理。
+- 旧 AI 文件的分析区段仍按原格式解析；新生成不再写分析字段。
 - `email_summary_zh` 必须简体中文，30–60 字仅告警、不拦截。
 
 ## 改动流程
@@ -69,6 +73,7 @@ node scripts/smoke-load.cjs
 - Bases API 自 1.10 起提供，但类型与行为仍在演进；只依赖 `data` / `config` / `onDataUpdated`，不要缓存 `entry` / `view.data` 引用。
 - 客户改名时双链会自动更新，但 AI 文件名不会自动改；有「同步 AI 文件名」需求时另做命令。
 - `.obsidian/` 不被 vault 索引，也不是 fast-note-sync 的同步对象；备份靠 git push。
+- 发送时间用 `Intl.DateTimeFormat` 按客户 IANA 时区计算，测试传固定 `now`；不要用运行机器本地时区猜客户时间。
 
 ## 提交约定
 

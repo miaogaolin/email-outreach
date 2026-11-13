@@ -4,11 +4,38 @@
  */
 import { createRequire } from "node:module";
 import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
-const outDir = ".test-build";
-rmSync(outDir, { recursive: true, force: true });
+
+/**
+ * 优先用工作区里的 .test-build；某些沙箱按设计禁止递归删除工作区内容
+ * （即使允许写入），这时退到系统临时目录，避免测试直接跑不起来。
+ */
+function prepareOutDir() {
+	const preferred = ".test-build";
+	try {
+		rmSync(preferred, { recursive: true, force: true });
+		return preferred;
+	} catch {
+		const fallback = path.join(
+			tmpdir(),
+			`email-outreach-test-${process.pid}`,
+		);
+		process.once("exit", () => {
+			try {
+				rmSync(fallback, { recursive: true, force: true });
+			} catch {
+				// temp cleanup is best-effort
+			}
+		});
+		return fallback;
+	}
+}
+
+const outDir = prepareOutDir();
 
 const rootNames = ts.sys.readDirectory(
 	"tests",
@@ -56,4 +83,4 @@ if (diagnostics.length > 0) {
 	process.exit(1);
 }
 
-require(`../${outDir}/tests/run.js`);
+require(path.resolve(outDir, "tests", "run.js"));

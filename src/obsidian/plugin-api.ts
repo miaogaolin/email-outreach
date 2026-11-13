@@ -1,5 +1,11 @@
 import type { App } from "obsidian";
-import type { CustomerAIFile, CustomerRecord, EmailRow, TaskSelection } from "../core/types";
+import type {
+	CustomerAIFile,
+	CustomerDevStatus,
+	CustomerRecord,
+	EmailRow,
+	RunStatusFile,
+} from "../core/types";
 import type { CustomerRepo } from "./customer-repo";
 import type { EmailStore } from "./email-store";
 import type { Settings } from "./settings";
@@ -13,10 +19,11 @@ export interface OutreachPluginApi {
 
 	getSelected(): Set<string>;
 	setSelected(paths: Set<string>): void;
-	getTaskSelection(): TaskSelection;
-	setTaskSelection(tasks: TaskSelection): void;
+	pruneSelection(allowed: Iterable<string>): Set<string>;
 
-	runTasks(records: CustomerRecord[], tasks: TaskSelection): Promise<void>;
+	runTasks(records: CustomerRecord[]): Promise<void>;
+	getCustomerDevStatus(path: string): CustomerDevStatus | null;
+	getLastRunStatus(): RunStatusFile | null;
 	openContacts(record: CustomerRecord): Promise<void>;
 	openEmailDetail(key: string): void;
 	openEmailList(): void;

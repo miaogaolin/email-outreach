@@ -32,7 +32,7 @@ export class LanguageModal extends Modal {
 
 	onOpen(): void {
 		const { contentEl } = this;
-		contentEl.addClass("eo-modal eo-language-modal");
+		contentEl.addClass("eo-modal", "eo-language-modal");
 		contentEl.createEl("h2", { text: "确认邮件语言" });
 		contentEl.createEl("p", {
 			text: "以下客户无法从「地区」可靠判断邮件语言。请先指定，或让 AI 自行判断。",

@@ -2,9 +2,11 @@ import { ItemView, type App, type WorkspaceLeaf } from "obsidian";
 import {
 	applyFilters,
 	collectPropertyKeys,
+	conditionValues,
 	distinctValues,
 	FILTER_OP_LABELS,
 	inferPropertyType,
+	supportsMultipleValues,
 	type FilterCondition,
 	type FilterOp,
 } from "../core/filters";
@@ -15,8 +17,11 @@ import {
 	renderCustomerTable,
 	type CustomerColumn,
 	type CustomerRow,
+	type CustomerStatus,
 } from "./table";
-import { renderTaskBar } from "./task-bar";
+import { renderRunBar, type RunBarHandle } from "./run-bar";
+import { fillContactCounts } from "./contact-counts";
+import { summarizeRunStatuses, statusLabel, statusLevel } from "../core/run-status";
 import { ColumnsModal } from "./modals/columns";
 
 const DEFAULT_COLUMNS = [
@@ -55,6 +60,10 @@ export class WorkbenchView extends ItemView {
 	private appRef: App;
 	private plugin: OutreachPluginApi;
 	private sortState: { key: string; dir: 1 | -1 } | null;
+	/** 重新渲染筛选框后保持值选择器展开。 */
+	private openValuePicker: FilterCondition | null = null;
+	/** 每次重绘递增；异步补联系人数量时用它丢弃过期结果。 */
+	private renderToken = 0;
 
 	constructor(leaf: WorkspaceLeaf, plugin: OutreachPluginApi) {
 		super(leaf);
@@ -79,11 +88,17 @@ export class WorkbenchView extends ItemView {
 		this.render();
 	}
 
+	async onClose(): Promise<void> {
+		// 视图关闭后不再往已销毁的表格里补数据。
+		this.renderToken++;
+	}
+
 	refresh(): void {
 		this.render();
 	}
 
 	private render(): void {
+		const token = ++this.renderToken;
 		const container = this.contentEl;
 		container.empty();
 		container.addClass("eo-workbench");
@@ -128,32 +143,39 @@ export class WorkbenchView extends ItemView {
 			})),
 		);
 
-		const selected = plugin.getSelected();
+		// 筛选条件变化后，已经不可见的客户不能继续留在选区里，
+		// 否则用户无法取消勾选，只能删掉筛选条件。
+		const selected = plugin.pruneSelection(rows.map((row) => row.key));
+		this.renderRunBanner(container);
 		const tableContainer = container.createDiv({ cls: "eo-table-wrap" });
 		const columns = this.buildColumns(records);
-		renderCustomerTable(tableContainer, {
+		let runBar: RunBarHandle | null = null;
+		const applySelection = (): void => {
+			plugin.setSelected(selected);
+			table.updateSelection(selected);
+			runBar?.updateSelectedCount(selected.size);
+		};
+		const table = renderCustomerTable(tableContainer, {
 			columns,
 			rows,
 			selected,
 			onToggle: (key, checked) => {
 				if (checked) selected.add(key);
 				else selected.delete(key);
-				plugin.setSelected(selected);
-				this.render();
+				applySelection();
 			},
 			onToggleAll: (checked) => {
 				for (const row of rows) {
 					if (checked) selected.add(row.key);
 					else selected.delete(row.key);
 				}
-				plugin.setSelected(selected);
-				this.render();
+				applySelection();
 			},
-			onRowClick: (row) => {
+			contactCount: (row) => plugin.repo.getContactCount(row.record),
+			onOpenContacts: (row) => {
 				void plugin.openContacts(row.record);
 			},
-			statusText: (row) =>
-				row.record.fm[plugin.settings.linkPropertyName] ? "✓" : "—",
+			status: (row) => this.statusFor(row),
 			sort: this.sortState
 				? { columnId: this.sortState.key, dir: this.sortState.dir }
 				: null,
@@ -173,25 +195,70 @@ export class WorkbenchView extends ItemView {
 					? "客户目录为空：请先在插件设置里指定客户目录"
 					: "没有符合筛选条件的客户",
 		});
+		fillContactCounts(
+			plugin.repo,
+			rows,
+			table,
+			() => token === this.renderToken,
+		);
 
 		const footer = container.createDiv({ cls: "eo-footer" });
 		const taskContainer = footer.createDiv({ cls: "eo-taskbar-container" });
-		const selectedAll = plugin.getSelected();
-		renderTaskBar(taskContainer, {
-			tasks: plugin.getTaskSelection(),
-			selectedCount: selectedAll.size,
-			onChange: (tasks) => {
-				plugin.setTaskSelection(tasks);
-				this.render();
-			},
+		runBar = renderRunBar(taskContainer, {
+			selectedCount: selected.size,
 			onRun: () => {
-				void plugin.runTasks(records, plugin.getTaskSelection());
+				void plugin.runTasks(records);
 			},
 		});
 		if (this.sortState) {
 			const hint = footer.createDiv({ cls: "eo-muted eo-sort-hint" });
 			hint.setText(`当前排序：${this.sortState.key} ${this.sortState.dir === 1 ? "升序" : "降序"}`);
 		}
+	}
+
+	private statusFor(row: CustomerRow): CustomerStatus {
+		const status = this.plugin.getCustomerDevStatus(row.record.path);
+		if (status) {
+			return {
+				text: statusLabel(status),
+				level: statusLevel(status),
+				title: status.message,
+			};
+		}
+		return {
+			text: row.record.fm[this.plugin.settings.linkPropertyName] ? "✓" : "—",
+		};
+	}
+
+	private renderRunBanner(container: HTMLElement): void {
+		const run = this.plugin.getLastRunStatus();
+		if (!run) return;
+		const summary = summarizeRunStatuses(run.customers);
+		if (
+			summary.generatedCustomers === 0 &&
+			summary.attention.length === 0
+		) {
+			return;
+		}
+		const banner = container.createDiv({ cls: "eo-run-banner" });
+		const parts: string[] = [];
+		if (summary.generatedCustomers > 0) {
+			parts.push(
+				`已生成 ${summary.generatedEmailCount} 封（${summary.generatedCustomers} 家）`,
+			);
+		}
+		if (summary.attention.length > 0) {
+			const names = summary.attention
+				.slice(0, 8)
+				.map((status) => `${status.customerName}（${statusLabel(status)}）`)
+				.join("、");
+			const more =
+				summary.attention.length > 8
+					? ` 等 ${summary.attention.length} 家`
+					: "";
+			parts.push(`未生成邮件：${names}${more}`);
+		}
+		banner.setText(`上次执行：${parts.join("；")}。`);
 	}
 
 	private sortRows(rows: CustomerRow[]): CustomerRow[] {
@@ -308,43 +375,27 @@ export class WorkbenchView extends ItemView {
 			}
 			opSelect.value = condition.op;
 			opSelect.addEventListener("change", () => {
-				condition.op = opSelect.value as FilterOp;
-				void plugin.saveSettings();
-				this.render();
-			});
-
-			const valueInput = row.createEl("input", {
-				type: "text",
-				value: condition.value,
-				attr: { placeholder: "值" },
-			});
-			const suggestions = distinctValues(records, condition.key);
-			if (suggestions.length > 0) {
-				const listId = `eo-values-${index}`;
-				valueInput.setAttr("list", listId);
-				const datalist = row.createEl("datalist", { attr: { id: listId } });
-				for (const suggestion of suggestions) {
-					datalist.createEl("option", { value: suggestion });
+				const nextOp = opSelect.value as FilterOp;
+				const previousValues = conditionValues(condition);
+				condition.op = nextOp;
+				if (supportsMultipleValues(nextOp)) {
+					if (previousValues.length > 0) {
+						condition.values = previousValues;
+						condition.value = "";
+					}
+				} else if (
+					nextOp === "gt" ||
+					nextOp === "lt" ||
+					nextOp === "between"
+				) {
+					condition.value = previousValues[0] ?? condition.value;
+					condition.values = undefined;
 				}
-			}
-			valueInput.addEventListener("change", () => {
-				condition.value = valueInput.value;
 				void plugin.saveSettings();
 				this.render();
 			});
 
-			if (condition.op === "between") {
-				const second = row.createEl("input", {
-					type: "text",
-					value: condition.value2 ?? "",
-					attr: { placeholder: "上限" },
-				});
-				second.addEventListener("change", () => {
-					condition.value2 = second.value;
-					void plugin.saveSettings();
-					this.render();
-				});
-			}
+			this.renderFilterValue(row, condition, records, index);
 
 			row
 				.createEl("button", { text: "×" })
@@ -363,6 +414,171 @@ export class WorkbenchView extends ItemView {
 				this.render();
 			},
 		);
+	}
+
+	private renderFilterValue(
+		row: HTMLElement,
+		condition: FilterCondition,
+		records: CustomerRecord[],
+		index: number,
+	): void {
+		if (condition.op === "empty" || condition.op === "not_empty") return;
+		if (supportsMultipleValues(condition.op)) {
+			this.renderMultiValueFilter(row, condition, records, index);
+			return;
+		}
+		this.renderSingleValueFilter(row, condition, records, index);
+	}
+
+	/** 文本类条件：同一个属性可以选多个值，任一命中即可。 */
+	private renderMultiValueFilter(
+		row: HTMLElement,
+		condition: FilterCondition,
+		records: CustomerRecord[],
+		index: number,
+	): void {
+		const values = conditionValues(condition);
+		const wrap = row.createDiv({ cls: "eo-filter-values" });
+
+		if (values.length > 0) {
+			const chips = wrap.createDiv({ cls: "eo-filter-chips" });
+			for (const value of values) {
+				const chip = chips.createSpan({ cls: "eo-filter-chip" });
+				chip.createSpan({ text: value });
+				chip
+					.createEl("button", {
+						cls: "eo-filter-chip-remove",
+						text: "×",
+						attr: { type: "button", "aria-label": `移除 ${value}` },
+					})
+					.addEventListener("click", () => {
+						this.setConditionValues(
+							condition,
+							conditionValues(condition).filter((item) => item !== value),
+						);
+					});
+			}
+		}
+
+		const suggestions = distinctValues(records, condition.key);
+		if (suggestions.length > 0) {
+			const details = wrap.createEl("details", { cls: "eo-filter-picker" });
+			details.open = this.openValuePicker === condition;
+			details.addEventListener("toggle", () => {
+				if (details.open) this.openValuePicker = condition;
+				else if (this.openValuePicker === condition) {
+					this.openValuePicker = null;
+				}
+			});
+			details.createEl("summary", {
+				text:
+					values.length > 0
+						? `选择值（已选 ${values.length}）`
+						: "选择值",
+			});
+			const list = details.createDiv({ cls: "eo-filter-picker-list" });
+			const selected = new Set(values.map((value) => value.toLowerCase()));
+			for (const suggestion of suggestions) {
+				const option = list.createEl("label", { cls: "eo-filter-option" });
+				const checkbox = option.createEl("input", { type: "checkbox" });
+				checkbox.checked = selected.has(suggestion.toLowerCase());
+				checkbox.addEventListener("change", () => {
+					const next = conditionValues(condition).filter(
+						(value) =>
+							value.toLowerCase() !== suggestion.toLowerCase(),
+					);
+					if (checkbox.checked) next.push(suggestion);
+					this.setConditionValues(condition, next);
+				});
+				option.createSpan({ text: suggestion });
+			}
+		}
+
+		const listId = `eo-values-${index}`;
+		const attr: Record<string, string> = {
+			placeholder:
+				values.length > 0
+					? "继续输入值，回车添加"
+					: "输入或选择值，可添加多个",
+		};
+		if (suggestions.length > 0) attr.list = listId;
+		const input = wrap.createEl("input", { type: "text", attr });
+		if (suggestions.length > 0) {
+			const datalist = wrap.createEl("datalist", { attr: { id: listId } });
+			for (const suggestion of suggestions) {
+				datalist.createEl("option", { value: suggestion });
+			}
+		}
+		const commit = (): void => {
+			const raw = input.value.trim();
+			if (!raw) return;
+			const current = conditionValues(condition);
+			if (current.some((value) => value.toLowerCase() === raw.toLowerCase())) {
+				input.value = "";
+				return;
+			}
+			this.setConditionValues(condition, [...current, raw]);
+		};
+		input.addEventListener("change", commit);
+		input.addEventListener("keydown", (event) => {
+			if (event.key === "Enter") {
+				event.preventDefault();
+				commit();
+			}
+		});
+	}
+
+	/** 数值/区间条件仍然只有一个值。 */
+	private renderSingleValueFilter(
+		row: HTMLElement,
+		condition: FilterCondition,
+		records: CustomerRecord[],
+		index: number,
+	): void {
+		const value = conditionValues(condition)[0] ?? condition.value;
+		const valueInput = row.createEl("input", {
+			type: "text",
+			value,
+			attr: { placeholder: "值" },
+		});
+		const suggestions = distinctValues(records, condition.key);
+		if (suggestions.length > 0) {
+			const listId = `eo-values-${index}`;
+			valueInput.setAttr("list", listId);
+			const datalist = row.createEl("datalist", { attr: { id: listId } });
+			for (const suggestion of suggestions) {
+				datalist.createEl("option", { value: suggestion });
+			}
+		}
+		valueInput.addEventListener("change", () => {
+			condition.value = valueInput.value;
+			condition.values = undefined;
+			void this.plugin.saveSettings();
+			this.render();
+		});
+
+		if (condition.op === "between") {
+			const second = row.createEl("input", {
+				type: "text",
+				value: condition.value2 ?? "",
+				attr: { placeholder: "上限" },
+			});
+			second.addEventListener("change", () => {
+				condition.value2 = second.value;
+				void this.plugin.saveSettings();
+				this.render();
+			});
+		}
+	}
+
+	private setConditionValues(
+		condition: FilterCondition,
+		values: string[],
+	): void {
+		condition.values = values;
+		condition.value = "";
+		void this.plugin.saveSettings();
+		this.render();
 	}
 
 	private async openColumnsModal(records: CustomerRecord[]): Promise<void> {

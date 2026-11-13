@@ -819,23 +819,77 @@ export function addEmailVersion(
 	};
 }
 
-export function appendEmailToContent(
+/**
+ * 当前邮件内容对应的版本号。
+ * 用于「重新生成」时说明依据的是输出目录里哪一版，而不是内存里的草稿。
+ */
+export function currentEmailVersion(record: EmailRecord): number {
+	const last = record.versions[record.versions.length - 1];
+	return last?.version ?? 1;
+}
+
+/**
+ * 邮件的「更新时间」。
+ *
+ * 第一次生成时它就是创建时间；之后每次新增版本或改状态都会刷新成新时间。
+ * 所以列表只需要这一个字段，不再分「生成时间 / 修改时间」。
+ * 老文件可能只有 generated_at 甚至只有版本标题里的时间，按顺序回退。
+ */
+export function emailUpdatedAt(record: EmailRecord): string {
+	const candidates = [
+		record.updatedAt,
+		record.generatedAt,
+		...record.versions.map((version) => version.at).reverse(),
+	];
+	for (const candidate of candidates) {
+		const trimmed = (candidate ?? "").trim();
+		if (trimmed) return trimmed;
+	}
+	return "";
+}
+
+/** 把 ISO 时间压成 `2026-11-10 20:19`，列表里不显示秒和时区。 */
+export function formatEmailTime(value: string): string {
+	const trimmed = value.trim();
+	const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/.exec(trimmed);
+	return match ? `${match[1]} ${match[2]}` : trimmed;
+}
+
+/**
+ * 一次追加多封邮件，保持同一个客户文件。
+ * 每封按当前文件里已有的最大 ID 连续编号，避免同一客户多联系人时产生副本文件。
+ */
+export function appendEmailsToContent(
 	content: string | null,
 	customerLink: string,
-	record: EmailRecord,
+	records: EmailRecord[],
 ): string {
 	const parsed = content
 		? parseCustomerAIFile(content)
 		: { file: emptyCustomerAIFile(customerLink), blocks: [] };
 	const file = parsed.file;
 	file.customerLink = file.customerLink || customerLink;
-	const nextId = nextEmailId(file.emails);
-	const withId: EmailRecord = { ...record, id: nextId, extraMeta: record.extraMeta };
-	file.emails = [...file.emails, withId];
+	if (records.length === 0) return renderCustomerAIFile(file);
+	for (const record of records) {
+		const withId: EmailRecord = {
+			...record,
+			id: nextEmailId(file.emails),
+			extraMeta: record.extraMeta,
+		};
+		file.emails = [...file.emails, withId];
+		file.lastStatus = withId.status;
+	}
 	file.emailCount = file.emails.length;
-	file.lastStatus = withId.status;
 	file.updated = isoNow();
 	return renderCustomerAIFile(file);
+}
+
+export function appendEmailToContent(
+	content: string | null,
+	customerLink: string,
+	record: EmailRecord,
+): string {
+	return appendEmailsToContent(content, customerLink, [record]);
 }
 
 export function updateEmailInContent(
