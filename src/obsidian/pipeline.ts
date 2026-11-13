@@ -31,7 +31,12 @@ import type {
 	RunProgress,
 } from "../core/types";
 import { MAX_EMAILS_PER_CUSTOMER } from "../core/types";
-import { AIClient, CanceledError, type CancelToken } from "./ai-client";
+import {
+	AIClient,
+	CanceledError,
+	type AIRequestMeta,
+	type CancelToken,
+} from "./ai-client";
 import type { CustomerRepo } from "./customer-repo";
 import type { Settings } from "./settings";
 import type { StateStore } from "./state-store";
@@ -331,6 +336,12 @@ export class Pipeline {
 			emailPrompt,
 			validationContext,
 			options.token,
+			{
+				kind: "email",
+				label: `${customer.name} · 生成开发邮件`,
+				customerName: customer.name,
+				customerPath: customer.path,
+			},
 		);
 		errors.push(...outcome.errors);
 		warnings.push(...outcome.warnings);
@@ -494,9 +505,10 @@ export class Pipeline {
 			maxBodyChars: number;
 		},
 		token: CancelToken,
+		meta: AIRequestMeta,
 	): Promise<RequestOutcome> {
 		const client = this.deps.client;
-		let raw = await client.complete(system, prompt, token);
+		let raw = await client.complete(system, prompt, token, meta);
 		let validation = validateAIResult(parseJsonLoose(raw), context);
 		if (!validation.ok) {
 			const detail = validation.errors
@@ -507,7 +519,13 @@ export class Pipeline {
 				`错误：${detail}\n` +
 				`上次输出（已截断）：\n${raw.slice(0, 4000)}\n\n` +
 				"请根据错误修正，仍然只输出完整 JSON。";
-			raw = await client.complete(system, repairPrompt, token);
+			raw = await client.complete(system, repairPrompt, token, {
+				...meta,
+				kind: "email-repair",
+				label: meta.customerName
+					? `${meta.customerName} · 校验失败后自动修复`
+					: "校验失败后自动修复",
+			});
 			validation = validateAIResult(parseJsonLoose(raw), context);
 		}
 		return {

@@ -32,6 +32,7 @@ const send_time_1 = require("src/core/send-time.ts");
 const types_1 = require("src/core/types.ts");
 const wikilinks_1 = require("src/core/wikilinks.ts");
 const ai_client_1 = require("src/obsidian/ai-client.ts");
+const ai_log_store_1 = require("src/obsidian/ai-log-store.ts");
 const bases_view_1 = require("src/obsidian/bases-view.ts");
 const customer_repo_1 = require("src/obsidian/customer-repo.ts");
 const email_store_1 = require("src/obsidian/email-store.ts");
@@ -140,7 +141,10 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
     initializeServices() {
         this.adapter = new vault_adapter_1.VaultAdapter(this.app);
         this.repo = new customer_repo_1.CustomerRepo(this.app, () => this.settings.customerDir, this.adapter);
-        this.client = new ai_client_1.AIClient(() => this.settings);
+        this.aiLog = new ai_log_store_1.AILogStore(this.adapter, () => this.settings.outputDir);
+        this.client = new ai_client_1.AIClient(() => this.settings, (entry) => {
+            void this.aiLog.append(entry);
+        });
         this.knowledgeLoader = new knowledge_loader_1.KnowledgeLoader(this.app, () => this.settings);
         this.state = new state_store_1.StateStore(this.adapter, () => this.settings.outputDir);
         this.emailStore = new email_store_1.EmailStore(this.app, () => this.settings.outputDir, this.adapter);
@@ -297,6 +301,15 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         this.settings.availableModels = models;
         await this.saveSettings();
         return models;
+    }
+    // --------------------------------------------------------------- ai logs
+    /** 设置页用：读取本机 AI 日志，最新在前。 */
+    async loadAILogs() {
+        await this.aiLog.load();
+        return this.aiLog.list();
+    }
+    async clearAILogs() {
+        await this.aiLog.clear();
     }
     // --------------------------------------------------------------- selection
     getSelected() {
@@ -676,7 +689,12 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             comment,
         });
         report("AI 正在重新生成邮件", `模型 ${this.settings.model} · 依据已保存的 v${version} · 超时 ${Math.round(this.settings.timeoutMs / 1000)} 秒`);
-        const raw = await this.client.complete((0, prompt_1.buildSystemPrompt)(types_1.MAX_EMAILS_PER_CUSTOMER), prompt);
+        const raw = await this.client.complete((0, prompt_1.buildSystemPrompt)(types_1.MAX_EMAILS_PER_CUSTOMER), prompt, undefined, {
+            kind: "regenerate",
+            label: `${row.customerName} · 重新生成邮件 ${row.record.id}`,
+            customerName: row.customerName,
+            customerPath: customer.path,
+        });
         report("校验 AI 返回", undefined, 0.85);
         const validation = (0, schema_1.validateAIResult)((0, schema_1.parseJsonLoose)(raw), validationContext);
         const draft = validation.emails.find((item) => item.contactId === focusContact.id);
@@ -856,7 +874,11 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             knowledge: loaded.bundle,
             email: row.record,
             userComments: comment,
-        }));
+        }), undefined, {
+            kind: "rule",
+            label: `${row.customerName} · 提炼经验规则`,
+            customerName: row.customerName,
+        });
         const draft = (0, prompt_1.parseRuleDraft)((0, schema_1.parseJsonLoose)(raw));
         if (!draft) {
             new obsidian_1.Notice("AI 没有返回可用的规则，请重试");
@@ -1856,6 +1878,308 @@ function versionSnapshotText(version) {
         "",
         version.body,
     ].join("\n");
+}
+
+};
+__modules["src/core/ai-log.ts"] = function(module, exports, require) {
+"use strict";
+/**
+ * AI 请求日志。
+ *
+ * 记录每次真正发出的 AI 请求：完整系统提示词、用户提示词、模型参数、
+ * HTTP 状态、原始返回、耗时与错误。设置页「AI 请求日志」直接读它，
+ * 用户可据此核对「插件到底让 AI 写了什么」。
+ *
+ * 纯数据逻辑，禁止 import "obsidian"。
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.AI_LOG_FILE_NAME = exports.AI_LOG_STATE_DIR = exports.AI_LOG_MAX_ENTRIES = void 0;
+exports.createAILogEntry = createAILogEntry;
+exports.parseAILogEntry = parseAILogEntry;
+exports.parseAILogLines = parseAILogLines;
+exports.serializeAILogEntry = serializeAILogEntry;
+exports.trimAILog = trimAILog;
+exports.aiLogKindLabel = aiLogKindLabel;
+exports.aiLogStatusLabel = aiLogStatusLabel;
+exports.formatAILogDuration = formatAILogDuration;
+exports.formatAILogTime = formatAILogTime;
+exports.formatAILogEntry = formatAILogEntry;
+exports.formatAILogEntries = formatAILogEntries;
+/** 内存与设置页里最多保留的条数；磁盘文件在读取时也会按这个上限裁剪。 */
+exports.AI_LOG_MAX_ENTRIES = 50;
+/** 相对于输出目录的日志文件位置，与 `.state/` 下的其他诊断文件放在一起。 */
+exports.AI_LOG_STATE_DIR = ".state";
+exports.AI_LOG_FILE_NAME = "ai-log.jsonl";
+function emptyUsage() {
+    return {
+        promptTokens: null,
+        completionTokens: null,
+        totalTokens: null,
+    };
+}
+function normalizeUsage(value) {
+    if (!value || typeof value !== "object")
+        return null;
+    const record = value;
+    const usage = emptyUsage();
+    let found = false;
+    for (const [key, target] of [
+        ["promptTokens", "promptTokens"],
+        ["completionTokens", "completionTokens"],
+        ["totalTokens", "totalTokens"],
+    ]) {
+        const number = record[key];
+        if (typeof number === "number" && Number.isFinite(number)) {
+            usage[target] = number;
+            found = true;
+        }
+    }
+    return found ? usage : null;
+}
+function normalizeResponse(value) {
+    const record = (value !== null && value !== void 0 ? value : {});
+    const stringOrNull = (input) => typeof input === "string" ? input : null;
+    return {
+        status: typeof record.status === "number" && Number.isFinite(record.status)
+            ? record.status
+            : null,
+        content: stringOrNull(record.content),
+        finishReason: stringOrNull(record.finishReason),
+        usage: normalizeUsage(record.usage),
+        rawBody: stringOrNull(record.rawBody),
+        error: stringOrNull(record.error),
+    };
+}
+/** 由请求现场数据组装一条日志；字数在这里统一算，避免各调用方口径不一致。 */
+function createAILogEntry(input) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+    const system = (_a = input.request.system) !== null && _a !== void 0 ? _a : "";
+    const user = (_b = input.request.user) !== null && _b !== void 0 ? _b : "";
+    return {
+        id: input.id,
+        at: input.at,
+        finishedAt: (_c = input.finishedAt) !== null && _c !== void 0 ? _c : input.at,
+        durationMs: Number.isFinite(input.durationMs) && input.durationMs >= 0
+            ? Math.round(input.durationMs)
+            : 0,
+        attempt: Math.max(1, Math.round((_d = input.attempt) !== null && _d !== void 0 ? _d : 1)),
+        maxAttempts: Math.max(1, Math.round((_e = input.maxAttempts) !== null && _e !== void 0 ? _e : 1)),
+        kind: input.kind,
+        label: input.label.trim() || aiLogKindLabel(input.kind),
+        customerName: ((_f = input.customerName) === null || _f === void 0 ? void 0 : _f.trim()) || null,
+        customerPath: ((_g = input.customerPath) === null || _g === void 0 ? void 0 : _g.trim()) || null,
+        status: input.status,
+        request: {
+            url: input.request.url,
+            method: (_h = input.request.method) !== null && _h !== void 0 ? _h : "POST",
+            model: input.request.model,
+            temperature: typeof input.request.temperature === "number" &&
+                Number.isFinite(input.request.temperature)
+                ? input.request.temperature
+                : null,
+            responseFormat: (_j = input.request.responseFormat) !== null && _j !== void 0 ? _j : null,
+            stream: (_k = input.request.stream) !== null && _k !== void 0 ? _k : false,
+            system,
+            user,
+            systemChars: system.length,
+            userChars: user.length,
+            totalChars: system.length + user.length,
+        },
+        response: normalizeResponse(input.response),
+    };
+}
+function isKind(value) {
+    return (value === "email" ||
+        value === "email-repair" ||
+        value === "regenerate" ||
+        value === "rule");
+}
+function isStatus(value) {
+    return value === "ok" || value === "error" || value === "canceled";
+}
+function asString(value) {
+    return typeof value === "string" ? value : null;
+}
+/**
+ * 解析一条日志。文件可能被中断写入或手工改坏，所以这里对每个字段都做
+ * 宽松校验：字段缺失用默认值，结构不对返回 null 让调用方跳过这一行。
+ */
+function parseAILogEntry(value) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return null;
+    const raw = value;
+    const id = (_a = asString(raw.id)) === null || _a === void 0 ? void 0 : _a.trim();
+    const at = (_b = asString(raw.at)) === null || _b === void 0 ? void 0 : _b.trim();
+    if (!id || !at)
+        return null;
+    const requestRaw = raw.request;
+    if (!requestRaw || typeof requestRaw !== "object")
+        return null;
+    const req = requestRaw;
+    const system = asString(req.system);
+    const user = asString(req.user);
+    if (system === null || user === null)
+        return null;
+    const responseRaw = raw.response;
+    const response = responseRaw && typeof responseRaw === "object"
+        ? responseRaw
+        : {};
+    const status = isStatus(raw.status) ? raw.status : "error";
+    const kind = isKind(raw.kind) ? raw.kind : "email";
+    const duration = Number(raw.durationMs);
+    const attempt = Number(raw.attempt);
+    const maxAttempts = Number(raw.maxAttempts);
+    return createAILogEntry({
+        id,
+        at,
+        finishedAt: (_c = asString(raw.finishedAt)) !== null && _c !== void 0 ? _c : at,
+        durationMs: Number.isFinite(duration) ? duration : 0,
+        attempt: Number.isFinite(attempt) ? attempt : 1,
+        maxAttempts: Number.isFinite(maxAttempts) ? maxAttempts : 1,
+        kind,
+        label: ((_d = asString(raw.label)) === null || _d === void 0 ? void 0 : _d.trim()) || aiLogKindLabel(kind),
+        customerName: asString(raw.customerName),
+        customerPath: asString(raw.customerPath),
+        status,
+        request: {
+            url: (_e = asString(req.url)) !== null && _e !== void 0 ? _e : "",
+            method: (_f = asString(req.method)) !== null && _f !== void 0 ? _f : "POST",
+            model: (_g = asString(req.model)) !== null && _g !== void 0 ? _g : "",
+            temperature: typeof req.temperature === "number" && Number.isFinite(req.temperature)
+                ? req.temperature
+                : null,
+            responseFormat: asString(req.responseFormat),
+            stream: req.stream === true,
+            system,
+            user,
+        },
+        response: {
+            status: typeof response.status === "number" &&
+                Number.isFinite(response.status)
+                ? response.status
+                : null,
+            content: asString(response.content),
+            finishReason: asString(response.finishReason),
+            usage: normalizeUsage(response.usage),
+            rawBody: asString(response.rawBody),
+            error: asString(response.error),
+        },
+    });
+}
+/** 每个条目一行 JSONL；坏行跳过，不让一条损坏记录拖垮整份日志。 */
+function parseAILogLines(text) {
+    const entries = [];
+    for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed)
+            continue;
+        let parsed;
+        try {
+            parsed = JSON.parse(trimmed);
+        }
+        catch (_a) {
+            continue;
+        }
+        const entry = parseAILogEntry(parsed);
+        if (entry)
+            entries.push(entry);
+    }
+    return entries;
+}
+function serializeAILogEntry(entry) {
+    return JSON.stringify(entry);
+}
+/** 只保留最近的条目；入参按时间从旧到新排列。 */
+function trimAILog(entries, limit = exports.AI_LOG_MAX_ENTRIES) {
+    const cap = Math.max(1, Math.round(limit));
+    return entries.length > cap ? entries.slice(entries.length - cap) : entries.slice();
+}
+function aiLogKindLabel(kind) {
+    switch (kind) {
+        case "email":
+            return "生成开发邮件";
+        case "email-repair":
+            return "校验失败后自动修复";
+        case "regenerate":
+            return "重新生成邮件";
+        case "rule":
+            return "提炼经验规则";
+    }
+}
+function aiLogStatusLabel(status) {
+    switch (status) {
+        case "ok":
+            return "成功";
+        case "error":
+            return "失败";
+        case "canceled":
+            return "已取消";
+    }
+}
+function formatAILogDuration(durationMs) {
+    if (!Number.isFinite(durationMs) || durationMs < 0)
+        return "—";
+    if (durationMs < 1000)
+        return `${Math.round(durationMs)} ms`;
+    return `${(durationMs / 1000).toFixed(1)} 秒`;
+}
+/** ISO 时间 → `2026-11-13 14:22:31`；保留原字符串里的本地时间。 */
+function formatAILogTime(at) {
+    const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/.exec(at);
+    return match ? `${match[1]} ${match[2]}` : at;
+}
+function thousands(value) {
+    return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+function section(title, content) {
+    if (content === null || content === undefined || content === "")
+        return null;
+    return `----- ${title} -----\n${content}`;
+}
+/** 单条日志的完整纯文本，用于复制给他人或在控制台里查看。 */
+function formatAILogEntry(entry) {
+    var _a, _b, _c, _d, _e;
+    const request = entry.request;
+    const response = entry.response;
+    const lines = [];
+    lines.push(`记录：${entry.label}`, `时间：${formatAILogTime(entry.at)}（${entry.at}）`, `状态：${aiLogStatusLabel(entry.status)} · 耗时 ${formatAILogDuration(entry.durationMs)}`, `类型：${aiLogKindLabel(entry.kind)}`);
+    if (entry.customerName)
+        lines.push(`客户：${entry.customerName}`);
+    if (entry.customerPath)
+        lines.push(`客户文件：${entry.customerPath}`);
+    lines.push(`尝试：第 ${entry.attempt} / ${entry.maxAttempts} 次`, `模型：${request.model || "（未设置）"}`, `接口：${request.method} ${request.url || "（未设置）"}`, `参数：temperature=${(_a = request.temperature) !== null && _a !== void 0 ? _a : "—"} · response_format=${(_b = request.responseFormat) !== null && _b !== void 0 ? _b : "—"} · stream=${request.stream}`, `提示词：系统 ${thousands(request.systemChars)} 字 + 用户 ${thousands(request.userChars)} 字 = ${thousands(request.totalChars)} 字`);
+    if (response.status !== null)
+        lines.push(`HTTP 状态：${response.status}`);
+    if (response.finishReason)
+        lines.push(`finish_reason：${response.finishReason}`);
+    if (response.usage) {
+        const usage = response.usage;
+        lines.push(`tokens：prompt ${(_c = usage.promptTokens) !== null && _c !== void 0 ? _c : "—"} / completion ${(_d = usage.completionTokens) !== null && _d !== void 0 ? _d : "—"} / total ${(_e = usage.totalTokens) !== null && _e !== void 0 ? _e : "—"}`);
+    }
+    if (response.error)
+        lines.push(`错误：${response.error}`);
+    const parts = [lines.join("\n")];
+    for (const block of [
+        section("系统提示词", request.system),
+        section("用户提示词", request.user),
+        section("AI 返回内容", response.content),
+        section("原始响应体", response.rawBody),
+    ]) {
+        if (block)
+            parts.push(block);
+    }
+    return parts.join("\n\n");
+}
+/** 多条日志的纯文本；入参约定为「最新在前」。 */
+function formatAILogEntries(entries) {
+    if (entries.length === 0)
+        return "（没有 AI 请求日志）";
+    const header = `Email Outreach · AI 请求日志（共 ${entries.length} 条，最新在前）`;
+    const body = entries
+        .map((entry, index) => `#${index + 1}\n${formatAILogEntry(entry)}`)
+        .join(`\n\n${"=".repeat(64)}\n\n`);
+    return `${header}\n\n${body}`;
 }
 
 };
@@ -4271,7 +4595,30 @@ __modules["src/obsidian/ai-client.ts"] = function(module, exports, require) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AIClient = exports.CanceledError = exports.AIError = void 0;
 const obsidian_1 = require("obsidian");
+const ai_log_1 = require("src/core/ai-log.ts");
+const filenames_1 = require("src/core/filenames.ts");
 const models_1 = require("src/core/models.ts");
+/** 从 OpenAI 兼容返回里读 token 统计；没有就返回 null。 */
+function readUsage(data) {
+    if (!data || typeof data !== "object")
+        return null;
+    const usage = data.usage;
+    if (!usage || typeof usage !== "object")
+        return null;
+    const record = usage;
+    const number = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+    const result = {
+        promptTokens: number(record.prompt_tokens),
+        completionTokens: number(record.completion_tokens),
+        totalTokens: number(record.total_tokens),
+    };
+    if (result.promptTokens === null &&
+        result.completionTokens === null &&
+        result.totalTokens === null) {
+        return null;
+    }
+    return result;
+}
 class AIError extends Error {
     constructor(message, retryable) {
         super(message);
@@ -4330,17 +4677,20 @@ function buildModelsEndpoint(baseUrl) {
     return endpoint;
 }
 class AIClient {
-    constructor(getSettings) {
+    constructor(getSettings, 
+    /** 每次真正发出请求后回调一条日志；失败不影响请求本身。 */
+    onLog) {
         this.getSettings = getSettings;
+        this.onLog = onLog;
     }
-    async complete(system, user, token) {
+    async complete(system, user, token, meta) {
         const maxAttempts = 4;
         let lastError = null;
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             if (token === null || token === void 0 ? void 0 : token.canceled)
                 throw new CanceledError();
             try {
-                return await this.requestOnce(system, user, token);
+                return await this.requestOnce(system, user, token, meta, attempt + 1, maxAttempts);
             }
             catch (error) {
                 lastError = error;
@@ -4389,66 +4739,261 @@ class AIClient {
         }
         return models;
     }
-    async requestOnce(system, user, token) {
-        var _a, _b;
+    async requestOnce(system, user, token, meta, attempt, maxAttempts) {
+        var _a, _b, _c;
         const settings = this.getSettings();
-        if (!settings.apiKey.trim()) {
-            throw new AIError("未设置 API Key", false);
-        }
-        if (!settings.model.trim()) {
-            throw new AIError("未设置模型名称", false);
-        }
-        const endpoint = buildEndpoint(settings.apiBaseUrl);
-        const payload = {
-            model: settings.model.trim(),
-            messages: [
-                { role: "system", content: system },
-                { role: "user", content: user },
-            ],
-            temperature: settings.temperature,
-            response_format: { type: "json_object" },
-            stream: false,
+        const startedAt = Date.now();
+        const startedIso = (0, filenames_1.isoNow)(new Date(startedAt));
+        let url = "";
+        let httpStatus = null;
+        let rawBody = null;
+        let finishReason = null;
+        let usage = null;
+        const log = (status, content, error) => {
+            var _a, _b, _c, _d;
+            if (!this.onLog)
+                return;
+            try {
+                this.onLog((0, ai_log_1.createAILogEntry)({
+                    id: `${startedAt.toString(36)}-${Math.random()
+                        .toString(36)
+                        .slice(2, 8)}`,
+                    at: startedIso,
+                    finishedAt: (0, filenames_1.isoNow)(),
+                    durationMs: Date.now() - startedAt,
+                    attempt,
+                    maxAttempts,
+                    kind: (_a = meta === null || meta === void 0 ? void 0 : meta.kind) !== null && _a !== void 0 ? _a : "email",
+                    label: (_b = meta === null || meta === void 0 ? void 0 : meta.label) !== null && _b !== void 0 ? _b : "",
+                    customerName: (_c = meta === null || meta === void 0 ? void 0 : meta.customerName) !== null && _c !== void 0 ? _c : null,
+                    customerPath: (_d = meta === null || meta === void 0 ? void 0 : meta.customerPath) !== null && _d !== void 0 ? _d : null,
+                    status,
+                    request: {
+                        url,
+                        method: "POST",
+                        model: settings.model.trim(),
+                        temperature: settings.temperature,
+                        responseFormat: "json_object",
+                        stream: false,
+                        system,
+                        user,
+                    },
+                    response: {
+                        status: httpStatus,
+                        content,
+                        finishReason,
+                        usage,
+                        rawBody,
+                        error,
+                    },
+                }));
+            }
+            catch (logError) {
+                console.error("[email-outreach] 记录 AI 请求日志失败", logError);
+            }
         };
-        const response = await withTimeout((0, obsidian_1.requestUrl)({
-            url: endpoint,
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${settings.apiKey.trim()}`,
-            },
-            body: JSON.stringify(payload),
-            throw: false,
-        }), Math.max(10000, settings.timeoutMs));
-        if (token === null || token === void 0 ? void 0 : token.canceled)
-            throw new CanceledError();
-        if (response.status < 200 || response.status >= 300) {
-            const retryable = response.status === 429 || response.status >= 500;
-            const detail = ((_a = response.text) !== null && _a !== void 0 ? _a : "").slice(0, 500);
-            throw new AIError(`AI 接口返回 ${response.status}${detail ? `：${detail}` : ""}`, retryable);
-        }
-        let data;
         try {
-            data = response.json;
+            if (!settings.apiKey.trim()) {
+                throw new AIError("未设置 API Key", false);
+            }
+            if (!settings.model.trim()) {
+                throw new AIError("未设置模型名称", false);
+            }
+            url = buildEndpoint(settings.apiBaseUrl);
+            const payload = {
+                model: settings.model.trim(),
+                messages: [
+                    { role: "system", content: system },
+                    { role: "user", content: user },
+                ],
+                temperature: settings.temperature,
+                response_format: { type: "json_object" },
+                stream: false,
+            };
+            const response = await withTimeout((0, obsidian_1.requestUrl)({
+                url,
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${settings.apiKey.trim()}`,
+                },
+                body: JSON.stringify(payload),
+                throw: false,
+            }), Math.max(10000, settings.timeoutMs));
+            httpStatus = response.status;
+            rawBody = (_a = response.text) !== null && _a !== void 0 ? _a : null;
+            if (token === null || token === void 0 ? void 0 : token.canceled)
+                throw new CanceledError();
+            if (response.status < 200 || response.status >= 300) {
+                const retryable = response.status === 429 || response.status >= 500;
+                const detail = ((_b = response.text) !== null && _b !== void 0 ? _b : "").slice(0, 500);
+                throw new AIError(`AI 接口返回 ${response.status}${detail ? `：${detail}` : ""}`, retryable);
+            }
+            let data;
+            try {
+                data = response.json;
+            }
+            catch (_d) {
+                data = null;
+            }
+            usage = readUsage(data);
+            if (!data || typeof data !== "object") {
+                throw new AIError("AI 接口返回的不是 JSON", true);
+            }
+            const choices = data.choices;
+            if (!Array.isArray(choices) || choices.length === 0) {
+                throw new AIError("AI 接口返回缺少 choices", false);
+            }
+            const first = choices[0];
+            finishReason =
+                typeof (first === null || first === void 0 ? void 0 : first.finish_reason) === "string"
+                    ? first.finish_reason
+                    : null;
+            const content = (_c = first === null || first === void 0 ? void 0 : first.message) === null || _c === void 0 ? void 0 : _c.content;
+            if (typeof content !== "string" || !content.trim()) {
+                throw new AIError("AI 返回内容为空", false);
+            }
+            log("ok", content, null);
+            return content;
         }
-        catch (_c) {
-            data = null;
+        catch (error) {
+            const canceled = error instanceof CanceledError;
+            const message = error instanceof Error ? error.message : String(error);
+            log(canceled ? "canceled" : "error", null, message);
+            throw error;
         }
-        if (!data || typeof data !== "object") {
-            throw new AIError("AI 接口返回的不是 JSON", true);
-        }
-        const choices = data.choices;
-        if (!Array.isArray(choices) || choices.length === 0) {
-            throw new AIError("AI 接口返回缺少 choices", false);
-        }
-        const first = choices[0];
-        const content = (_b = first === null || first === void 0 ? void 0 : first.message) === null || _b === void 0 ? void 0 : _b.content;
-        if (typeof content !== "string" || !content.trim()) {
-            throw new AIError("AI 返回内容为空", false);
-        }
-        return content;
     }
 }
 exports.AIClient = AIClient;
+
+};
+__modules["src/obsidian/ai-log-store.ts"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.AILogStore = void 0;
+const ai_log_1 = require("src/core/ai-log.ts");
+const filenames_1 = require("src/core/filenames.ts");
+/**
+ * AI 请求日志的存取层。
+ *
+ * - 内存里保留最近 {@link AI_LOG_MAX_ENTRIES} 条，设置页直接读内存。
+ * - 同时逐条追加到 `{输出目录}/.state/ai-log.jsonl`，重载插件后仍能看到；
+ *   文件里的旧记录在首次读取时会被裁剪到上限以内。
+ * - 未配置输出目录时只保留内存，日志不会写到 vault 里。
+ * - 任何读写失败都只打控制台，绝不影响邮件生成。
+ */
+class AILogStore {
+    constructor(adapter, getOutputDir) {
+        this.adapter = adapter;
+        this.getOutputDir = getOutputDir;
+        /** 按时间从旧到新排列。 */
+        this.entries = [];
+        this.loaded = false;
+        this.loading = null;
+        this.queue = Promise.resolve();
+        this.writesSinceRewrite = 0;
+    }
+    filePath() {
+        const dir = this.getOutputDir().trim();
+        if (!dir)
+            return null;
+        return (0, filenames_1.joinPath)(dir, ai_log_1.AI_LOG_STATE_DIR, ai_log_1.AI_LOG_FILE_NAME);
+    }
+    /** 最新在前，供设置页列表使用。 */
+    list() {
+        return [...this.entries].reverse();
+    }
+    /** 首次调用时从磁盘读入；之后的调用直接复用内存。 */
+    async load() {
+        if (this.loaded)
+            return;
+        if (!this.loading) {
+            this.loading = this.readFromDisk().finally(() => {
+                this.loading = null;
+            });
+        }
+        await this.loading;
+    }
+    async readFromDisk() {
+        const path = this.filePath();
+        let parsed = [];
+        if (path) {
+            try {
+                const raw = await this.adapter.readStateFile(path);
+                if (raw)
+                    parsed = (0, ai_log_1.parseAILogLines)(raw);
+            }
+            catch (error) {
+                console.error("[email-outreach] 读取 AI 日志失败", error);
+            }
+        }
+        // 同一条记录可能既在内存里又在文件里（本轮写过、之后才第一次打开设置页），
+        // 用 id 去重后再按时间裁剪。
+        const merged = new Map();
+        for (const entry of parsed)
+            merged.set(entry.id, entry);
+        for (const entry of this.entries)
+            merged.set(entry.id, entry);
+        const all = [...merged.values()];
+        this.entries = (0, ai_log_1.trimAILog)(all);
+        this.loaded = true;
+        if (path && all.length > this.entries.length) {
+            await this.rewrite(path);
+        }
+    }
+    async append(entry) {
+        await this.load();
+        this.entries = (0, ai_log_1.trimAILog)([...this.entries, entry]);
+        const path = this.filePath();
+        if (!path)
+            return;
+        this.queue = this.queue.then(() => this.writeEntry(path, entry));
+        await this.queue;
+    }
+    async writeEntry(path, entry) {
+        try {
+            this.writesSinceRewrite++;
+            if (this.writesSinceRewrite >= ai_log_1.AI_LOG_MAX_ENTRIES) {
+                this.writesSinceRewrite = 0;
+                await this.rewrite(path);
+                return;
+            }
+            await this.adapter.appendStateFile(path, `${(0, ai_log_1.serializeAILogEntry)(entry)}\n`);
+        }
+        catch (error) {
+            console.error("[email-outreach] 写入 AI 日志失败", error);
+        }
+    }
+    async rewrite(path) {
+        try {
+            const content = this.entries
+                .map((entry) => `${(0, ai_log_1.serializeAILogEntry)(entry)}\n`)
+                .join("");
+            await this.adapter.writeStateFile(path, content);
+        }
+        catch (error) {
+            console.error("[email-outreach] 重写 AI 日志失败", error);
+        }
+    }
+    async clear() {
+        this.entries = [];
+        this.loaded = true;
+        this.writesSinceRewrite = 0;
+        const path = this.filePath();
+        if (!path)
+            return;
+        this.queue = this.queue.then(async () => {
+            try {
+                await this.adapter.deleteStateFile(path);
+            }
+            catch (error) {
+                console.error("[email-outreach] 清除 AI 日志失败", error);
+            }
+        });
+        await this.queue;
+    }
+}
+exports.AILogStore = AILogStore;
 
 };
 __modules["src/obsidian/bases-view.ts"] = function(module, exports, require) {
@@ -6556,7 +7101,12 @@ class Pipeline {
             focusContactId: null,
             emailHistory: existingEmails,
         });
-        const outcome = await this.requestValidated((0, prompt_1.buildSystemPrompt)(types_1.MAX_EMAILS_PER_CUSTOMER), emailPrompt, validationContext, options.token);
+        const outcome = await this.requestValidated((0, prompt_1.buildSystemPrompt)(types_1.MAX_EMAILS_PER_CUSTOMER), emailPrompt, validationContext, options.token, {
+            kind: "email",
+            label: `${customer.name} · 生成开发邮件`,
+            customerName: customer.name,
+            customerPath: customer.path,
+        });
         errors.push(...outcome.errors);
         warnings.push(...outcome.warnings);
         if (!outcome.ok) {
@@ -6632,9 +7182,9 @@ class Pipeline {
         };
         return this.resultWith(customer, contacts, payload.contacts.warnings, records, errors, warnings, outcome.raw, aiPath, status);
     }
-    async requestValidated(system, prompt, context, token) {
+    async requestValidated(system, prompt, context, token, meta) {
         const client = this.deps.client;
-        let raw = await client.complete(system, prompt, token);
+        let raw = await client.complete(system, prompt, token, meta);
         let validation = (0, schema_1.validateAIResult)((0, schema_1.parseJsonLoose)(raw), context);
         if (!validation.ok) {
             const detail = validation.errors
@@ -6644,7 +7194,13 @@ class Pipeline {
                 `错误：${detail}\n` +
                 `上次输出（已截断）：\n${raw.slice(0, 4000)}\n\n` +
                 "请根据错误修正，仍然只输出完整 JSON。";
-            raw = await client.complete(system, repairPrompt, token);
+            raw = await client.complete(system, repairPrompt, token, {
+                ...meta,
+                kind: "email-repair",
+                label: meta.customerName
+                    ? `${meta.customerName} · 校验失败后自动修复`
+                    : "校验失败后自动修复",
+            });
             validation = (0, schema_1.validateAIResult)((0, schema_1.parseJsonLoose)(raw), context);
         }
         return {
@@ -6773,7 +7329,36 @@ __modules["src/obsidian/settings-tab.ts"] = function(module, exports, require) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.EmailOutreachSettingTab = void 0;
 const obsidian_1 = require("obsidian");
+const ai_log_1 = require("src/core/ai-log.ts");
 const settings_1 = require("src/obsidian/settings.ts");
+const confirm_1 = require("src/obsidian/modals/confirm.ts");
+/** 复制文本；Electron 里 navigator.clipboard 偶尔不可用，回退到 textarea。 */
+async function copyText(text) {
+    try {
+        if (navigator.clipboard &&
+            typeof navigator.clipboard.writeText === "function") {
+            await navigator.clipboard.writeText(text);
+            return;
+        }
+    }
+    catch (_a) {
+        // 继续走回退方案
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+        const ok = document.execCommand("copy");
+        if (!ok)
+            throw new Error("浏览器拒绝了复制请求");
+    }
+    finally {
+        document.body.removeChild(textarea);
+    }
+}
 class EmailOutreachSettingTab extends obsidian_1.PluginSettingTab {
     constructor(app, host) {
         super(app, host);
@@ -7086,6 +7671,191 @@ class EmailOutreachSettingTab extends obsidian_1.PluginSettingTab {
             this.host.clearSelection();
             this.display();
         }));
+        this.renderAILogSection(containerEl);
+    }
+    /** 设置页最底部：AI 请求日志。 */
+    renderAILogSection(containerEl) {
+        new obsidian_1.Setting(containerEl).setName("AI 请求日志").setHeading();
+        const dir = this.host.settings.outputDir.trim();
+        const storage = dir
+            ? `日志同时写入「${dir}/${ai_log_1.AI_LOG_STATE_DIR}/${ai_log_1.AI_LOG_FILE_NAME}」，重载插件后仍可查看。`
+            : "当前未设置输出目录，日志只保存在本次会话。";
+        containerEl.createDiv({
+            cls: "eo-log-desc",
+            text: `逐条记录真正发给 AI 的内容：完整系统提示词、用户提示词、模型与参数、耗时、原始响应和错误。最多保留最近 ${ai_log_1.AI_LOG_MAX_ENTRIES} 条。${storage}`,
+        });
+        const toolbar = containerEl.createDiv({ cls: "eo-log-toolbar" });
+        const refreshButton = toolbar.createEl("button", { text: "刷新" });
+        const copyAllButton = toolbar.createEl("button", { text: "复制全部" });
+        const clearButton = toolbar.createEl("button", {
+            cls: "mod-warning",
+            text: "清除日志",
+        });
+        const listEl = containerEl.createDiv({ cls: "eo-log-list" });
+        const fill = async () => {
+            listEl.empty();
+            listEl.createDiv({ cls: "eo-muted", text: "正在读取日志…" });
+            let entries;
+            try {
+                entries = await this.host.loadAILogs();
+            }
+            catch (error) {
+                listEl.empty();
+                listEl.createDiv({
+                    cls: "eo-log-empty",
+                    text: `读取日志失败：${error instanceof Error ? error.message : String(error)}`,
+                });
+                return;
+            }
+            // 等待期间用户可能已经切走或重新打开设置页。
+            if (!listEl.isConnected)
+                return;
+            listEl.empty();
+            if (entries.length === 0) {
+                listEl.createDiv({
+                    cls: "eo-log-empty",
+                    text: "还没有记录。生成邮件、重新生成邮件或提炼规则后，这里会显示发给 AI 的完整内容。",
+                });
+                return;
+            }
+            listEl.createDiv({
+                cls: "eo-muted",
+                text: `共 ${entries.length} 条，最新在前。点击一条展开完整内容。`,
+            });
+            for (const entry of entries)
+                this.renderAILogEntry(listEl, entry);
+        };
+        refreshButton.addEventListener("click", () => {
+            void fill();
+        });
+        copyAllButton.addEventListener("click", async () => {
+            try {
+                const entries = await this.host.loadAILogs();
+                if (entries.length === 0) {
+                    new obsidian_1.Notice("还没有 AI 日志");
+                    return;
+                }
+                await copyText((0, ai_log_1.formatAILogEntries)(entries));
+                new obsidian_1.Notice(`已复制 ${entries.length} 条 AI 日志`);
+            }
+            catch (error) {
+                new obsidian_1.Notice(`复制失败：${error instanceof Error ? error.message : String(error)}`);
+            }
+        });
+        clearButton.addEventListener("click", async () => {
+            const ok = await (0, confirm_1.confirm)(this.app, {
+                title: "清除 AI 请求日志",
+                confirmText: "清除",
+                danger: true,
+                build: (container) => {
+                    container.createEl("p", {
+                        text: "会删除当前保存的全部 AI 请求记录（包括 .state/ai-log.jsonl），不影响已生成的邮件。",
+                    });
+                },
+            });
+            if (!ok)
+                return;
+            await this.host.clearAILogs();
+            new obsidian_1.Notice("AI 日志已清除");
+            await fill();
+        });
+        void fill();
+    }
+    renderAILogEntry(parent, entry) {
+        const details = parent.createEl("details", {
+            cls: `eo-log-entry eo-log-entry-${entry.status}`,
+        });
+        const summary = details.createEl("summary", { cls: "eo-log-summary" });
+        summary.createSpan({
+            cls: `eo-log-badge eo-log-badge-${entry.status}`,
+            text: (0, ai_log_1.aiLogStatusLabel)(entry.status),
+        });
+        summary.createSpan({ cls: "eo-log-time", text: (0, ai_log_1.formatAILogTime)(entry.at) });
+        summary.createSpan({ cls: "eo-log-label", text: entry.label });
+        const meta = [
+            entry.request.model || "（未配置模型）",
+            (0, ai_log_1.formatAILogDuration)(entry.durationMs),
+            `系统 ${entry.request.systemChars} 字 / 用户 ${entry.request.userChars} 字`,
+        ];
+        if (entry.attempt > 1)
+            meta.push(`第 ${entry.attempt} 次尝试`);
+        summary.createSpan({ cls: "eo-log-meta", text: meta.join(" · ") });
+        if (entry.status === "error" && entry.response.error) {
+            summary.createSpan({
+                cls: "eo-log-error-hint",
+                text: entry.response.error.slice(0, 90),
+            });
+        }
+        let rendered = false;
+        details.addEventListener("toggle", () => {
+            if (!details.open || rendered)
+                return;
+            rendered = true;
+            this.renderAILogBody(details, entry);
+        });
+    }
+    renderAILogBody(parent, entry) {
+        var _a, _b, _c, _d, _e;
+        const body = parent.createDiv({ cls: "eo-log-body" });
+        const facts = body.createDiv({ cls: "eo-log-facts" });
+        const fact = (key, value) => {
+            const row = facts.createDiv({ cls: "eo-log-fact" });
+            row.createSpan({ cls: "eo-log-fact-key", text: key });
+            row.createSpan({ cls: "eo-log-fact-value", text: value });
+        };
+        fact("记录", entry.label);
+        fact("时间", `${(0, ai_log_1.formatAILogTime)(entry.at)}（${entry.at}）`);
+        if (entry.customerName || entry.customerPath) {
+            fact("客户", [entry.customerName, entry.customerPath].filter(Boolean).join(" · "));
+        }
+        fact("尝试", `第 ${entry.attempt} / ${entry.maxAttempts} 次`);
+        fact("模型", entry.request.model || "（未设置）");
+        fact("接口", `${entry.request.method} ${entry.request.url || "（未设置）"}`);
+        fact("参数", `temperature=${(_a = entry.request.temperature) !== null && _a !== void 0 ? _a : "—"} · response_format=${(_b = entry.request.responseFormat) !== null && _b !== void 0 ? _b : "—"} · stream=${entry.request.stream}`);
+        fact("提示词", `系统 ${entry.request.systemChars} 字 / 用户 ${entry.request.userChars} 字 / 合计 ${entry.request.totalChars} 字`);
+        fact("耗时", (0, ai_log_1.formatAILogDuration)(entry.durationMs));
+        fact("HTTP 状态", entry.response.status === null ? "未收到响应" : String(entry.response.status));
+        if (entry.response.finishReason) {
+            fact("finish_reason", entry.response.finishReason);
+        }
+        if (entry.response.usage) {
+            const usage = entry.response.usage;
+            fact("tokens", `prompt ${(_c = usage.promptTokens) !== null && _c !== void 0 ? _c : "—"} / completion ${(_d = usage.completionTokens) !== null && _d !== void 0 ? _d : "—"} / total ${(_e = usage.totalTokens) !== null && _e !== void 0 ? _e : "—"}`);
+        }
+        if (entry.response.error) {
+            body.createDiv({
+                cls: "eo-log-error",
+                text: `错误：${entry.response.error}`,
+            });
+        }
+        const section = (title, content) => {
+            if (content === null || content === "")
+                return;
+            const block = body.createDiv({ cls: "eo-log-section" });
+            const head = block.createDiv({ cls: "eo-log-section-head" });
+            head.createSpan({ cls: "eo-log-section-title", text: title });
+            head.createSpan({
+                cls: "eo-log-section-size",
+                text: `${content.length} 字`,
+            });
+            block.createEl("pre", { cls: "eo-log-pre", text: content });
+        };
+        section("系统提示词（完整）", entry.request.system);
+        section("用户提示词（完整）", entry.request.user);
+        section("AI 返回内容", entry.response.content);
+        section("原始响应体", entry.response.rawBody);
+        const actions = body.createDiv({ cls: "eo-log-actions" });
+        actions
+            .createEl("button", { text: "复制这条日志" })
+            .addEventListener("click", async () => {
+            try {
+                await copyText((0, ai_log_1.formatAILogEntry)(entry));
+                new obsidian_1.Notice("已复制这条日志");
+            }
+            catch (error) {
+                new obsidian_1.Notice(`复制失败：${error instanceof Error ? error.message : String(error)}`);
+            }
+        });
     }
 }
 exports.EmailOutreachSettingTab = EmailOutreachSettingTab;
@@ -7528,6 +8298,33 @@ class VaultAdapter {
         if (!(await adapter.exists(path)))
             return null;
         return adapter.read(path);
+    }
+    /** 追加一段文本；文件不存在时创建。用于逐条写入 AI 请求日志。 */
+    async appendStateFile(relativePath, content) {
+        const path = (0, obsidian_1.normalizePath)(relativePath);
+        const adapter = this.app.vault.adapter;
+        const dir = path.split("/").slice(0, -1).join("/");
+        if (dir) {
+            try {
+                await adapter.mkdir(dir);
+            }
+            catch (_a) {
+                // already exists
+            }
+        }
+        if (await adapter.exists(path)) {
+            await adapter.append(path, content);
+        }
+        else {
+            await adapter.write(path, content);
+        }
+        return path;
+    }
+    async deleteStateFile(relativePath) {
+        const path = (0, obsidian_1.normalizePath)(relativePath);
+        const adapter = this.app.vault.adapter;
+        if (await adapter.exists(path))
+            await adapter.remove(path);
     }
     async writeStateJson(dir, fileName, data) {
         return this.writeStateFile((0, filenames_1.joinPath)(dir, ".state", fileName), JSON.stringify(data, null, 2));

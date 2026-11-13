@@ -11,6 +11,7 @@ import {
 	parseCustomerAIFile,
 	setEmailStatus,
 } from "../core/ai-file";
+import type { AILogEntry } from "../core/ai-log";
 import { findContactByEmail } from "../core/contact-parser";
 import {
 	collectPropertyKeys,
@@ -54,6 +55,7 @@ import {
 	toWikilink,
 } from "../core/wikilinks";
 import { AIClient, CanceledError } from "./ai-client";
+import { AILogStore } from "./ai-log-store";
 import {
 	registerBasesView,
 	refreshBasesViews,
@@ -112,6 +114,7 @@ export default class EmailOutreachPlugin
 	emailStore!: EmailStore;
 	adapter!: VaultAdapter;
 	client!: AIClient;
+	aiLog!: AILogStore;
 	knowledgeLoader!: KnowledgeLoader;
 	state!: StateStore;
 	basesAvailable = false;
@@ -212,7 +215,13 @@ export default class EmailOutreachPlugin
 			() => this.settings.customerDir,
 			this.adapter,
 		);
-		this.client = new AIClient(() => this.settings);
+		this.aiLog = new AILogStore(this.adapter, () => this.settings.outputDir);
+		this.client = new AIClient(
+			() => this.settings,
+			(entry) => {
+				void this.aiLog.append(entry);
+			},
+		);
 		this.knowledgeLoader = new KnowledgeLoader(
 			this.app,
 			() => this.settings,
@@ -383,6 +392,18 @@ export default class EmailOutreachPlugin
 		this.settings.availableModels = models;
 		await this.saveSettings();
 		return models;
+	}
+
+	// --------------------------------------------------------------- ai logs
+
+	/** 设置页用：读取本机 AI 日志，最新在前。 */
+	async loadAILogs(): Promise<AILogEntry[]> {
+		await this.aiLog.load();
+		return this.aiLog.list();
+	}
+
+	async clearAILogs(): Promise<void> {
+		await this.aiLog.clear();
 	}
 
 	// --------------------------------------------------------------- selection
@@ -836,6 +857,13 @@ export default class EmailOutreachPlugin
 		const raw = await this.client.complete(
 			buildSystemPrompt(MAX_EMAILS_PER_CUSTOMER),
 			prompt,
+			undefined,
+			{
+				kind: "regenerate",
+				label: `${row.customerName} · 重新生成邮件 ${row.record.id}`,
+				customerName: row.customerName,
+				customerPath: customer.path,
+			},
 		);
 		report("校验 AI 返回", undefined, 0.85);
 		const validation = validateAIResult(
@@ -1031,6 +1059,12 @@ export default class EmailOutreachPlugin
 				email: row.record,
 				userComments: comment,
 			}),
+			undefined,
+			{
+				kind: "rule",
+				label: `${row.customerName} · 提炼经验规则`,
+				customerName: row.customerName,
+			},
 		);
 		const draft = parseRuleDraft(parseJsonLoose(raw));
 		if (!draft) {

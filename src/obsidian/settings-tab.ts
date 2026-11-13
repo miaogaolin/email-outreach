@@ -1,6 +1,18 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import {
+	AI_LOG_FILE_NAME,
+	AI_LOG_MAX_ENTRIES,
+	AI_LOG_STATE_DIR,
+	aiLogStatusLabel,
+	formatAILogDuration,
+	formatAILogEntries,
+	formatAILogEntry,
+	formatAILogTime,
+	type AILogEntry,
+} from "../core/ai-log";
 import { getConfigProblems, type WorkbenchMode } from "./settings";
 import type { OutreachPluginApi } from "./plugin-api";
+import { confirm } from "./modals/confirm";
 
 export interface SettingsHost extends OutreachPluginApi {
 	getKnowledgeSummary(): Promise<string>;
@@ -8,6 +20,36 @@ export interface SettingsHost extends OutreachPluginApi {
 	clearApiKey(): Promise<void>;
 	listModels(): Promise<string[]>;
 	reloadBasesView(): void;
+	/** 读取本机 AI 日志（最新在前）。 */
+	loadAILogs(): Promise<AILogEntry[]>;
+	clearAILogs(): Promise<void>;
+}
+
+/** 复制文本；Electron 里 navigator.clipboard 偶尔不可用，回退到 textarea。 */
+async function copyText(text: string): Promise<void> {
+	try {
+		if (
+			navigator.clipboard &&
+			typeof navigator.clipboard.writeText === "function"
+		) {
+			await navigator.clipboard.writeText(text);
+			return;
+		}
+	} catch {
+		// 继续走回退方案
+	}
+	const textarea = document.createElement("textarea");
+	textarea.value = text;
+	textarea.style.position = "fixed";
+	textarea.style.opacity = "0";
+	document.body.appendChild(textarea);
+	textarea.select();
+	try {
+		const ok = document.execCommand("copy");
+		if (!ok) throw new Error("浏览器拒绝了复制请求");
+	} finally {
+		document.body.removeChild(textarea);
+	}
 }
 
 export class EmailOutreachSettingTab extends PluginSettingTab {
@@ -417,5 +459,214 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 					this.display();
 				}),
 			);
+
+		this.renderAILogSection(containerEl);
+	}
+
+	/** 设置页最底部：AI 请求日志。 */
+	private renderAILogSection(containerEl: HTMLElement): void {
+		new Setting(containerEl).setName("AI 请求日志").setHeading();
+
+		const dir = this.host.settings.outputDir.trim();
+		const storage = dir
+			? `日志同时写入「${dir}/${AI_LOG_STATE_DIR}/${AI_LOG_FILE_NAME}」，重载插件后仍可查看。`
+			: "当前未设置输出目录，日志只保存在本次会话。";
+		containerEl.createDiv({
+			cls: "eo-log-desc",
+			text: `逐条记录真正发给 AI 的内容：完整系统提示词、用户提示词、模型与参数、耗时、原始响应和错误。最多保留最近 ${AI_LOG_MAX_ENTRIES} 条。${storage}`,
+		});
+
+		const toolbar = containerEl.createDiv({ cls: "eo-log-toolbar" });
+		const refreshButton = toolbar.createEl("button", { text: "刷新" });
+		const copyAllButton = toolbar.createEl("button", { text: "复制全部" });
+		const clearButton = toolbar.createEl("button", {
+			cls: "mod-warning",
+			text: "清除日志",
+		});
+		const listEl = containerEl.createDiv({ cls: "eo-log-list" });
+
+		const fill = async (): Promise<void> => {
+			listEl.empty();
+			listEl.createDiv({ cls: "eo-muted", text: "正在读取日志…" });
+			let entries: AILogEntry[];
+			try {
+				entries = await this.host.loadAILogs();
+			} catch (error) {
+				listEl.empty();
+				listEl.createDiv({
+					cls: "eo-log-empty",
+					text: `读取日志失败：${error instanceof Error ? error.message : String(error)}`,
+				});
+				return;
+			}
+			// 等待期间用户可能已经切走或重新打开设置页。
+			if (!listEl.isConnected) return;
+			listEl.empty();
+			if (entries.length === 0) {
+				listEl.createDiv({
+					cls: "eo-log-empty",
+					text: "还没有记录。生成邮件、重新生成邮件或提炼规则后，这里会显示发给 AI 的完整内容。",
+				});
+				return;
+			}
+			listEl.createDiv({
+				cls: "eo-muted",
+				text: `共 ${entries.length} 条，最新在前。点击一条展开完整内容。`,
+			});
+			for (const entry of entries) this.renderAILogEntry(listEl, entry);
+		};
+
+		refreshButton.addEventListener("click", () => {
+			void fill();
+		});
+
+		copyAllButton.addEventListener("click", async () => {
+			try {
+				const entries = await this.host.loadAILogs();
+				if (entries.length === 0) {
+					new Notice("还没有 AI 日志");
+					return;
+				}
+				await copyText(formatAILogEntries(entries));
+				new Notice(`已复制 ${entries.length} 条 AI 日志`);
+			} catch (error) {
+				new Notice(
+					`复制失败：${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		});
+
+		clearButton.addEventListener("click", async () => {
+			const ok = await confirm(this.app, {
+				title: "清除 AI 请求日志",
+				confirmText: "清除",
+				danger: true,
+				build: (container) => {
+					container.createEl("p", {
+						text: "会删除当前保存的全部 AI 请求记录（包括 .state/ai-log.jsonl），不影响已生成的邮件。",
+					});
+				},
+			});
+			if (!ok) return;
+			await this.host.clearAILogs();
+			new Notice("AI 日志已清除");
+			await fill();
+		});
+
+		void fill();
+	}
+
+	private renderAILogEntry(parent: HTMLElement, entry: AILogEntry): void {
+		const details = parent.createEl("details", {
+			cls: `eo-log-entry eo-log-entry-${entry.status}`,
+		});
+		const summary = details.createEl("summary", { cls: "eo-log-summary" });
+		summary.createSpan({
+			cls: `eo-log-badge eo-log-badge-${entry.status}`,
+			text: aiLogStatusLabel(entry.status),
+		});
+		summary.createSpan({ cls: "eo-log-time", text: formatAILogTime(entry.at) });
+		summary.createSpan({ cls: "eo-log-label", text: entry.label });
+		const meta = [
+			entry.request.model || "（未配置模型）",
+			formatAILogDuration(entry.durationMs),
+			`系统 ${entry.request.systemChars} 字 / 用户 ${entry.request.userChars} 字`,
+		];
+		if (entry.attempt > 1) meta.push(`第 ${entry.attempt} 次尝试`);
+		summary.createSpan({ cls: "eo-log-meta", text: meta.join(" · ") });
+		if (entry.status === "error" && entry.response.error) {
+			summary.createSpan({
+				cls: "eo-log-error-hint",
+				text: entry.response.error.slice(0, 90),
+			});
+		}
+
+		let rendered = false;
+		details.addEventListener("toggle", () => {
+			if (!details.open || rendered) return;
+			rendered = true;
+			this.renderAILogBody(details, entry);
+		});
+	}
+
+	private renderAILogBody(parent: HTMLElement, entry: AILogEntry): void {
+		const body = parent.createDiv({ cls: "eo-log-body" });
+		const facts = body.createDiv({ cls: "eo-log-facts" });
+		const fact = (key: string, value: string): void => {
+			const row = facts.createDiv({ cls: "eo-log-fact" });
+			row.createSpan({ cls: "eo-log-fact-key", text: key });
+			row.createSpan({ cls: "eo-log-fact-value", text: value });
+		};
+		fact("记录", entry.label);
+		fact("时间", `${formatAILogTime(entry.at)}（${entry.at}）`);
+		if (entry.customerName || entry.customerPath) {
+			fact(
+				"客户",
+				[entry.customerName, entry.customerPath].filter(Boolean).join(" · "),
+			);
+		}
+		fact("尝试", `第 ${entry.attempt} / ${entry.maxAttempts} 次`);
+		fact("模型", entry.request.model || "（未设置）");
+		fact("接口", `${entry.request.method} ${entry.request.url || "（未设置）"}`);
+		fact(
+			"参数",
+			`temperature=${entry.request.temperature ?? "—"} · response_format=${entry.request.responseFormat ?? "—"} · stream=${entry.request.stream}`,
+		);
+		fact(
+			"提示词",
+			`系统 ${entry.request.systemChars} 字 / 用户 ${entry.request.userChars} 字 / 合计 ${entry.request.totalChars} 字`,
+		);
+		fact("耗时", formatAILogDuration(entry.durationMs));
+		fact(
+			"HTTP 状态",
+			entry.response.status === null ? "未收到响应" : String(entry.response.status),
+		);
+		if (entry.response.finishReason) {
+			fact("finish_reason", entry.response.finishReason);
+		}
+		if (entry.response.usage) {
+			const usage = entry.response.usage;
+			fact(
+				"tokens",
+				`prompt ${usage.promptTokens ?? "—"} / completion ${usage.completionTokens ?? "—"} / total ${usage.totalTokens ?? "—"}`,
+			);
+		}
+
+		if (entry.response.error) {
+			body.createDiv({
+				cls: "eo-log-error",
+				text: `错误：${entry.response.error}`,
+			});
+		}
+
+		const section = (title: string, content: string | null): void => {
+			if (content === null || content === "") return;
+			const block = body.createDiv({ cls: "eo-log-section" });
+			const head = block.createDiv({ cls: "eo-log-section-head" });
+			head.createSpan({ cls: "eo-log-section-title", text: title });
+			head.createSpan({
+				cls: "eo-log-section-size",
+				text: `${content.length} 字`,
+			});
+			block.createEl("pre", { cls: "eo-log-pre", text: content });
+		};
+		section("系统提示词（完整）", entry.request.system);
+		section("用户提示词（完整）", entry.request.user);
+		section("AI 返回内容", entry.response.content);
+		section("原始响应体", entry.response.rawBody);
+
+		const actions = body.createDiv({ cls: "eo-log-actions" });
+		actions
+			.createEl("button", { text: "复制这条日志" })
+			.addEventListener("click", async () => {
+				try {
+					await copyText(formatAILogEntry(entry));
+					new Notice("已复制这条日志");
+				} catch (error) {
+					new Notice(
+						`复制失败：${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			});
 	}
 }

@@ -131,6 +131,32 @@ export class VaultAdapter {
 		return adapter.read(path);
 	}
 
+	/** 追加一段文本；文件不存在时创建。用于逐条写入 AI 请求日志。 */
+	async appendStateFile(relativePath: string, content: string): Promise<string> {
+		const path = normalizePath(relativePath);
+		const adapter = this.app.vault.adapter;
+		const dir = path.split("/").slice(0, -1).join("/");
+		if (dir) {
+			try {
+				await adapter.mkdir(dir);
+			} catch {
+				// already exists
+			}
+		}
+		if (await adapter.exists(path)) {
+			await adapter.append(path, content);
+		} else {
+			await adapter.write(path, content);
+		}
+		return path;
+	}
+
+	async deleteStateFile(relativePath: string): Promise<void> {
+		const path = normalizePath(relativePath);
+		const adapter = this.app.vault.adapter;
+		if (await adapter.exists(path)) await adapter.remove(path);
+	}
+
 	async writeStateJson(dir: string, fileName: string, data: unknown): Promise<string> {
 		return this.writeStateFile(
 			joinPath(dir, ".state", fileName),

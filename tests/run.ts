@@ -1,4 +1,5 @@
 import "./contact-parser.test";
+import "./ai-log.test";
 import "./ai-file.test";
 import "./schema-merge.test";
 import "./send-time.test";

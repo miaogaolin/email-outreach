@@ -1,6 +1,46 @@
 import { requestUrl } from "obsidian";
+import {
+	createAILogEntry,
+	type AILogEntry,
+	type AILogKind,
+	type AILogStatus,
+	type AILogUsage,
+} from "../core/ai-log";
+import { isoNow } from "../core/filenames";
 import { modelsEndpoint, parseModelList } from "../core/models";
 import type { Settings } from "./settings";
+
+/** 调用方补的上下文，只用于日志展示，不参与请求内容。 */
+export interface AIRequestMeta {
+	kind?: AILogKind;
+	/** 例如「ACME · 生成开发邮件」。 */
+	label?: string;
+	customerName?: string | null;
+	customerPath?: string | null;
+}
+
+/** 从 OpenAI 兼容返回里读 token 统计；没有就返回 null。 */
+function readUsage(data: unknown): AILogUsage | null {
+	if (!data || typeof data !== "object") return null;
+	const usage = (data as { usage?: unknown }).usage;
+	if (!usage || typeof usage !== "object") return null;
+	const record = usage as Record<string, unknown>;
+	const number = (value: unknown): number | null =>
+		typeof value === "number" && Number.isFinite(value) ? value : null;
+	const result: AILogUsage = {
+		promptTokens: number(record.prompt_tokens),
+		completionTokens: number(record.completion_tokens),
+		totalTokens: number(record.total_tokens),
+	};
+	if (
+		result.promptTokens === null &&
+		result.completionTokens === null &&
+		result.totalTokens === null
+	) {
+		return null;
+	}
+	return result;
+}
 
 export class AIError extends Error {
 	constructor(
@@ -70,19 +110,31 @@ function buildModelsEndpoint(baseUrl: string): string {
 }
 
 export class AIClient {
-	constructor(private getSettings: () => Settings) {}
+	constructor(
+		private getSettings: () => Settings,
+		/** 每次真正发出请求后回调一条日志；失败不影响请求本身。 */
+		private onLog?: (entry: AILogEntry) => void,
+	) {}
 
 	async complete(
 		system: string,
 		user: string,
 		token?: CancelToken,
+		meta?: AIRequestMeta,
 	): Promise<string> {
 		const maxAttempts = 4;
 		let lastError: unknown = null;
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			if (token?.canceled) throw new CanceledError();
 			try {
-				return await this.requestOnce(system, user, token);
+				return await this.requestOnce(
+					system,
+					user,
+					token,
+					meta,
+					attempt + 1,
+					maxAttempts,
+				);
 			} catch (error) {
 				lastError = error;
 				const retryable =
@@ -143,70 +195,147 @@ export class AIClient {
 	private async requestOnce(
 		system: string,
 		user: string,
-		token?: CancelToken,
+		token: CancelToken | undefined,
+		meta: AIRequestMeta | undefined,
+		attempt: number,
+		maxAttempts: number,
 	): Promise<string> {
 		const settings = this.getSettings();
-		if (!settings.apiKey.trim()) {
-			throw new AIError("未设置 API Key", false);
-		}
-		if (!settings.model.trim()) {
-			throw new AIError("未设置模型名称", false);
-		}
-		const endpoint = buildEndpoint(settings.apiBaseUrl);
-		const payload = {
-			model: settings.model.trim(),
-			messages: [
-				{ role: "system", content: system },
-				{ role: "user", content: user },
-			],
-			temperature: settings.temperature,
-			response_format: { type: "json_object" },
-			stream: false,
+		const startedAt = Date.now();
+		const startedIso = isoNow(new Date(startedAt));
+		let url = "";
+		let httpStatus: number | null = null;
+		let rawBody: string | null = null;
+		let finishReason: string | null = null;
+		let usage: AILogUsage | null = null;
+
+		const log = (
+			status: AILogStatus,
+			content: string | null,
+			error: string | null,
+		): void => {
+			if (!this.onLog) return;
+			try {
+				this.onLog(
+					createAILogEntry({
+						id: `${startedAt.toString(36)}-${Math.random()
+							.toString(36)
+							.slice(2, 8)}`,
+						at: startedIso,
+						finishedAt: isoNow(),
+						durationMs: Date.now() - startedAt,
+						attempt,
+						maxAttempts,
+						kind: meta?.kind ?? "email",
+						label: meta?.label ?? "",
+						customerName: meta?.customerName ?? null,
+						customerPath: meta?.customerPath ?? null,
+						status,
+						request: {
+							url,
+							method: "POST",
+							model: settings.model.trim(),
+							temperature: settings.temperature,
+							responseFormat: "json_object",
+							stream: false,
+							system,
+							user,
+						},
+						response: {
+							status: httpStatus,
+							content,
+							finishReason,
+							usage,
+							rawBody,
+							error,
+						},
+					}),
+				);
+			} catch (logError) {
+				console.error("[email-outreach] 记录 AI 请求日志失败", logError);
+			}
 		};
 
-		const response = await withTimeout(
-			requestUrl({
-				url: endpoint,
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${settings.apiKey.trim()}`,
-				},
-				body: JSON.stringify(payload),
-				throw: false,
-			}),
-			Math.max(10000, settings.timeoutMs),
-		);
-
-		if (token?.canceled) throw new CanceledError();
-
-		if (response.status < 200 || response.status >= 300) {
-			const retryable = response.status === 429 || response.status >= 500;
-			const detail = (response.text ?? "").slice(0, 500);
-			throw new AIError(
-				`AI 接口返回 ${response.status}${detail ? `：${detail}` : ""}`,
-				retryable,
-			);
-		}
-
-		let data: unknown;
 		try {
-			data = response.json;
-		} catch {
-			data = null;
+			if (!settings.apiKey.trim()) {
+				throw new AIError("未设置 API Key", false);
+			}
+			if (!settings.model.trim()) {
+				throw new AIError("未设置模型名称", false);
+			}
+			url = buildEndpoint(settings.apiBaseUrl);
+			const payload = {
+				model: settings.model.trim(),
+				messages: [
+					{ role: "system", content: system },
+					{ role: "user", content: user },
+				],
+				temperature: settings.temperature,
+				response_format: { type: "json_object" },
+				stream: false,
+			};
+
+			const response = await withTimeout(
+				requestUrl({
+					url,
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${settings.apiKey.trim()}`,
+					},
+					body: JSON.stringify(payload),
+					throw: false,
+				}),
+				Math.max(10000, settings.timeoutMs),
+			);
+
+			httpStatus = response.status;
+			rawBody = response.text ?? null;
+
+			if (token?.canceled) throw new CanceledError();
+
+			if (response.status < 200 || response.status >= 300) {
+				const retryable = response.status === 429 || response.status >= 500;
+				const detail = (response.text ?? "").slice(0, 500);
+				throw new AIError(
+					`AI 接口返回 ${response.status}${detail ? `：${detail}` : ""}`,
+					retryable,
+				);
+			}
+
+			let data: unknown;
+			try {
+				data = response.json;
+			} catch {
+				data = null;
+			}
+			usage = readUsage(data);
+			if (!data || typeof data !== "object") {
+				throw new AIError("AI 接口返回的不是 JSON", true);
+			}
+			const choices = (data as { choices?: unknown }).choices;
+			if (!Array.isArray(choices) || choices.length === 0) {
+				throw new AIError("AI 接口返回缺少 choices", false);
+			}
+			const first = choices[0] as {
+				message?: { content?: unknown };
+				finish_reason?: unknown;
+			};
+			finishReason =
+				typeof first?.finish_reason === "string"
+					? first.finish_reason
+					: null;
+			const content = first?.message?.content;
+			if (typeof content !== "string" || !content.trim()) {
+				throw new AIError("AI 返回内容为空", false);
+			}
+			log("ok", content, null);
+			return content;
+		} catch (error) {
+			const canceled = error instanceof CanceledError;
+			const message = error instanceof Error ? error.message : String(error);
+			log(canceled ? "canceled" : "error", null, message);
+			throw error;
 		}
-		if (!data || typeof data !== "object") {
-			throw new AIError("AI 接口返回的不是 JSON", true);
-		}
-		const choices = (data as { choices?: unknown }).choices;
-		if (!Array.isArray(choices) || choices.length === 0) {
-			throw new AIError("AI 接口返回缺少 choices", false);
-		}
-		const first = choices[0] as { message?: { content?: unknown } };
-		const content = first?.message?.content;
-		if (typeof content !== "string" || !content.trim()) {
-			throw new AIError("AI 返回内容为空", false);
-		}
-		return content;
 	}
 }
