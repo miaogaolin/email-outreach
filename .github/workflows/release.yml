@@ -15,6 +15,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check tag matches manifest version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          node -e "const m=require('./manifest.json');const t=process.env.TAG.replace(/^v/,'');if(m.version!==t){console.error('manifest version '+m.version+' does not match tag '+t+'；请先提交版本号，再打 tag');process.exit(1)}"
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -35,12 +41,6 @@ jobs:
 
       - name: Smoke load bundle
         run: node scripts/smoke-load.cjs
-
-      - name: Check tag matches manifest version
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          node -e "const m=require('./manifest.json');const t=process.env.TAG.replace(/^v/,'');if(m.version!==t){console.error('manifest version '+m.version+' does not match tag '+t);process.exit(1)}"
 
       - name: Create release
         uses: softprops/action-gh-release@v2

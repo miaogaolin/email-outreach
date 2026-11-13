@@ -1,7 +1,7 @@
 {
   "id": "email-outreach",
   "name": "Email Outreach 开发邮件",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "minAppVersion": "1.6.0",
   "description": "AI 外贸开发邮件工作台：按属性筛选客户、解析联系人、调用 AI 生成多语言开发邮件，人工审核后保存为 Markdown。",
   "author": "Evan Miao",

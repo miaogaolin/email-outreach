@@ -3,7 +3,7 @@
 在 Obsidian 里完成「筛选客户 → 勾选客户 → 生成开发邮件 → 人工审核 → 落盘」的完整闭环。客户资料仍由你维护，AI 规则来自你指定的 Markdown 指令文件及其双链文章，插件不会自动发送邮件。
 
 - 插件 id：`email-outreach`
-- 版本：0.1.0
+- 版本：0.1.2
 - 仓库：[miaogaolin/email-outreach](https://github.com/miaogaolin/email-outreach)
 - 源码位置：`.obsidian/plugins/email-outreach/`
 - 依赖：Obsidian 1.6+；Bases 工作台需要 1.10+；AI 接口需兼容 OpenAI `chat/completions`

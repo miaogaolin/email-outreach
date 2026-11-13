@@ -1,6 +1,6 @@
 {
   "name": "obsidian-email-outreach",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "AI outreach workbench for Obsidian: filter customers, parse contacts, analyze with AI, review and save outreach emails as Markdown.",
   "main": "main.js",
