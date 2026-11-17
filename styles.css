@@ -534,7 +534,7 @@ a.eo-dev-cell:focus-visible {
 	white-space: nowrap;
 }
 
-.eo-email-table td:nth-child(4) {
+.eo-email-table td.eo-summary-cell {
 	white-space: normal;
 }
 

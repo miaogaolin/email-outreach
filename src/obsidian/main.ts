@@ -1257,6 +1257,52 @@ export default class EmailOutreachPlugin
 		await this.refreshEmailList();
 	}
 
+	/**
+	 * 批量永久删除开发邮件：按文件分组，一次写盘删掉邮件块并清理提醒。
+	 * 单个文件失败不影响其他文件；生成任务运行中直接拒绝。
+	 */
+	async deleteEmails(rows: EmailRow[]): Promise<void> {
+		if (this.isRunning()) {
+			new Notice("生成任务正在运行，完成后再删除邮件。");
+			return;
+		}
+		if (rows.length === 0) return;
+
+		const byFile = new Map<string, string[]>();
+		for (const row of rows) {
+			const ids = byFile.get(row.filePath) ?? [];
+			if (!ids.includes(row.record.id)) ids.push(row.record.id);
+			byFile.set(row.filePath, ids);
+		}
+
+		let removed = 0;
+		let missing = 0;
+		const failures: string[] = [];
+		for (const [path, ids] of byFile) {
+			try {
+				const result = await this.emailStore.removeRecords(path, ids);
+				removed += result.removed.length;
+				missing += result.missing.length;
+			} catch (error) {
+				failures.push(
+					`${path}：${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+
+		await this.refreshEmailList();
+		this.refreshWorkbenchViews();
+
+		const parts = [`已删除 ${removed} 封邮件`];
+		if (missing > 0) parts.push(`${missing} 封在文件里已不存在`);
+		if (failures.length > 0) {
+			parts.push(
+				`${failures.length} 个文件删除失败：${failures.join("；")}`,
+			);
+		}
+		new Notice(parts.join("；"), failures.length > 0 ? 9000 : undefined);
+	}
+
 	/** 读取邮件对应当前联系人的 `#Contact/...` 渠道；失败时只返回空数组。 */
 	private async loadContactChannels(
 		customer: CustomerRecord | null,

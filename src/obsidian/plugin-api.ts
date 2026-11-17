@@ -32,6 +32,8 @@ export interface OutreachPluginApi {
 	getLastRunStatus(): RunStatusFile | null;
 	openContacts(record: CustomerRecord): Promise<void>;
 	openEmailDetail(key: string): void;
+	/** 永久删除选中的开发邮件（含修改历史与发送提醒），并刷新列表/工作台。 */
+	deleteEmails(rows: EmailRow[]): Promise<void>;
 	openEmailList(): void;
 	/** 打开邮件列表并筛选到指定客户；aiFilePath 命中时优先用它定位。 */
 	openEmailListForCustomer(

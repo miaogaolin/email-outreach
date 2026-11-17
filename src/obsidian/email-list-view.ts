@@ -9,10 +9,12 @@ import {
 	summarizeRunStatuses,
 	statusLabel,
 } from "../core/run-status";
+import { pruneSelection, selectionSummary } from "../core/selection";
 import { formatBeijingTime } from "../core/send-time";
 import type { EmailRow, EmailStatus } from "../core/types";
 import { EMAIL_STATUSES } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
+import { confirm } from "./modals/confirm";
 import { PreviewController } from "./preview-popover";
 
 const STATUS_LABELS: Record<EmailStatus | "all", string> = {
@@ -28,6 +30,17 @@ export class EmailListView extends ItemView {
 	private customerFilter: EmailCustomerFilter | null = null;
 	private showDuplicatePending = false;
 	private preview = new PreviewController();
+
+	// 批量删除：选中键只对当前可见行有意义，筛选变化后自动裁剪。
+	private selected = new Set<string>();
+	private busy = false;
+	private deleteButton: HTMLButtonElement | null = null;
+	private selectAllInput: HTMLInputElement | null = null;
+	private visibleKeys: string[] = [];
+	private rowElements = new Map<
+		string,
+		{ tr: HTMLTableRowElement; checkbox: HTMLInputElement }
+	>();
 
 	// 局部重绘用：搜索/状态变化只换计数与表格，输入框不丢焦点。
 	private tableContainer: HTMLElement | null = null;
@@ -123,6 +136,19 @@ export class EmailListView extends ItemView {
 		this.dedupeWrap = dedupeWrap;
 		dedupeWrap.style.display = "none";
 
+		this.deleteButton = actions.createEl("button", {
+			text: "删除选中",
+			cls: "mod-warning eo-delete-emails",
+		});
+		this.deleteButton.disabled = true;
+		this.deleteButton.setAttr(
+			"title",
+			"永久删除勾选的邮件（含修改历史和发送提醒）",
+		);
+		this.deleteButton.addEventListener("click", () => {
+			void this.deleteSelected();
+		});
+
 		actions
 			.createEl("button", { text: "刷新" })
 			.addEventListener("click", () => void this.refresh());
@@ -173,6 +199,8 @@ export class EmailListView extends ItemView {
 		const target = this.tableContainer;
 		if (!target) return;
 		target.empty();
+		this.rowElements = new Map();
+		this.selectAllInput = null;
 
 		const result = filterEmailRows(this.plugin.emailStore.getRows(), {
 			status: this.statusFilter,
@@ -181,6 +209,9 @@ export class EmailListView extends ItemView {
 			showDuplicatePending: this.showDuplicatePending,
 		});
 		const rows = result.visible;
+		this.visibleKeys = rows.map((row) => row.key);
+		// 筛选/刷新后只保留仍然可见的勾选，避免删除看不见的邮件。
+		this.selected = pruneSelection(this.selected, this.visibleKeys);
 
 		const countParts = [`共 ${rows.length} 封邮件`];
 		if (this.customerFilter) countParts.push(`客户：${this.customerFilter.name}`);
@@ -206,11 +237,25 @@ export class EmailListView extends ItemView {
 
 		if (rows.length === 0) {
 			this.renderEmptyState(target, result.hiddenDuplicateCount);
+			this.syncSelectionUi();
 			return;
 		}
 
 		const table = target.createEl("table", { cls: "eo-table eo-email-table" });
 		const head = table.createEl("thead").createEl("tr");
+		const selectTh = head.createEl("th", { cls: "eo-col-select" });
+		this.selectAllInput = selectTh.createEl("input", {
+			type: "checkbox",
+			attr: { "aria-label": "全选当前邮件" },
+		});
+		this.selectAllInput.addEventListener("change", () => {
+			if (this.selectAllInput?.checked) {
+				for (const key of this.visibleKeys) this.selected.add(key);
+			} else {
+				this.selected.clear();
+			}
+			this.syncSelectionUi();
+		});
 		for (const label of [
 			"客户",
 			"联系人",
@@ -230,6 +275,24 @@ export class EmailListView extends ItemView {
 			tr.addEventListener("click", () => {
 				this.plugin.openEmailDetail(row.key);
 			});
+			if (this.selected.has(row.key)) tr.addClass("is-selected");
+
+			const selectCell = tr.createEl("td", { cls: "eo-col-select" });
+			selectCell.addEventListener("click", (event) => event.stopPropagation());
+			const checkbox = selectCell.createEl("input", {
+				type: "checkbox",
+				attr: {
+					"aria-label": `选择 ${row.customerName} 的邮件 ${row.record.id}`,
+				},
+			});
+			checkbox.checked = this.selected.has(row.key);
+			checkbox.addEventListener("click", (event) => event.stopPropagation());
+			checkbox.addEventListener("change", () => {
+				if (checkbox.checked) this.selected.add(row.key);
+				else this.selected.delete(row.key);
+				this.syncSelectionUi();
+			});
+			this.rowElements.set(row.key, { tr, checkbox });
 
 			const customerCell = tr.createEl("td");
 			if (row.customerLink) {
@@ -301,6 +364,96 @@ export class EmailListView extends ItemView {
 			});
 			if (updatedAt) updatedCell.setAttr("title", updatedAt);
 			tr.createEl("td", { text: String(row.record.versions.length) });
+		}
+		this.syncSelectionUi();
+	}
+
+	/** 同步全选框、行选中样式与删除按钮；勾选时只更新界面，不整表重绘。 */
+	private syncSelectionUi(): void {
+		const summary = selectionSummary(this.visibleKeys, this.selected);
+		if (this.selectAllInput) {
+			this.selectAllInput.checked = summary.checked;
+			this.selectAllInput.indeterminate = summary.indeterminate;
+		}
+		for (const [key, element] of this.rowElements) {
+			const checked = this.selected.has(key);
+			if (element.checkbox.checked !== checked) {
+				element.checkbox.checked = checked;
+			}
+			element.tr.classList.toggle("is-selected", checked);
+		}
+		if (!this.deleteButton) return;
+		const count = this.selected.size;
+		this.deleteButton.disabled = this.busy || count === 0;
+		this.deleteButton.setText(
+			count > 0 ? `删除选中（${count}）` : "删除选中",
+		);
+	}
+
+	private async deleteSelected(): Promise<void> {
+		if (this.busy) return;
+		if (this.plugin.isRunning()) {
+			new Notice("生成任务正在运行，完成后再删除邮件。");
+			return;
+		}
+		const rows = this.plugin.emailStore
+			.getRows()
+			.filter((row) => this.selected.has(row.key));
+		if (rows.length === 0) {
+			this.syncSelectionUi();
+			return;
+		}
+
+		const fileCount = new Set(rows.map((row) => row.filePath)).size;
+		const acceptedCount = rows.filter(
+			(row) => row.record.status === "Accepted",
+		).length;
+
+		this.busy = true;
+		this.syncSelectionUi();
+		try {
+			const confirmed = await confirm(this.app, {
+				title: "删除开发邮件",
+				confirmText: "永久删除",
+				cancelText: "取消",
+				danger: true,
+				build: (container) => {
+					container.createEl("p", {
+						text: `将从 ${fileCount} 个 AI 开发信息文件中永久删除 ${rows.length} 封邮件。`,
+					});
+					container.createEl("p", {
+						text: "每封邮件的修改历史和对应的发送提醒会一起删除，列表里的这些行也会消失。此操作不能撤销，只能从 Git 历史或备份恢复。",
+					});
+					if (acceptedCount > 0) {
+						container.createEl("p", {
+							cls: "eo-warning-box",
+							text: `其中 ${acceptedCount} 封已验收，发送提醒会被一并移除。`,
+						});
+					}
+					const list = container.createEl("ul");
+					for (const row of rows.slice(0, 5)) {
+						list.createEl("li", {
+							text: `${row.customerName} · 邮件 ${row.record.id} · ${
+								row.record.contact || row.record.email || "（无联系人）"
+							}`,
+						});
+					}
+					if (rows.length > 5) {
+						container.createEl("p", {
+							cls: "eo-muted",
+							text: `等 ${rows.length} 封`,
+						});
+					}
+				},
+			});
+			if (!confirmed) return;
+			await this.plugin.deleteEmails(rows);
+		} catch (error) {
+			new Notice(error instanceof Error ? error.message : String(error));
+			await this.refresh();
+		} finally {
+			this.busy = false;
+			this.syncSelectionUi();
 		}
 	}
 
