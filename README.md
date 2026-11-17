@@ -3,7 +3,7 @@
 在 Obsidian 里完成「筛选客户 → 勾选客户 → 生成开发邮件 → 人工审核 → 落盘」的完整闭环。客户资料仍由你维护，AI 规则来自你指定的 Markdown 指令文件及其双链文章，插件不会自动发送邮件。
 
 - 插件 id：`email-outreach`
-- 版本：0.1.2
+- 版本：0.2.0
 - 仓库：[miaogaolin/email-outreach](https://github.com/miaogaolin/email-outreach)
 - 源码位置：`.obsidian/plugins/email-outreach/`
 - 依赖：Obsidian 1.6+；Bases 工作台需要 1.10+；AI 接口需兼容 OpenAI `chat/completions`
@@ -45,6 +45,8 @@
 2. 命令面板执行 `BRAT: Add a beta plugin for testing`，输入 `miaogaolin/email-outreach`。
 3. 回到 设置 → 第三方插件，启用 **Email Outreach 开发邮件**。
 4. 之后 BRAT 会检查新 Release；每次发布都会附带 `main.js`、`manifest.json`、`styles.css`。
+
+更新到最新代码：命令面板执行 `BRAT: Check for updates to all beta plugins`，或重启 Obsidian 让 BRAT 自动检查。BRAT 按 Release 的版本号判断是否有更新，所以发布前必须先把 `manifest.json` 的 `version` 提上去；只推代码不发新版不会触发更新。升级后在 设置 → 第三方插件 里能看到新的版本号。
 
 > BRAT 只能直接安装公开仓库；仓库需保持 public，Release 资产由 tag 触发自动构建上传。
 
