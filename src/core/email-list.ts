@@ -35,7 +35,7 @@ export interface EmailListResult {
 }
 
 export function isPendingStatus(status: EmailStatus): boolean {
-	return status === "Generated" || status === "Revision";
+	return status === "Generated";
 }
 
 export function normalizeEmail(value: string): string {

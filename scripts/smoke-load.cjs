@@ -47,6 +47,7 @@ const obsidianStub = {
 	requestUrl: async () => ({ status: 200, json: {} }),
 	normalizePath: (path) => path,
 	setIcon: () => undefined,
+	setTooltip: () => undefined,
 	debounce: (fn) => fn,
 	getLinkpath: (link) => link,
 };

@@ -1,5 +1,6 @@
 import type {
 	Contact,
+	ContactChannel,
 	ContactParseResult,
 	ParseWarning,
 } from "./types";
@@ -150,6 +151,25 @@ function cleanText(text: string): string {
 }
 
 /**
+ * 联系人行里的 `#Contact/...` 渠道标签：标签保留原样，内容取同一行去掉
+ * 该标签后的说明（电话、链接或备注）。支持标签在值后面或前面。
+ */
+function extractContactChannels(text: string): ContactChannel[] {
+	const channels: ContactChannel[] = [];
+	const seen = new Set<string>();
+	for (const match of text.matchAll(TAG_RE)) {
+		const tag = match[0] ?? "";
+		if (!/^#Contact\b/i.test(tag)) continue;
+		const content = cleanText(text.replace(tag, " "));
+		const key = `${tag}\u0000${content}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		channels.push({ tag, content });
+	}
+	return channels;
+}
+
+/**
  * Split a contact line into name / parenthesized role / trailing remark.
  *
  * Supported shapes (both full-width and ASCII parentheses, spaces allowed
@@ -244,6 +264,7 @@ export function parseContacts(markdown: string): ContactParseResult {
 				phones: string[];
 				links: string[];
 				notes: string[];
+				channels: ContactChannel[];
 				line: number;
 		  }
 		| null = null;
@@ -269,6 +290,7 @@ export function parseContacts(markdown: string): ContactParseResult {
 			phones: current.phones,
 			links: current.links,
 			notes: current.notes,
+			channels: current.channels,
 			line: current.line,
 		});
 		current = null;
@@ -346,6 +368,7 @@ export function parseContacts(markdown: string): ContactParseResult {
 				phones: tokens.phones,
 				links: tokens.links,
 				notes: contactNotes(split.rest, tokens.tags),
+				channels: extractContactChannels(trimmed),
 				line: i + 1,
 			};
 			plainMode = true;
@@ -373,6 +396,7 @@ export function parseContacts(markdown: string): ContactParseResult {
 					phones: preview.phones,
 					links: preview.links,
 					notes: contactNotes(split.rest, preview.tags),
+					channels: extractContactChannels(body),
 					line: i + 1,
 				};
 				plainMode = false;
@@ -394,6 +418,7 @@ export function parseContacts(markdown: string): ContactParseResult {
 		current.emails.push(...tokens.emails);
 		current.phones.push(...tokens.phones);
 		current.links.push(...tokens.links);
+		current.channels.push(...extractContactChannels(bodyText));
 
 		const roleMatch = bodyText.match(ROLE_LINE_RE);
 		if (roleMatch) {
@@ -415,6 +440,13 @@ export function parseContacts(markdown: string): ContactParseResult {
 		contact.emails = dedupe(contact.emails);
 		contact.phones = dedupe(contact.phones);
 		contact.links = dedupe(contact.links);
+		const seenChannels = new Set<string>();
+		contact.channels = contact.channels.filter((channel) => {
+			const key = `${channel.tag}\u0000${channel.content}`;
+			if (seenChannels.has(key)) return false;
+			seenChannels.add(key);
+			return true;
+		});
 	}
 
 	if (contacts.length === 0) {

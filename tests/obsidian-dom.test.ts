@@ -22,6 +22,22 @@ function sourceFiles(dir: string): string[] {
 
 suite("obsidian DOM helpers");
 
+test("开发状态不再同时设置原生 title 与 Obsidian tooltip", () => {
+	const source = readFileSync(
+		join(OBSIDIAN_SRC, "dev-status-cell.ts"),
+		"utf8",
+	);
+	assert(
+		!/\.title\s*=/.test(source),
+		"不要设置原生 title，否则会和 Obsidian tooltip 同时弹出",
+	);
+	assert(source.includes("setTooltip("), "应使用 Obsidian 的 setTooltip");
+	assert(
+		!/setAttribute\(\s*["']aria-label["']/.test(source),
+		"让 setTooltip 统一管理 aria-label",
+	);
+});
+
 test("addClass / addClasses 的类名参数不含空格", () => {
 	const offenders: string[] = [];
 	for (const file of sourceFiles(OBSIDIAN_SRC)) {

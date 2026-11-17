@@ -24,7 +24,7 @@ export interface EmailDetailHost {
 	getRow(key: string): EmailRow | null;
 	getAIFile(path: string): CustomerAIFile | null;
 	saveEmailEdit(row: EmailRow, subject: string, body: string): Promise<void>;
-	/** 返回是否真的写入了新版本（配置不全、已发送等情况返回 false）。 */
+	/** 返回是否真的写入了新版本（配置不全等情况返回 false）。 */
 	regenerateEmail(
 		row: EmailRow,
 		comment: string,
@@ -32,7 +32,6 @@ export interface EmailDetailHost {
 	): Promise<boolean>;
 	acceptEmail(row: EmailRow): Promise<void>;
 	rejectEmail(row: EmailRow): Promise<void>;
-	markEmailSent(row: EmailRow): Promise<void>;
 	saveRuleFromEmail(row: EmailRow, comment: string): Promise<void>;
 	openFile(path: string): void;
 	refreshEmails(): Promise<void>;
@@ -40,7 +39,6 @@ export interface EmailDetailHost {
 
 const STATUS_LABELS: Record<string, string> = {
 	Generated: "待审核",
-	Revision: "已修改，待审核",
 	Accepted: "已验收",
 	Rejected: "已拒绝",
 };
@@ -258,7 +256,6 @@ export class EmailDetailModal extends Modal {
 		addMeta("中文摘要", record.summaryZh);
 		// 只有一个「更新时间」：首次生成时是创建时间，之后每次改动都会刷新。
 		addMeta("更新时间", emailUpdatedAt(record));
-		addMeta("已发送", record.sent ? `是（${record.sentAt ?? ""}）` : "否");
 
 		const subjectGroup = contentEl.createDiv({ cls: "eo-detail-field" });
 		subjectGroup.createEl("label", { text: "Subject" });
@@ -355,16 +352,6 @@ export class EmailDetailModal extends Modal {
 		);
 
 		addButton(
-			"标记已发送",
-			async () => {
-				await this.host.markEmailSent(this.row);
-				await this.afterAction();
-			},
-			undefined,
-			record.status !== "Accepted" || record.sent,
-		);
-
-		addButton(
 			"拒绝",
 			async () => {
 				await this.host.rejectEmail(this.row);
@@ -426,10 +413,6 @@ export class EmailDetailModal extends Modal {
 		if (this.busy) return;
 		const comment = this.commentValue();
 		const intent = emailEditIntent(comment);
-		if (this.row.record.sent) {
-			new Notice("已发送的邮件不能修改或重新生成");
-			return;
-		}
 		const subject = this.subjectInput?.value.trim() ?? "";
 		const body = this.bodyInput?.value ?? "";
 		if (!subject || !body.trim()) {

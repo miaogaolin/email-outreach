@@ -13,7 +13,7 @@ import { guessLanguage, languageLabel } from "../src/core/language";
 import { extractWikiLinks, parseSingleWikilink, pathToLinkTarget } from "../src/core/wikilinks";
 import { summaryWarnings, looksChinese } from "../src/core/summary";
 import { aiFileName, aiFilePath, fileSettingCandidates, sanitizeFileName } from "../src/core/filenames";
-import { nextFollowUpCount, parseFollowUpCount } from "../src/core/follow-up";
+import { parseFollowUpCount } from "../src/core/follow-up";
 import type { CustomerRecord } from "../src/core/types";
 import { suite, test, assert, assertEqual } from "./harness";
 
@@ -388,12 +388,10 @@ test("accepts missing extension, wikilinks, quotes and Windows separators", () =
 });
 
 suite("follow-up");
-test("跟进次数解析与 +1", () => {
+test("跟进次数解析（只读）", () => {
 	assertEqual(parseFollowUpCount(2), 2, "数字");
 	assertEqual(parseFollowUpCount("3"), 3, "字符串");
 	assertEqual(parseFollowUpCount("  "), 0, "空值");
 	assertEqual(parseFollowUpCount("abc"), 0, "非法值");
 	assertEqual(parseFollowUpCount(-1), 0, "负数");
-	assertEqual(nextFollowUpCount(undefined), 1, "第一次跟进");
-	assertEqual(nextFollowUpCount("2"), 3, "已有次数 +1");
 });

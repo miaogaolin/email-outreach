@@ -67,7 +67,6 @@ suite("email list");
 
 test("isPendingStatus", () => {
 	assert(isPendingStatus("Generated"), "Generated 待审");
-	assert(isPendingStatus("Revision"), "Revision 待审");
 	assert(!isPendingStatus("Accepted"), "Accepted 不是待审");
 	assert(!isPendingStatus("Rejected"), "Rejected 不是待审");
 });
@@ -86,7 +85,7 @@ test("同一客户同一邮箱：只保留最新待审，顺序不变", () => {
 	});
 	const newer = row({
 		id: "2",
-		status: "Revision",
+		status: "Generated",
 		updatedAt: "2026-11-17T09:12:00+08:00",
 	});
 	const other = row({ id: "3", status: "Generated", email: "mary@acme.com" });

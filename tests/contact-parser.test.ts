@@ -257,3 +257,30 @@ test("findContactByEmail matches case-insensitively and falls back to raw", () =
 	assert(byRaw?.raw.includes("Kim Lucas"), "按联系人原文兜底");
 	assertEqual(findContactByEmail(result.contacts, "nobody@x.com"), null, "找不到");
 });
+
+test("解析联系人行上的 #Contact 渠道标签与内容", () => {
+	const result = parseContacts(`## Contact
+- Ron Downing 采购
+	- ron@example.com
+	- +19185514828 #Contact/WA
+	- https://www.linkedin.com/in/ron-downing/ #Contact/LinkedIn
+- Ana Lopez
+	- #Contact/WA ：+52 55 1234 5678
+	- +12345678 #Contact/WA #VIP
+`);
+	assertEqual(result.contacts.length, 2, "两个联系人");
+	const ron = result.contacts[0]!;
+	assertEqual(ron.channels.length, 2, "Ron 两个渠道");
+	assertEqual(ron.channels[0]!.tag, "#Contact/WA", "WA 标签");
+	assertEqual(ron.channels[0]!.content, "+19185514828", "WA 号码");
+	assertEqual(ron.channels[1]!.tag, "#Contact/LinkedIn", "LinkedIn 标签");
+	assert(
+		ron.channels[1]!.content.includes("linkedin.com/in/ron-downing"),
+		"LinkedIn 链接",
+	);
+	const ana = result.contacts[1]!;
+	assertEqual(ana.channels.length, 2, "标签在前也识别，且忽略非 Contact 标签");
+	assertEqual(ana.channels[0]!.tag, "#Contact/WA", "Ana WA 标签");
+	assertEqual(ana.channels[0]!.content, "+52 55 1234 5678", "Ana WA 号码");
+	assertEqual(ana.channels[1]!.content, "+12345678 #VIP", "保留同行其他说明");
+});

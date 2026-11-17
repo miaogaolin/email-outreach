@@ -1,11 +1,18 @@
-export type EmailStatus = "Generated" | "Revision" | "Accepted" | "Rejected";
+export type EmailStatus = "Generated" | "Accepted" | "Rejected";
 
 export const EMAIL_STATUSES: EmailStatus[] = [
 	"Generated",
-	"Revision",
 	"Accepted",
 	"Rejected",
 ];
+
+/** 联系人行上以 `#Contact` 开头的标签及其后的说明（如 WA 号码 / LinkedIn 链接）。 */
+export interface ContactChannel {
+	/** 原样保留的标签，例如 `#Contact/WA`。 */
+	tag: string;
+	/** 同一行去掉该标签后的说明，例如 `+1 724-967-7306`。 */
+	content: string;
+}
 
 export interface Contact {
 	/** Stable id inside one customer: C1, C2, ... */
@@ -20,6 +27,8 @@ export interface Contact {
 	phones: string[];
 	links: string[];
 	notes: string[];
+	/** `#Contact/...` 渠道标签与对应内容，用于验收提醒。 */
+	channels: ContactChannel[];
 	/** 1-based line number of the contact line in the customer file. */
 	line: number;
 }
@@ -147,7 +156,9 @@ export interface EmailRecord {
 	status: EmailStatus;
 	generatedAt: string;
 	updatedAt: string;
+	/** 旧版本「标记已发送」遗留的只读字段；新流程不再写入。 */
 	sent: boolean;
+	/** 旧版本「标记已发送」遗留的只读字段；新流程不再写入。 */
 	sentAt: string | null;
 	subject: string;
 	body: string;

@@ -144,7 +144,7 @@ test("多封取最大时间并忽略已拒绝", () => {
 		[
 			email("1", "Generated", "2026-11-10 09:00"),
 			email("2", "Accepted", "2026-11-12 09:00"),
-			email("3", "Revision", "2026-11-15 09:00"),
+			email("3", "Generated", "2026-11-15 09:00"),
 			email("4", "Rejected", "2026-11-16 09:00"),
 		],
 		true,
@@ -155,7 +155,7 @@ test("多封取最大时间并忽略已拒绝", () => {
 	assertEqual(info.totalEmailCount, 4, "总邮件数");
 	assertEqual(info.pendingCount, 2, "待审计数");
 	assertEqual(info.allRejected, false, "不是全部拒绝");
-	assertEqual(info.lastStatus, "Revision", "最近一封的状态");
+	assertEqual(info.lastStatus, "Generated", "最近一封的状态");
 });
 
 test("全部已拒绝：state 仍为 known、时间为空", () => {
@@ -176,11 +176,11 @@ test("AI 文件存在但解析不出邮件 → unknown", () => {
 	assertEqual(summarizeGeneration([], false).state, "never", "没有文件 → never");
 });
 
-test("pendingCount 只数 Generated / Revision", () => {
+test("pendingCount 只数 Generated", () => {
 	const info = summarizeGeneration(
 		[
 			email("1", "Generated"),
-			email("2", "Revision"),
+			email("2", "Generated"),
 			email("3", "Accepted"),
 			email("4", "Rejected"),
 		],

@@ -9,6 +9,7 @@ import "./dev-state.test";
 import "./email-list.test";
 import "./core.test";
 import "./email-regenerate.test";
+import "./reminder.test";
 import "./obsidian-dom.test";
 import "./models.test";
 import { runAll } from "./harness";

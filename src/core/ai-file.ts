@@ -23,6 +23,17 @@ export interface ParsedAIFile {
 
 const EMAIL_HEADING_RE =
 	/^###\s+邮件\s+([0-9A-Za-z_-]+)\s*·\s*(.*)\s*·\s*(Generated|Revision|Accepted|Rejected)\s*$/;
+
+/**
+ * 状态归一化：旧文件里的「已修改，待审核」(Revision) 已合并到待审核
+ * (Generated)。标题正则仍接受 Revision，避免旧文件解析失败。
+ */
+export function parseEmailStatus(value: string): EmailStatus | null {
+	if (value === "Revision") return "Generated";
+	return (EMAIL_STATUSES as string[]).includes(value)
+		? (value as EmailStatus)
+		: null;
+}
 const VERSION_HEADING_RE = /^#####\s+v(\d+)\s*·\s*(.*)$/;
 const META_RE = /^-\s+([A-Za-z_][\w]*)\s*:\s?(.*)$/;
 const SECTION_RE = /^####\s+(Subject|Body|修改历史)\s*$/;
@@ -347,7 +358,8 @@ function parseEmailBlock(
 	}
 	const id = headingMatch[1] ?? "001";
 	const headingContact = (headingMatch[2] ?? "").trim();
-	const headingStatus = headingMatch[3] as EmailStatus;
+	const headingStatus: EmailStatus =
+		parseEmailStatus(headingMatch[3] ?? "") ?? "Generated";
 
 	const meta: Record<string, string> = {};
 	let index = start + 1;
@@ -420,8 +432,7 @@ function parseEmailBlock(
 		);
 	}
 
-	const statusRaw = (meta["status"] ?? headingStatus) as EmailStatus;
-	const status = EMAIL_STATUSES.includes(statusRaw) ? statusRaw : headingStatus;
+	const status = parseEmailStatus(meta["status"] ?? "") ?? headingStatus;
 	const knownKeys = new Set([
 		"contact",
 		"email",

@@ -495,11 +495,6 @@ a.eo-dev-cell:focus-visible {
 	border-color: var(--text-accent);
 }
 
-.eo-status-revision {
-	color: var(--text-warning);
-	border-color: var(--text-warning);
-}
-
 .eo-status-accepted {
 	color: var(--text-success);
 	border-color: var(--text-success);

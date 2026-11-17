@@ -18,7 +18,6 @@ import { PreviewController } from "./preview-popover";
 const STATUS_LABELS: Record<EmailStatus | "all", string> = {
 	all: "全部状态",
 	Generated: "待审核",
-	Revision: "已修改，待审核",
 	Accepted: "已验收",
 	Rejected: "已拒绝",
 };

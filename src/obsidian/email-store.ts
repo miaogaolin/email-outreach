@@ -97,9 +97,18 @@ export class EmailStore {
 		return parsed.file;
 	}
 
-	async saveRecord(path: string, record: EmailRecord): Promise<void> {
+	/**
+	 * 保存邮件记录。可选的 transform 在同一份内容上追加/删除验收提醒，
+	 * 保证「状态 + 提醒」一次写盘。
+	 */
+	async saveRecord(
+		path: string,
+		record: EmailRecord,
+		transform?: (content: string) => string,
+	): Promise<void> {
 		const content = await this.adapter.read(path);
-		const updated = updateEmailInContent(content, record);
+		let updated = updateEmailInContent(content, record);
+		if (transform) updated = transform(updated);
 		await this.adapter.write(path, updated);
 		await this.refresh();
 	}

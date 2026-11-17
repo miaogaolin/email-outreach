@@ -1,3 +1,4 @@
+import { setTooltip } from "obsidian";
 import { describeDevState } from "../core/dev-state";
 import type { CustomerGeneration } from "../core/generation";
 import type { OutreachPluginApi } from "./plugin-api";
@@ -60,8 +61,17 @@ export function renderDevStatusCell(
 	const hint = clickable
 		? `点击查看该客户的开发邮件（待审 ${pending} 封 / 共 ${total} 封）`
 		: "还没有开发邮件";
-	cell.title = [view.title, hint].filter(Boolean).join("\n");
-	cell.setAttribute("aria-label", `${row.name} 开发状态：${view.text}；${hint}`);
+	// 只用 Obsidian 的 tooltip：再设原生 title 会同时弹出两个内容相同的提示。
+	setTooltip(
+		cell,
+		[
+			`${row.name} 开发状态：${view.text}`,
+			view.title,
+			hint,
+		]
+			.filter(Boolean)
+			.join("\n"),
+	);
 
 	if (clickable) {
 		cell.addEventListener("click", (event) => {

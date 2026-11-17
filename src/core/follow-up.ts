@@ -9,8 +9,3 @@ export function parseFollowUpCount(value: unknown): number {
 	if (!Number.isFinite(parsed) || parsed < 0) return 0;
 	return Math.floor(parsed);
 }
-
-/** 「标记已发送」时把跟进次数 +1。 */
-export function nextFollowUpCount(current: unknown): number {
-	return parseFollowUpCount(current) + 1;
-}

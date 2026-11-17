@@ -96,6 +96,7 @@ test("提示词只使用输出目录里已落盘的版本", () => {
 	const parsed = parseCustomerAIFile(aiFileContent());
 	const record = parsed.file.emails[0]!;
 	assertEqual(currentEmailVersion(record), 2, "当前版本号取最后一版");
+	assertEqual(record.status, "Generated", "旧 Revision 归一化为待审核");
 
 	// 弹窗里没保存的编辑：绝对不能进入提示词。
 	const unsavedSubject = "UNSAVED SUBJECT";
@@ -194,6 +195,7 @@ test("重新生成时提示词聚焦原联系人", () => {
 				phones: [],
 				links: [],
 				notes: [],
+				channels: [],
 				line: 1,
 			},
 		],

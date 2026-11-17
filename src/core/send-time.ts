@@ -72,7 +72,7 @@ export interface SendHistory {
 	followUpCount: number;
 	/** 客户 frontmatter 的「最近联系时间」。 */
 	lastContact: string | null;
-	/** 已发送邮件的 sent_at / updated_at / generated_at。 */
+	/** 旧版本「标记已发送」留下的 sent_at / updated_at / generated_at（只读）。 */
 	sentDates: string[];
 }
 

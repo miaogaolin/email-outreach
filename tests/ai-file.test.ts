@@ -7,8 +7,10 @@ import {
 	formatEmailTime,
 	nextEmailId,
 	parseCustomerAIFile,
+	parseEmailStatus,
 	renderCustomerAIFile,
 } from "../src/core/ai-file";
+import { EMAIL_STATUSES } from "../src/core/types";
 import { suite, test, assert, assertEqual } from "./harness";
 
 function record(overrides: Partial<Parameters<typeof createEmailRecord>[0]> = {}) {
@@ -48,6 +50,24 @@ test("append + parse keeps every field", () => {
 	assertEqual(email.updatedAt, first.updatedAt, "更新时间落盘后不变");
 });
 
+test("旧 Revision 状态解析为待审核，并在渲染时归一化", () => {
+	assert(!(EMAIL_STATUSES as string[]).includes("Revision"), "Revision 已从状态枚举移除");
+	assertEqual(parseEmailStatus("Revision"), "Generated", "Revision → Generated");
+	assertEqual(parseEmailStatus("Accepted"), "Accepted", "合法状态保留");
+	assertEqual(parseEmailStatus("Nope"), null, "非法状态返回 null");
+
+	const legacy = appendEmailToContent(null, "G", record())
+		.replace("· Generated", "· Revision")
+		.replace("- status: Generated", "- status: Revision")
+		.replace("last_status: Generated", "last_status: Revision");
+	const parsed = parseCustomerAIFile(legacy);
+	assertEqual(parsed.file.emails[0]!.status, "Generated", "解析归一化");
+	const rendered = renderCustomerAIFile(parsed.file);
+	assert(rendered.includes("· Generated"), "标题写回待审核");
+	assert(rendered.includes("- status: Generated"), "元数据写回待审核");
+	assert(!rendered.includes("· Revision"), "不再输出 Revision");
+});
+
 test("更新时间：首次是创建时间，之后取最新一次改动", () => {
 	const base = record();
 	assertEqual(emailUpdatedAt(base), base.updatedAt, "新建邮件用创建时间");
@@ -57,7 +77,7 @@ test("更新时间：首次是创建时间，之后取最新一次改动", () =>
 		body: "Revised body",
 		action: "Edited",
 		comment: "",
-		status: "Revision",
+		status: "Generated",
 		now: new Date("2026-11-12T09:30:00+08:00"),
 	});
 	assert(
@@ -192,7 +212,7 @@ test("version history survives a save cycle", () => {
 		body: "Revised body",
 		action: "Edited",
 		comment: "主题太泛，改具体一点",
-		status: "Revision",
+		status: "Generated",
 	});
 	content = renderCustomerAIFile({ ...parsed.file, emails: [revised] });
 	parsed = parseCustomerAIFile(content);
@@ -200,7 +220,7 @@ test("version history survives a save cycle", () => {
 	assertEqual(email.versions.length, 2, "两个版本");
 	assertEqual(email.versions[0]!.body, original.body, "第一版原文保留");
 	assertEqual(email.versions[1]!.userComment, "主题太泛，改具体一点", "意见保留");
-	assertEqual(email.status, "Revision", "状态 Revision");
+	assertEqual(email.status, "Generated", "状态归一化为待审核");
 });
 
 test("body containing code fences survives the version history", () => {
@@ -212,7 +232,7 @@ test("body containing code fences survives the version history", () => {
 		body: tricky + "\nmore",
 		action: "Edited",
 		comment: "",
-		status: "Revision",
+		status: "Generated",
 	});
 	content = renderCustomerAIFile({ ...parsed.file, emails: [revised] });
 	const again = parseCustomerAIFile(content).file.emails[0]!;

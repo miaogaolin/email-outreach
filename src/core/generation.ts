@@ -22,7 +22,7 @@ export interface CustomerGeneration {
 	totalEmailCount: number;
 	/** 所有邮件都被拒绝（用于区分「已拒绝」和「时间无法解析」）。 */
 	allRejected: boolean;
-	/** 待审邮件数（Generated + Revision），用于开发状态单元格的「✉」角标。 */
+	/** 待审邮件数（Generated），用于开发状态单元格的「✉」角标。 */
 	pendingCount: number;
 	/** 匹配到的 AI 开发信息文件路径；没有匹配 / 从未生成时为 null。 */
 	filePath: string | null;
@@ -182,7 +182,7 @@ export function summarizeGeneration(
 			rejected++;
 			continue;
 		}
-		if (email.status === "Generated" || email.status === "Revision") {
+		if (email.status === "Generated") {
 			pendingCount++;
 		}
 		const raw = emailGeneratedAt(email);

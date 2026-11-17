@@ -33,7 +33,6 @@ import {
 	localStamp,
 	normalizeDir,
 } from "../core/filenames";
-import { nextFollowUpCount } from "../core/follow-up";
 import { guessLanguage, languageLabel } from "../core/language";
 import {
 	buildEmailRevisionPrompt,
@@ -47,11 +46,17 @@ import {
 	type PromptCustomer,
 	type RuleDraft,
 } from "../core/prompt";
+import {
+	buildEmailReminder,
+	removeEmailReminderFromContent,
+	upsertEmailReminderInContent,
+} from "../core/reminder";
 import { summarizeRunStatuses, mergeDevStatuses } from "../core/run-status";
 import { parseJsonLoose, validateAIResult } from "../core/schema";
 import { pruneSelection } from "../core/selection";
 import { planSendTime, sendHistoryFrom } from "../core/send-time";
 import type {
+	ContactChannel,
 	CustomerAIFile,
 	CustomerDevStatus,
 	CustomerRecord,
@@ -768,7 +773,7 @@ export default class EmailOutreachPlugin
 							text: "只为有邮箱且适合的联系人生成，一个客户可能生成多封（最多 5 封）",
 						});
 						list.createEl("li", {
-							text: "发送时间按客户地区时区、跟进次数和已发送记录自动计算",
+							text: "发送时间按客户地区时区、跟进次数和最近联系时间自动计算",
 						});
 						list.createEl("li", {
 							text: "没有可用联系人的客户不会调用 AI，并会在列表里标记",
@@ -942,18 +947,18 @@ export default class EmailOutreachPlugin
 		subject: string,
 		body: string,
 	): Promise<void> {
-		if (row.record.sent) {
-			new Notice("这封邮件已标记为已发送，不能再修改");
-			return;
-		}
 		const updated = addEmailVersion(row.record, {
 			subject,
 			body,
 			action: "Edited",
 			comment: "手动修改",
-			status: "Revision",
+			status: "Generated",
 		});
-		await this.emailStore.saveRecord(row.filePath, updated);
+		await this.emailStore.saveRecord(
+			row.filePath,
+			updated,
+			this.reminderRemoval(row.record.id),
+		);
 		new Notice("已保存为新版本");
 		await this.refreshEmailList();
 	}
@@ -970,10 +975,6 @@ export default class EmailOutreachPlugin
 		): void => {
 			onProgress?.({ step, detail, fraction });
 		};
-		if (row.record.sent) {
-			new Notice("已发送的邮件不能重新生成");
-			return false;
-		}
 		const problems = getConfigProblems(this.settings);
 		if (problems.length > 0) {
 			new Notice(problems.map((problem) => problem.message).join("\n"));
@@ -985,10 +986,6 @@ export default class EmailOutreachPlugin
 		const parsed = parseCustomerAIFile(content);
 		const record = parsed.file.emails.find((item) => item.id === row.record.id);
 		if (!record) throw new Error("AI 文件中找不到这封邮件");
-		if (record.sent) {
-			new Notice("已发送的邮件不能重新生成");
-			return false;
-		}
 		const version = currentEmailVersion(record);
 		report(
 			"准备客户资料",
@@ -1103,7 +1100,7 @@ export default class EmailOutreachPlugin
 			body: draft.body,
 			action: "Revised",
 			comment: comment.trim() || "重新生成",
-			status: "Revision",
+			status: "Generated",
 		});
 		updated = {
 			...updated,
@@ -1117,7 +1114,11 @@ export default class EmailOutreachPlugin
 			timeReason: plan.timeReason,
 		};
 		report("写入输出目录", row.filePath, 0.95);
-		await this.emailStore.saveRecord(row.filePath, updated);
+		await this.emailStore.saveRecord(
+			row.filePath,
+			updated,
+			this.reminderRemoval(record.id),
+		);
 		report("完成", `已写入 v${currentEmailVersion(updated)}`, 1);
 		new Notice("已生成新版本");
 		await this.refreshEmailList();
@@ -1140,6 +1141,21 @@ export default class EmailOutreachPlugin
 				existingLink = String(existing);
 			}
 		}
+
+		const channels = await this.loadContactChannels(customer, row);
+		const reminder = buildEmailReminder({
+			customerName: row.customerName,
+			emailId: row.record.id,
+			aiFilePath: row.filePath,
+			contact: row.record.contact,
+			email: row.record.email,
+			subject: row.record.subject,
+			summaryZh: row.record.summaryZh,
+			suggestedTime: row.record.suggestedTime,
+			timezone: row.record.timezone,
+			channels,
+		});
+
 		const confirmed = await confirm(this.app, {
 			title: "验收通过",
 			confirmText: "确认验收",
@@ -1147,6 +1163,22 @@ export default class EmailOutreachPlugin
 				container.createEl("p", {
 					text: "验收通过代表邮件内容审核通过，不代表已经发送。",
 				});
+				if (reminder) {
+					container.createEl("p", {
+						text: `会在 AI 开发信息文件生成发送提醒（北京时间 ${reminder.time}）。`,
+					});
+					if (channels.length > 0) {
+						container.createEl("p", {
+							cls: "eo-muted",
+							text: `联系人带 ${channels.length} 个 #Contact 渠道，会一起写入提醒。`,
+						});
+					}
+				} else {
+					container.createEl("p", {
+						cls: "eo-muted",
+						text: "这封邮件没有可用的建议发送时间，本次不会生成发送提醒。",
+					});
+				}
 				if (willWriteLink && customer) {
 					container.createEl("p", {
 						text: `会把客户属性「${propertyName}」写为 ${toWikilink(linkPath)}。`,
@@ -1167,23 +1199,48 @@ export default class EmailOutreachPlugin
 			},
 		});
 		if (!confirmed) return;
+
 		const updated = setEmailStatus(row.record, "Accepted");
-		await this.emailStore.saveRecord(row.filePath, updated);
+		let reminderError: string | null = null;
+		const transform = reminder
+			? (content: string): string => {
+					try {
+						return upsertEmailReminderInContent(content, reminder);
+					} catch (error) {
+						reminderError =
+							error instanceof Error ? error.message : String(error);
+						console.error(
+							"[email-outreach] 写入发送提醒失败",
+							error,
+						);
+						return content;
+					}
+				}
+			: this.reminderRemoval(row.record.id);
+		await this.emailStore.saveRecord(row.filePath, updated, transform);
+
+		const messages: string[] = ["已验收"];
 		if (willWriteLink && customer) {
 			try {
 				await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
 					frontmatter[propertyName] = toWikilink(linkPath);
 				});
-				new Notice(`已验收，并写入客户属性「${propertyName}」`);
+				messages.push(`已写入客户属性「${propertyName}」`);
 			} catch (error) {
-				new Notice(
-					`邮件已验收，但写客户属性失败：${error instanceof Error ? error.message : String(error)}`,
-					9000,
+				messages.push(
+					`写客户属性失败：${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
-		} else {
-			new Notice("已验收");
 		}
+		if (!reminder) {
+			messages.push("没有可用的建议发送时间，未生成提醒");
+		} else if (reminderError) {
+			messages.push(`发送提醒生成失败：${reminderError}`);
+		} else {
+			messages.push(`已生成发送提醒（北京时间 ${reminder.time}）`);
+		}
+		new Notice(messages.join("；"), reminderError ? 9000 : undefined);
+
 		this.repo.invalidate();
 		this.refreshWorkbenchViews();
 		await this.refreshEmailList();
@@ -1191,69 +1248,50 @@ export default class EmailOutreachPlugin
 
 	async rejectEmail(row: EmailRow): Promise<void> {
 		const updated = setEmailStatus(row.record, "Rejected");
-		await this.emailStore.saveRecord(row.filePath, updated);
+		await this.emailStore.saveRecord(
+			row.filePath,
+			updated,
+			this.reminderRemoval(row.record.id),
+		);
 		new Notice("已拒绝这封邮件");
 		await this.refreshEmailList();
 	}
 
-	async markEmailSent(row: EmailRow): Promise<void> {
-		if (row.record.status !== "Accepted") {
-			new Notice("只有验收通过的邮件才能标记为已发送");
-			return;
-		}
-		if (row.record.sent) {
-			new Notice("这封邮件已经标记为已发送");
-			return;
-		}
-		const aiFile = await this.reloadAIFile(row.filePath);
-		const link = aiFile?.customerLink ?? row.customerLink;
-		const customer = await this.resolveCustomer(row.filePath, link);
-		if (!customer) {
-			new Notice("客户文件链接失效，无法更新跟进次数和最近联系时间");
-			return;
-		}
-		const today = localStamp().date;
-		const oldFollow = customer.fm["跟进次数"];
-		const nextFollow = nextFollowUpCount(oldFollow);
-		const oldLastContact = customer.fm["最近联系时间"];
-		const confirmed = await confirm(this.app, {
-			title: "标记为已发送",
-			confirmText: "确认已发送",
-			build: (container) => {
-				container.createEl("p", {
-					text: `邮件：${row.record.subject}`,
-				});
-				const list = container.createEl("ul");
-				list.createEl("li", {
-					text: `跟进次数：${oldFollow === undefined ? "（空）" : String(oldFollow)} → ${nextFollow}`,
-				});
-				list.createEl("li", {
-					text: `最近联系时间：${oldLastContact === undefined || String(oldLastContact).trim() === "" ? "（空）" : String(oldLastContact)} → ${today}`,
-				});
-				container.createEl("p", {
-					cls: "eo-muted",
-					text: "这是唯一会修改跟进次数与最近联系时间的操作。",
-				});
-			},
-		});
-		if (!confirmed) return;
-		const sentAt = isoNow();
-		const updated = { ...row.record, sent: true, sentAt, updatedAt: sentAt };
-		await this.emailStore.saveRecord(row.filePath, updated);
+	/** 读取邮件对应当前联系人的 `#Contact/...` 渠道；失败时只返回空数组。 */
+	private async loadContactChannels(
+		customer: CustomerRecord | null,
+		row: EmailRow,
+	): Promise<ContactChannel[]> {
+		if (!customer) return [];
 		try {
-			await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
-				frontmatter["跟进次数"] = nextFollow;
-				frontmatter["最近联系时间"] = today;
-			});
-		} catch (error) {
-			new Notice(
-				`邮件已标记发送，但更新客户属性失败：${error instanceof Error ? error.message : String(error)}`,
-				9000,
+			const payload = await this.repo.load(
+				customer,
+				Math.max(500, this.settings.truncateBodyChars),
 			);
+			const contact = findContactByEmail(
+				payload.contacts.contacts,
+				row.record.email,
+				row.record.contact,
+			);
+			return contact?.channels ?? [];
+		} catch (error) {
+			console.error("[email-outreach] 读取联系人渠道失败", error);
+			return [];
 		}
-		this.repo.invalidate();
-		this.refreshWorkbenchViews();
-		await this.refreshEmailList();
+	}
+
+	/** 删除某封邮件在 AI 文件里的旧提醒；失败不阻塞保存。 */
+	private reminderRemoval(
+		emailId: string,
+	): (content: string) => string {
+		return (content) => {
+			try {
+				return removeEmailReminderFromContent(content, emailId);
+			} catch (error) {
+				console.error("[email-outreach] 删除发送提醒失败", error);
+				return content;
+			}
+		};
 	}
 
 	async saveRuleFromEmail(row: EmailRow, comment: string): Promise<void> {
