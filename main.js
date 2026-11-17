@@ -1012,6 +1012,48 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         new obsidian_1.Notice("已拒绝这封邮件");
         await this.refreshEmailList();
     }
+    /**
+     * 批量永久删除开发邮件：按文件分组，一次写盘删掉邮件块并清理提醒。
+     * 单个文件失败不影响其他文件；生成任务运行中直接拒绝。
+     */
+    async deleteEmails(rows) {
+        var _a;
+        if (this.isRunning()) {
+            new obsidian_1.Notice("生成任务正在运行，完成后再删除邮件。");
+            return;
+        }
+        if (rows.length === 0)
+            return;
+        const byFile = new Map();
+        for (const row of rows) {
+            const ids = (_a = byFile.get(row.filePath)) !== null && _a !== void 0 ? _a : [];
+            if (!ids.includes(row.record.id))
+                ids.push(row.record.id);
+            byFile.set(row.filePath, ids);
+        }
+        let removed = 0;
+        let missing = 0;
+        const failures = [];
+        for (const [path, ids] of byFile) {
+            try {
+                const result = await this.emailStore.removeRecords(path, ids);
+                removed += result.removed.length;
+                missing += result.missing.length;
+            }
+            catch (error) {
+                failures.push(`${path}：${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        await this.refreshEmailList();
+        this.refreshWorkbenchViews();
+        const parts = [`已删除 ${removed} 封邮件`];
+        if (missing > 0)
+            parts.push(`${missing} 封在文件里已不存在`);
+        if (failures.length > 0) {
+            parts.push(`${failures.length} 个文件删除失败：${failures.join("；")}`);
+        }
+        new obsidian_1.Notice(parts.join("；"), failures.length > 0 ? 9000 : undefined);
+    }
     /** 读取邮件对应当前联系人的 `#Contact/...` 渠道；失败时只返回空数组。 */
     async loadContactChannels(customer, row) {
         var _a;
@@ -1236,6 +1278,7 @@ exports.emailUpdatedAt = emailUpdatedAt;
 exports.formatEmailTime = formatEmailTime;
 exports.appendEmailsToContent = appendEmailsToContent;
 exports.appendEmailToContent = appendEmailToContent;
+exports.removeEmailsFromContent = removeEmailsFromContent;
 exports.updateEmailInContent = updateEmailInContent;
 exports.updateAnalysisInContent = updateAnalysisInContent;
 exports.versionSnapshotText = versionSnapshotText;
@@ -2029,6 +2072,53 @@ function appendEmailsToContent(content, customerLink, records) {
 }
 function appendEmailToContent(content, customerLink, record) {
     return appendEmailsToContent(content, customerLink, [record]);
+}
+/**
+ * 永久删除 AI 开发信息文件里的邮件块。
+ *
+ * - 只动 `## 邮件` 区段；frontmatter、AI 分析、trailing（发送提醒 / 用户备注）原样保留；
+ * - `email_count` / `last_status` / `updated` 按剩余邮件重新计算；
+ * - 删除后不重排剩余 ID，避免 `## 发送提醒` 的 `<!-- eo-reminder: ID -->` 失效；
+ * - 一个都没命中时原样返回 content，调用方可以据此跳过写盘。
+ */
+function removeEmailsFromContent(content, ids) {
+    var _a, _b;
+    const wanted = [];
+    const wantedSet = new Set();
+    for (const raw of ids) {
+        const id = (raw !== null && raw !== void 0 ? raw : "").trim();
+        if (!id || wantedSet.has(id))
+            continue;
+        wantedSet.add(id);
+        wanted.push(id);
+    }
+    if (wantedSet.size === 0) {
+        return { content, removed: [], missing: [] };
+    }
+    const parsed = parseCustomerAIFile(content);
+    const removed = [];
+    const removedSet = new Set();
+    const remaining = [];
+    for (const email of parsed.file.emails) {
+        if (wantedSet.has(email.id)) {
+            // 同一 ID 理论上只有一个块；文件被手改出重复 ID 时也一并删掉，
+            // 但 removed 只记一次，避免调用方把一封邮件算成多封。
+            if (!removedSet.has(email.id))
+                removed.push(email.id);
+            removedSet.add(email.id);
+            continue;
+        }
+        remaining.push(email);
+    }
+    const missing = wanted.filter((id) => !removedSet.has(id));
+    if (removed.length === 0) {
+        return { content, removed, missing };
+    }
+    parsed.file.emails = remaining;
+    parsed.file.emailCount = remaining.length;
+    parsed.file.lastStatus = (_b = (_a = remaining[remaining.length - 1]) === null || _a === void 0 ? void 0 : _a.status) !== null && _b !== void 0 ? _b : "";
+    parsed.file.updated = (0, filenames_1.isoNow)();
+    return { content: renderCustomerAIFile(parsed.file), removed, missing };
 }
 function updateEmailInContent(content, record) {
     const parsed = parseCustomerAIFile(content);
@@ -6943,8 +7033,10 @@ const obsidian_1 = require("obsidian");
 const ai_file_1 = require("src/core/ai-file.ts");
 const email_list_1 = require("src/core/email-list.ts");
 const run_status_1 = require("src/core/run-status.ts");
+const selection_1 = require("src/core/selection.ts");
 const send_time_1 = require("src/core/send-time.ts");
 const types_1 = require("src/core/types.ts");
+const confirm_1 = require("src/obsidian/modals/confirm.ts");
 const preview_popover_1 = require("src/obsidian/preview-popover.ts");
 const STATUS_LABELS = {
     all: "全部状态",
@@ -6961,6 +7053,13 @@ class EmailListView extends obsidian_1.ItemView {
         this.customerFilter = null;
         this.showDuplicatePending = false;
         this.preview = new preview_popover_1.PreviewController();
+        // 批量删除：选中键只对当前可见行有意义，筛选变化后自动裁剪。
+        this.selected = new Set();
+        this.busy = false;
+        this.deleteButton = null;
+        this.selectAllInput = null;
+        this.visibleKeys = [];
+        this.rowElements = new Map();
         // 局部重绘用：搜索/状态变化只换计数与表格，输入框不丢焦点。
         this.tableContainer = null;
         this.countEl = null;
@@ -7037,6 +7136,15 @@ class EmailListView extends obsidian_1.ItemView {
         this.dedupeLabelEl = dedupeWrap.createSpan({ text: "显示重复待审" });
         this.dedupeWrap = dedupeWrap;
         dedupeWrap.style.display = "none";
+        this.deleteButton = actions.createEl("button", {
+            text: "删除选中",
+            cls: "mod-warning eo-delete-emails",
+        });
+        this.deleteButton.disabled = true;
+        this.deleteButton.setAttr("title", "永久删除勾选的邮件（含修改历史和发送提醒）");
+        this.deleteButton.addEventListener("click", () => {
+            void this.deleteSelected();
+        });
         actions
             .createEl("button", { text: "刷新" })
             .addEventListener("click", () => void this.refresh());
@@ -7084,6 +7192,8 @@ class EmailListView extends obsidian_1.ItemView {
         if (!target)
             return;
         target.empty();
+        this.rowElements = new Map();
+        this.selectAllInput = null;
         const result = (0, email_list_1.filterEmailRows)(this.plugin.emailStore.getRows(), {
             status: this.statusFilter,
             search: this.search,
@@ -7091,6 +7201,9 @@ class EmailListView extends obsidian_1.ItemView {
             showDuplicatePending: this.showDuplicatePending,
         });
         const rows = result.visible;
+        this.visibleKeys = rows.map((row) => row.key);
+        // 筛选/刷新后只保留仍然可见的勾选，避免删除看不见的邮件。
+        this.selected = (0, selection_1.pruneSelection)(this.selected, this.visibleKeys);
         const countParts = [`共 ${rows.length} 封邮件`];
         if (this.customerFilter)
             countParts.push(`客户：${this.customerFilter.name}`);
@@ -7109,10 +7222,27 @@ class EmailListView extends obsidian_1.ItemView {
         }
         if (rows.length === 0) {
             this.renderEmptyState(target, result.hiddenDuplicateCount);
+            this.syncSelectionUi();
             return;
         }
         const table = target.createEl("table", { cls: "eo-table eo-email-table" });
         const head = table.createEl("thead").createEl("tr");
+        const selectTh = head.createEl("th", { cls: "eo-col-select" });
+        this.selectAllInput = selectTh.createEl("input", {
+            type: "checkbox",
+            attr: { "aria-label": "全选当前邮件" },
+        });
+        this.selectAllInput.addEventListener("change", () => {
+            var _a;
+            if ((_a = this.selectAllInput) === null || _a === void 0 ? void 0 : _a.checked) {
+                for (const key of this.visibleKeys)
+                    this.selected.add(key);
+            }
+            else {
+                this.selected.clear();
+            }
+            this.syncSelectionUi();
+        });
         for (const label of [
             "客户",
             "联系人",
@@ -7131,6 +7261,26 @@ class EmailListView extends obsidian_1.ItemView {
             tr.addEventListener("click", () => {
                 this.plugin.openEmailDetail(row.key);
             });
+            if (this.selected.has(row.key))
+                tr.addClass("is-selected");
+            const selectCell = tr.createEl("td", { cls: "eo-col-select" });
+            selectCell.addEventListener("click", (event) => event.stopPropagation());
+            const checkbox = selectCell.createEl("input", {
+                type: "checkbox",
+                attr: {
+                    "aria-label": `选择 ${row.customerName} 的邮件 ${row.record.id}`,
+                },
+            });
+            checkbox.checked = this.selected.has(row.key);
+            checkbox.addEventListener("click", (event) => event.stopPropagation());
+            checkbox.addEventListener("change", () => {
+                if (checkbox.checked)
+                    this.selected.add(row.key);
+                else
+                    this.selected.delete(row.key);
+                this.syncSelectionUi();
+            });
+            this.rowElements.set(row.key, { tr, checkbox });
             const customerCell = tr.createEl("td");
             if (row.customerLink) {
                 const link = customerCell.createEl("a", {
@@ -7193,6 +7343,91 @@ class EmailListView extends obsidian_1.ItemView {
             if (updatedAt)
                 updatedCell.setAttr("title", updatedAt);
             tr.createEl("td", { text: String(row.record.versions.length) });
+        }
+        this.syncSelectionUi();
+    }
+    /** 同步全选框、行选中样式与删除按钮；勾选时只更新界面，不整表重绘。 */
+    syncSelectionUi() {
+        const summary = (0, selection_1.selectionSummary)(this.visibleKeys, this.selected);
+        if (this.selectAllInput) {
+            this.selectAllInput.checked = summary.checked;
+            this.selectAllInput.indeterminate = summary.indeterminate;
+        }
+        for (const [key, element] of this.rowElements) {
+            const checked = this.selected.has(key);
+            if (element.checkbox.checked !== checked) {
+                element.checkbox.checked = checked;
+            }
+            element.tr.classList.toggle("is-selected", checked);
+        }
+        if (!this.deleteButton)
+            return;
+        const count = this.selected.size;
+        this.deleteButton.disabled = this.busy || count === 0;
+        this.deleteButton.setText(count > 0 ? `删除选中（${count}）` : "删除选中");
+    }
+    async deleteSelected() {
+        if (this.busy)
+            return;
+        if (this.plugin.isRunning()) {
+            new obsidian_1.Notice("生成任务正在运行，完成后再删除邮件。");
+            return;
+        }
+        const rows = this.plugin.emailStore
+            .getRows()
+            .filter((row) => this.selected.has(row.key));
+        if (rows.length === 0) {
+            this.syncSelectionUi();
+            return;
+        }
+        const fileCount = new Set(rows.map((row) => row.filePath)).size;
+        const acceptedCount = rows.filter((row) => row.record.status === "Accepted").length;
+        this.busy = true;
+        this.syncSelectionUi();
+        try {
+            const confirmed = await (0, confirm_1.confirm)(this.app, {
+                title: "删除开发邮件",
+                confirmText: "永久删除",
+                cancelText: "取消",
+                danger: true,
+                build: (container) => {
+                    container.createEl("p", {
+                        text: `将从 ${fileCount} 个 AI 开发信息文件中永久删除 ${rows.length} 封邮件。`,
+                    });
+                    container.createEl("p", {
+                        text: "每封邮件的修改历史和对应的发送提醒会一起删除，列表里的这些行也会消失。此操作不能撤销，只能从 Git 历史或备份恢复。",
+                    });
+                    if (acceptedCount > 0) {
+                        container.createEl("p", {
+                            cls: "eo-warning-box",
+                            text: `其中 ${acceptedCount} 封已验收，发送提醒会被一并移除。`,
+                        });
+                    }
+                    const list = container.createEl("ul");
+                    for (const row of rows.slice(0, 5)) {
+                        list.createEl("li", {
+                            text: `${row.customerName} · 邮件 ${row.record.id} · ${row.record.contact || row.record.email || "（无联系人）"}`,
+                        });
+                    }
+                    if (rows.length > 5) {
+                        container.createEl("p", {
+                            cls: "eo-muted",
+                            text: `等 ${rows.length} 封`,
+                        });
+                    }
+                },
+            });
+            if (!confirmed)
+                return;
+            await this.plugin.deleteEmails(rows);
+        }
+        catch (error) {
+            new obsidian_1.Notice(error instanceof Error ? error.message : String(error));
+            await this.refresh();
+        }
+        finally {
+            this.busy = false;
+            this.syncSelectionUi();
         }
     }
     renderEmptyState(target, hiddenCount) {
@@ -7264,6 +7499,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.EmailStore = void 0;
 const ai_file_1 = require("src/core/ai-file.ts");
 const filenames_1 = require("src/core/filenames.ts");
+const reminder_1 = require("src/core/reminder.ts");
 class EmailStore {
     constructor(app, getDir, adapter) {
         this.app = app;
@@ -7358,6 +7594,23 @@ class EmailStore {
         const updated = (0, ai_file_1.appendEmailToContent)(content, customerLink, record);
         await this.adapter.write(path, updated);
         await this.refresh();
+    }
+    /**
+     * 永久删除 AI 文件里的邮件块，并在同一次写盘里移除对应发送提醒。
+     * 一个都没命中时不重写文件；找不到的 ID 通过 missing 返回。
+     */
+    async removeRecords(path, ids) {
+        const content = await this.adapter.read(path);
+        const result = (0, ai_file_1.removeEmailsFromContent)(content, ids);
+        if (result.removed.length === 0)
+            return result;
+        let updated = result.content;
+        for (const id of result.removed) {
+            updated = (0, reminder_1.removeEmailReminderFromContent)(updated, id);
+        }
+        await this.adapter.write(path, updated);
+        await this.refresh();
+        return result;
     }
     rowsForCustomer(customerPath) {
         var _a, _b;
