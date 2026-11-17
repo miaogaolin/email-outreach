@@ -139,6 +139,8 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         catch (error) {
             console.error("[email-outreach] 初始加载邮件失败", error);
         }
+        // 修复历史空文件留下的「上次已生成」：启动时按当前文件状态清一次。
+        await this.clearStaleGeneratedStatuses();
     }
     initializeServices() {
         this.adapter = new vault_adapter_1.VaultAdapter(this.app);
@@ -432,6 +434,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             path,
             customerLink: file.customerLink,
             emails: file.emails,
+            declaredEmailCount: file.declaredEmailCount,
         })), customers.map((record) => (0, generation_1.customerGenerationInput)(record, this.settings.linkPropertyName)));
     }
     getGenerationIndex(records) {
@@ -1045,6 +1048,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             }
         }
         await this.refreshEmailList();
+        await this.clearStaleGeneratedStatuses(byFile.keys());
         this.refreshWorkbenchViews();
         const parts = [`已删除 ${removed} 封邮件`];
         if (missing > 0)
@@ -1053,6 +1057,40 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             parts.push(`${failures.length} 个文件删除失败：${failures.join("；")}`);
         }
         new obsidian_1.Notice(parts.join("；"), failures.length > 0 ? 9000 : undefined);
+    }
+    /**
+     * 邮件删空后，「上次已生成」不再成立：清掉该客户的 generated 记录，
+     * 让开发状态回到「从未」，也避免生成冷却继续用旧记录兜底。
+     * 只处理 `email_count: 0` 的显式空文件；unknown（可能损坏）保留提醒。
+     */
+    async clearStaleGeneratedStatuses(aiFilePaths) {
+        var _a;
+        try {
+            const report = this.getGenerationReport(this.repo.list());
+            const touched = aiFilePaths ? new Set(aiFilePaths) : null;
+            const cleared = [];
+            for (const [customerPath, info] of report.byCustomer) {
+                if (info.totalEmailCount > 0)
+                    continue;
+                // state === "never" + filePath 表示文件存在且声明了 0 封邮件。
+                if (info.state !== "never" || !info.filePath)
+                    continue;
+                if (touched && !touched.has(info.filePath))
+                    continue;
+                if (((_a = this.devStatus[customerPath]) === null || _a === void 0 ? void 0 : _a.kind) !== "generated")
+                    continue;
+                cleared.push(customerPath);
+            }
+            if (cleared.length === 0)
+                return;
+            for (const customerPath of cleared) {
+                delete this.devStatus[customerPath];
+            }
+            await this.state.saveCustomerStatuses(this.devStatus);
+        }
+        catch (error) {
+            console.error("[email-outreach] 清理旧的生成状态失败", error);
+        }
     }
     /** 读取邮件对应当前联系人的 `#Contact/...` 渠道；失败时只返回空数组。 */
     async loadContactChannels(customer, row) {
@@ -1301,11 +1339,19 @@ const VERSION_HEADING_RE = /^#####\s+v(\d+)\s*·\s*(.*)$/;
 const META_RE = /^-\s+([A-Za-z_][\w]*)\s*:\s?(.*)$/;
 const SECTION_RE = /^####\s+(Subject|Body|修改历史)\s*$/;
 const H2_RE = /^##\s+/;
+/** frontmatter 声明的 email_count；缺失或非法时返回 null，交给解析结果判断。 */
+function parseDeclaredEmailCount(value) {
+    if (value === undefined)
+        return null;
+    const parsed = Number(value.trim());
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
 function emptyCustomerAIFile(customerLink) {
     return {
         customerLink,
         updated: (0, filenames_1.isoNow)(),
         emailCount: 0,
+        declaredEmailCount: 0,
         lastStatus: "",
         analysis: null,
         analysisHistory: [],
@@ -1722,6 +1768,7 @@ function parseCustomerAIFile(content) {
     const warnings = [];
     const { frontmatter, bodyStart } = parseFrontmatter(lines, warnings);
     const customerLink = (_a = (0, wikilinks_1.parseSingleWikilink)(frontmatter["customer"])) !== null && _a !== void 0 ? _a : "";
+    const declaredEmailCount = parseDeclaredEmailCount(frontmatter["email_count"]);
     const extraFrontmatter = {};
     const knownFrontmatter = new Set([
         "type",
@@ -1781,6 +1828,7 @@ function parseCustomerAIFile(content) {
             customerLink,
             updated: (_g = frontmatter["updated"]) !== null && _g !== void 0 ? _g : "",
             emailCount: emails.length,
+            declaredEmailCount,
             lastStatus,
             analysis,
             analysisHistory: history,
@@ -2067,6 +2115,7 @@ function appendEmailsToContent(content, customerLink, records) {
         file.lastStatus = withId.status;
     }
     file.emailCount = file.emails.length;
+    file.declaredEmailCount = file.emails.length;
     file.updated = (0, filenames_1.isoNow)();
     return renderCustomerAIFile(file);
 }
@@ -2116,6 +2165,7 @@ function removeEmailsFromContent(content, ids) {
     }
     parsed.file.emails = remaining;
     parsed.file.emailCount = remaining.length;
+    parsed.file.declaredEmailCount = remaining.length;
     parsed.file.lastStatus = (_b = (_a = remaining[remaining.length - 1]) === null || _a === void 0 ? void 0 : _a.status) !== null && _b !== void 0 ? _b : "";
     parsed.file.updated = (0, filenames_1.isoNow)();
     return { content: renderCustomerAIFile(parsed.file), removed, missing };
@@ -2129,6 +2179,7 @@ function updateEmailInContent(content, record) {
     }
     file.emails = file.emails.map((email) => email.id === record.id ? record : email);
     file.emailCount = file.emails.length;
+    file.declaredEmailCount = file.emails.length;
     file.lastStatus = record.status;
     file.updated = (0, filenames_1.isoNow)();
     return renderCustomerAIFile(file);
@@ -2996,12 +3047,14 @@ function describeDevState(info, attempt, now) {
     let detail = null;
     let detailLevel = null;
     const titleLines = [(0, generation_1.generationTooltip)(info)];
+    // `email_count: 0` 的显式空文件不是「文件缺失」，不要吓用户。
+    const explicitlyEmptyFile = (info === null || info === void 0 ? void 0 : info.state) === "never" && Boolean(info.filePath);
     if (attempt) {
         const atMs = (0, generation_1.parseGenerationTime)(attempt.at);
         const attemptLine = atMs === null
             ? `上次尝试：${((_b = attempt.at) !== null && _b !== void 0 ? _b : "").trim() || "时间未知"} · ${attemptLabel(attempt)}`
             : `上次尝试：${(0, generation_1.formatGenerationDate)(atMs)} · ${attemptLabel(attempt)}`;
-        if (!hasGeneration && attempt.kind === "generated") {
+        if (!explicitlyEmptyFile && !hasGeneration && attempt.kind === "generated") {
             // AI 文件被删 / 移走 / 损坏，但记录说生成过：提示，并让冷却继续生效。
             detail = attemptDetail(attempt, "上次已生成但文件缺失", atMs, now);
             detailLevel = "warn";
@@ -3791,7 +3844,7 @@ function formatDateOnly(ms) {
     return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
 }
 // ------------------------------------------------------------------ summary
-function summarizeGeneration(emails, hasAIFile) {
+function summarizeGeneration(emails, hasAIFile, declaredEmailCount = null) {
     const totalEmailCount = emails.length;
     let lastGeneratedAt = null;
     let lastGeneratedMs = null;
@@ -3819,7 +3872,16 @@ function summarizeGeneration(emails, hasAIFile) {
         }
     }
     const allRejected = totalEmailCount > 0 && rejected === totalEmailCount;
-    const state = totalEmailCount > 0 ? "known" : hasAIFile ? "unknown" : "never";
+    // `email_count: 0` 是插件删除全部邮件后写回的显式空文件，不能当成
+    // 「文件存在但解析不出邮件」的 unknown，否则开发状态不会回退。
+    const explicitlyEmpty = totalEmailCount === 0 && hasAIFile && declaredEmailCount === 0;
+    const state = totalEmailCount > 0
+        ? "known"
+        : explicitlyEmpty
+            ? "never"
+            : hasAIFile
+                ? "unknown"
+                : "never";
     return {
         state,
         lastGeneratedAt,
@@ -3843,7 +3905,7 @@ function baseNameOf(key) {
     return (_a = key.split("/").pop()) !== null && _a !== void 0 ? _a : "";
 }
 function buildGenerationIndex(files, customers) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g;
     const byCustomer = new Map();
     const unmatchedFiles = [];
     const byPath = new Map();
@@ -3921,17 +3983,21 @@ function buildGenerationIndex(files, customers) {
     }
     for (const [customerPath, customerFiles] of matched) {
         const emails = customerFiles.flatMap((file) => file.emails);
-        const info = summarizeGeneration(emails, true);
+        // 同一客户的所有 AI 文件都声明 0 封邮件时，才是显式清空；
+        // 只要有一个文件可能损坏，仍按 unknown 处理。
+        const declaredEmpty = customerFiles.length > 0 &&
+            customerFiles.every((file) => file.declaredEmailCount === 0);
+        const info = summarizeGeneration(emails, true, declaredEmpty ? 0 : null);
         let best = null;
         for (const file of customerFiles) {
-            const summary = summarizeGeneration(file.emails, true);
+            const summary = summarizeGeneration(file.emails, true, (_d = file.declaredEmailCount) !== null && _d !== void 0 ? _d : null);
             if (summary.lastGeneratedMs === null)
                 continue;
             if (!best || summary.lastGeneratedMs > best.ms) {
                 best = { path: file.path, ms: summary.lastGeneratedMs };
             }
         }
-        info.filePath = (_f = (_d = best === null || best === void 0 ? void 0 : best.path) !== null && _d !== void 0 ? _d : (_e = customerFiles[0]) === null || _e === void 0 ? void 0 : _e.path) !== null && _f !== void 0 ? _f : null;
+        info.filePath = (_g = (_e = best === null || best === void 0 ? void 0 : best.path) !== null && _e !== void 0 ? _e : (_f = customerFiles[0]) === null || _f === void 0 ? void 0 : _f.path) !== null && _g !== void 0 ? _g : null;
         byCustomer.set(customerPath, info);
     }
     return { byCustomer, unmatchedFiles };
@@ -4049,8 +4115,13 @@ function formatGenerationAge(info, now) {
     return "未知";
 }
 function generationTooltip(info) {
-    if (!info || info.state === "never")
+    if (!info)
         return "从未生成开发邮件";
+    if (info.state === "never") {
+        return info.filePath
+            ? "AI 开发信息文件里没有邮件（可能已全部删除）"
+            : "从未生成开发邮件";
+    }
     if (info.state === "unknown") {
         return "AI 开发信息文件存在，但无法解析出邮件块";
     }
