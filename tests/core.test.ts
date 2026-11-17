@@ -8,6 +8,7 @@ import {
 	supportsMultipleValues,
 } from "../src/core/filters";
 import { pruneSelection, selectionSummary } from "../src/core/selection";
+import type { CustomerGeneration } from "../src/core/generation";
 import { guessLanguage, languageLabel } from "../src/core/language";
 import { extractWikiLinks, parseSingleWikilink, pathToLinkTarget } from "../src/core/wikilinks";
 import { summaryWarnings, looksChinese } from "../src/core/summary";
@@ -159,6 +160,7 @@ test("multiple-value conditions still accept legacy single values", () => {
 		{ tags: [], progressPrefixes: [] },
 	);
 	assertEqual(legacy.included.length, 2, "旧数据单值行为不变");
+	assertEqual(legacy.hiddenByGeneration, 0, "没有生成时间上下文时不隐藏");
 	assertEqual(
 		conditionValues({ key: "tags", op: "contains", value: " 五星 " }),
 		["五星"],
@@ -177,6 +179,83 @@ test("multiple-value conditions still accept legacy single values", () => {
 	assert(supportsMultipleValues("contains"), "包含支持多值");
 	assert(!supportsMultipleValues("gt"), "数值比较不支持多值");
 });
+
+suite("filters with generation");
+
+const GEN_NOW = new Date("2026-11-17T10:00:00+08:00");
+
+function generationOf(
+	path: string,
+	deltaMs: number | null,
+): CustomerGeneration | undefined {
+	if (deltaMs === null) return undefined;
+	const ms = GEN_NOW.getTime() - deltaMs;
+	return {
+		state: "known",
+		lastGeneratedAt: new Date(ms).toISOString(),
+		lastGeneratedMs: ms,
+		emailCount: 1,
+		totalEmailCount: 1,
+		allRejected: false,
+		pendingCount: 0,
+		filePath: null,
+		lastStatus: "Generated",
+	};
+}
+
+test("生成时间筛选与属性条件叠加，并统计隐藏数", () => {
+	const byPath = new Map<string, CustomerGeneration | undefined>();
+	const day = 86400000;
+	// Gallaway 刚生成；Airgas 3 天前；其余没有索引（从未生成）。
+	byPath.set(records[0]!.path, generationOf(records[0]!.path, 3600000));
+	byPath.set(records[1]!.path, generationOf(records[1]!.path, 3 * day));
+
+	const result = applyFilters(
+		records,
+		{ conditions: [], showExcluded: false },
+		{ tags: ["公海", "共享"], progressPrefixes: [] },
+		{
+			generation: {
+				filter: { mode: "stale", days: 1, includeNever: true },
+				of: (record) => byPath.get(record.path),
+				now: GEN_NOW,
+			},
+		},
+	);
+	assertEqual(
+		result.included.map((item) => item.name),
+		["Airgas Store"],
+		"只留下超过 1 天未生成、且没被排除的客户",
+	);
+	assertEqual(result.hiddenByGeneration, 1, "隐藏的是刚生成的 Gallaway");
+	assertEqual(result.excluded.length, 2, "公海/共享仍单独计数");
+});
+
+test("showExcluded 时生成时间同样生效", () => {
+	const byPath = new Map<string, CustomerGeneration | undefined>();
+	byPath.set(records[2]!.path, generationOf(records[2]!.path, 3600000));
+	const result = applyFilters(
+		records,
+		{ conditions: [], showExcluded: true },
+		{ tags: ["公海", "共享"], progressPrefixes: [] },
+		{
+			generation: {
+				filter: { mode: "fresh", days: 1, includeNever: true },
+				of: (record) => byPath.get(record.path),
+				now: GEN_NOW,
+			},
+		},
+	);
+	assertEqual(
+		result.included.map((item) => item.name),
+		["lablte.ru"],
+		"显示已排除时也能按生成时间筛",
+	);
+	assertEqual(result.hiddenByGeneration, 3, "其余客户被隐藏");
+});
+
+suite("filters");
+
 
 test("progress prefix exclusion", () => {
 	const rules = { tags: [], progressPrefixes: ["2.初步开发"] };

@@ -1,6 +1,11 @@
 import { ItemView, Notice, type WorkspaceLeaf } from "obsidian";
 import { emailUpdatedAt, formatEmailTime } from "../core/ai-file";
 import {
+	filterEmailRows,
+	matchesCustomerFilter,
+	type EmailCustomerFilter,
+} from "../core/email-list";
+import {
 	summarizeRunStatuses,
 	statusLabel,
 } from "../core/run-status";
@@ -21,7 +26,15 @@ const STATUS_LABELS: Record<EmailStatus | "all", string> = {
 export class EmailListView extends ItemView {
 	private statusFilter: EmailStatus | "all" = "all";
 	private search = "";
+	private customerFilter: EmailCustomerFilter | null = null;
+	private showDuplicatePending = false;
 	private preview = new PreviewController();
+
+	// 局部重绘用：搜索/状态变化只换计数与表格，输入框不丢焦点。
+	private tableContainer: HTMLElement | null = null;
+	private countEl: HTMLElement | null = null;
+	private dedupeWrap: HTMLElement | null = null;
+	private dedupeLabelEl: HTMLElement | null = null;
 
 	constructor(
 		leaf: WorkspaceLeaf,
@@ -56,6 +69,13 @@ export class EmailListView extends ItemView {
 		} catch (error) {
 			console.error("[email-outreach] 刷新邮件列表失败", error);
 		}
+		// 刷新不清空客户筛选 / 搜索 / 状态，只重画内容。
+		this.render();
+	}
+
+	/** 由工作台「开发状态」单元格调用；null 表示回到全部客户。 */
+	setCustomerFilter(filter: EmailCustomerFilter | null): void {
+		this.customerFilter = filter;
 		this.render();
 	}
 
@@ -64,7 +84,6 @@ export class EmailListView extends ItemView {
 		container.empty();
 		container.addClass("eo-email-list");
 
-		const rows = this.plugin.emailStore.getRows();
 		const header = container.createDiv({ cls: "eo-header" });
 		header.createEl("h2", { text: "开发邮件列表" });
 		const actions = header.createDiv({ cls: "eo-header-actions" });
@@ -76,7 +95,7 @@ export class EmailListView extends ItemView {
 		});
 		searchInput.addEventListener("input", () => {
 			this.search = searchInput.value;
-			this.renderTable(container);
+			this.renderBody();
 		});
 
 		const statusSelect = actions.createEl("select");
@@ -89,8 +108,21 @@ export class EmailListView extends ItemView {
 		statusSelect.value = this.statusFilter;
 		statusSelect.addEventListener("change", () => {
 			this.statusFilter = statusSelect.value as EmailStatus | "all";
-			this.renderTable(container);
+			this.renderBody();
 		});
+
+		const dedupeWrap = actions.createEl("label", {
+			cls: "eo-filter-excluded eo-dedupe-toggle",
+		});
+		const dedupeInput = dedupeWrap.createEl("input", { type: "checkbox" });
+		dedupeInput.checked = this.showDuplicatePending;
+		dedupeInput.addEventListener("change", () => {
+			this.showDuplicatePending = dedupeInput.checked;
+			this.renderBody();
+		});
+		this.dedupeLabelEl = dedupeWrap.createSpan({ text: "显示重复待审" });
+		this.dedupeWrap = dedupeWrap;
+		dedupeWrap.style.display = "none";
 
 		actions
 			.createEl("button", { text: "刷新" })
@@ -99,10 +131,21 @@ export class EmailListView extends ItemView {
 			.createEl("button", { text: "客户工作台" })
 			.addEventListener("click", () => this.plugin.openWorkbench());
 
+		if (this.customerFilter) {
+			const chipRow = container.createDiv({ cls: "eo-filter-row eo-customer-filter" });
+			chipRow.createSpan({ text: `客户：${this.customerFilter.name}` });
+			chipRow
+				.createEl("button", {
+					text: "×",
+					attr: { type: "button", "aria-label": "清除客户筛选" },
+				})
+				.addEventListener("click", () => this.setCustomerFilter(null));
+		}
+
 		this.renderRunBanner(container);
+		this.countEl = container.createDiv({ cls: "eo-muted eo-list-count" });
 		this.tableContainer = container.createDiv({ cls: "eo-table-wrap" });
-		this.renderTable(container);
-		void rows;
+		this.renderBody();
 	}
 
 	private renderRunBanner(container: HTMLElement): void {
@@ -126,45 +169,44 @@ export class EmailListView extends ItemView {
 		button.addEventListener("click", () => this.plugin.openWorkbench());
 	}
 
-	private tableContainer: HTMLElement | null = null;
-
-	private filteredRows(): EmailRow[] {
-		const rows = this.plugin.emailStore.getRows();
-		const search = this.search.trim().toLowerCase();
-		return rows.filter((row) => {
-			if (this.statusFilter === "all") {
-				if (row.record.status === "Rejected") return false;
-			} else if (row.record.status !== this.statusFilter) {
-				return false;
-			}
-			if (!search) return true;
-			const haystack = [
-				row.customerName,
-				row.record.contact,
-				row.record.email,
-				row.record.summaryZh,
-				row.record.subject,
-			]
-				.join(" ")
-				.toLowerCase();
-			return haystack.includes(search);
-		});
-	}
-
-	private renderTable(container: HTMLElement): void {
+	private renderBody(): void {
 		this.preview.hide();
 		const target = this.tableContainer;
 		if (!target) return;
 		target.empty();
-		const rows = this.filteredRows();
-		const count = target.createDiv({ cls: "eo-muted eo-list-count" });
-		count.setText(`共 ${rows.length} 封邮件`);
+
+		const result = filterEmailRows(this.plugin.emailStore.getRows(), {
+			status: this.statusFilter,
+			search: this.search,
+			customer: this.customerFilter,
+			showDuplicatePending: this.showDuplicatePending,
+		});
+		const rows = result.visible;
+
+		const countParts = [`共 ${rows.length} 封邮件`];
+		if (this.customerFilter) countParts.push(`客户：${this.customerFilter.name}`);
+		if (result.hiddenDuplicateCount > 0) {
+			countParts.push(
+				this.showDuplicatePending
+					? `已显示 ${result.hiddenDuplicateCount} 封旧待审`
+					: `已隐藏 ${result.hiddenDuplicateCount} 封同邮箱旧待审`,
+			);
+		}
+		this.countEl?.setText(countParts.join(" · "));
+
+		if (this.dedupeWrap && this.dedupeLabelEl) {
+			const relevant =
+				result.hiddenDuplicateCount > 0 || this.showDuplicatePending;
+			this.dedupeWrap.style.display = relevant ? "" : "none";
+			this.dedupeLabelEl.setText(
+				result.hiddenDuplicateCount > 0
+					? `显示重复待审（${result.hiddenDuplicateCount}）`
+					: "显示重复待审",
+			);
+		}
 
 		if (rows.length === 0) {
-			target.createDiv({
-				cls: "eo-empty",
-				text: "还没有生成邮件。先在客户工作台勾选客户并执行「生成开发邮件」。",
-			});
+			this.renderEmptyState(target, result.hiddenDuplicateCount);
 			return;
 		}
 
@@ -261,7 +303,62 @@ export class EmailListView extends ItemView {
 			if (updatedAt) updatedCell.setAttr("title", updatedAt);
 			tr.createEl("td", { text: String(row.record.versions.length) });
 		}
-		void container;
+	}
+
+	private renderEmptyState(target: HTMLElement, hiddenCount: number): void {
+		const empty = target.createDiv({ cls: "eo-empty" });
+		const addButton = (label: string, handler: () => void): void => {
+			const button = empty.createEl("button", { text: label });
+			button.addEventListener("click", handler);
+		};
+
+		if (this.customerFilter) {
+			const allForCustomer = this.plugin.emailStore
+				.getRows()
+				.filter((row) => matchesCustomerFilter(row, this.customerFilter));
+			if (allForCustomer.length === 0) {
+				empty.setText("这个客户还没有开发邮件");
+				addButton("清除客户筛选", () => this.setCustomerFilter(null));
+				return;
+			}
+			if (allForCustomer.every((row) => row.record.status === "Rejected")) {
+				empty.setText("这个客户只有已拒绝的邮件");
+				if (this.statusFilter === "Rejected") {
+					addButton("清除客户筛选", () => this.setCustomerFilter(null));
+				} else {
+					addButton("查看已拒绝", () => {
+						this.statusFilter = "Rejected";
+						this.render();
+					});
+				}
+				return;
+			}
+			if (hiddenCount > 0) {
+				empty.setText(
+					`有 ${hiddenCount} 封旧待审被合并（同一邮箱只显示最新的待审）`,
+				);
+				addButton("显示重复待审", () => {
+					this.showDuplicatePending = true;
+					this.render();
+				});
+				return;
+			}
+			empty.setText("这个客户在当前搜索/状态筛选下没有邮件");
+			addButton("清除客户筛选", () => this.setCustomerFilter(null));
+			return;
+		}
+
+		if (hiddenCount > 0) {
+			empty.setText(`有 ${hiddenCount} 封旧待审被合并（同一邮箱只显示最新的待审）`);
+			addButton("显示重复待审", () => {
+				this.showDuplicatePending = true;
+				this.render();
+			});
+			return;
+		}
+		empty.setText(
+			"还没有生成邮件。先在客户工作台勾选客户并执行「生成开发邮件」。",
+		);
 	}
 
 	/** 客户列是双链：点开客户笔记，而不是进入邮件详情。 */

@@ -63,6 +63,84 @@ export function confirm(app: App, options: ConfirmOptions): Promise<boolean> {
 	return new ConfirmModal(app, options).openAndWait();
 }
 
+export type ConfirmChoice = "primary" | "secondary" | null;
+
+export interface ConfirmChoiceOptions {
+	title: string;
+	primaryText: string;
+	secondaryText: string;
+	cancelText?: string;
+	build: (container: HTMLElement) => void;
+}
+
+class ChoiceModal extends Modal {
+	private resolved = false;
+	private resolvePromise: (value: ConfirmChoice) => void = () => undefined;
+
+	constructor(
+		app: App,
+		private options: ConfirmChoiceOptions,
+	) {
+		super(app);
+	}
+
+	openAndWait(): Promise<ConfirmChoice> {
+		return new Promise((resolve) => {
+			this.resolvePromise = resolve;
+			this.open();
+		});
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.addClass("eo-modal");
+		contentEl.createEl("h2", { text: this.options.title });
+		const body = contentEl.createDiv({ cls: "eo-confirm-body" });
+		this.options.build(body);
+		const buttons = contentEl.createDiv({ cls: "eo-modal-buttons" });
+		buttons
+			.createEl("button", {
+				text: this.options.cancelText ?? "取消",
+			})
+			.addEventListener("click", () => this.finish(null));
+		buttons
+			.createEl("button", { text: this.options.secondaryText })
+			.addEventListener("click", () => this.finish("secondary"));
+		const primary = buttons.createEl("button", {
+			cls: "mod-cta",
+			text: this.options.primaryText,
+		});
+		primary.addEventListener("click", () => this.finish("primary"));
+		primary.focus();
+	}
+
+	private finish(value: ConfirmChoice): void {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.resolvePromise(value);
+		this.close();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		if (!this.resolved) {
+			this.resolved = true;
+			this.resolvePromise(null);
+		}
+	}
+}
+
+/**
+ * 三态确认：主按钮是安全路径（跳过冷却中的客户），次按钮是显式覆盖。
+ * 取消返回 null。
+ */
+export function confirmChoice(
+	app: App,
+	options: ConfirmChoiceOptions,
+): Promise<ConfirmChoice> {
+	return new ChoiceModal(app, options).openAndWait();
+}
+
 export class ProgressModal extends Modal {
 	private messageEl: HTMLElement | null = null;
 	private detailEl: HTMLElement | null = null;

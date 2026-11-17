@@ -1,9 +1,13 @@
 import type { App, TFile } from "obsidian";
 import { isExcluded } from "../core/filters";
 import {
+	matchesGenerationFilter,
+	type GenerationFilter,
+	type GenerationFilterMode,
+} from "../core/generation";
+import {
 	summarizeRunStatuses,
 	statusLabel,
-	statusLevel,
 } from "../core/run-status";
 import type { CustomerRecord } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
@@ -13,8 +17,8 @@ import {
 	renderCustomerTable,
 	type CustomerColumn,
 	type CustomerRow,
-	type CustomerStatus,
 } from "./table";
+import { DEV_STATUS_COLUMN_ID, renderDevStatusCell } from "./dev-status-cell";
 
 export const BASES_VIEW_TYPE = "email-outreach-customers";
 export const BASES_VIEW_NAME = "Email Outreach 客户工作台";
@@ -124,6 +128,7 @@ function renderBasesRoot(
 		.addEventListener("click", () => plugin.openWorkbench());
 
 	// 搜索/排除开关会重复调用 drawTable；每次只重画这一块，避免表格叠加。
+	const generationBar = root.createDiv({ cls: "eo-bases-generation" });
 	const body = root.createDiv({ cls: "eo-bases-body" });
 	let showExcluded = false;
 	let drawToken = 0;
@@ -135,7 +140,11 @@ function renderBasesRoot(
 			tags: plugin.settings.excludeTags,
 			progressPrefixes: plugin.settings.excludeProgressPrefixes,
 		};
+		// 生成时间来自 AI 开发信息文件：用全量客户建索引，不能只用 Base 过滤后的行。
+		const generation = plugin.getGenerationReport();
+		const now = new Date();
 		let excludedCount = 0;
+		let hiddenByGeneration = 0;
 		const filtered = allRows.filter(({ record }) => {
 			if (search && !record.name.toLowerCase().includes(search)) return false;
 			if (excludeToggle.checked && !showExcluded) {
@@ -143,6 +152,16 @@ function renderBasesRoot(
 					excludedCount++;
 					return false;
 				}
+			}
+			if (
+				!matchesGenerationFilter(
+					generation.byCustomer.get(record.path),
+					plugin.settings.generationFilter,
+					now,
+				)
+			) {
+				hiddenByGeneration++;
+				return false;
 			}
 			return true;
 		});
@@ -173,6 +192,17 @@ function renderBasesRoot(
 					});
 					return link;
 				},
+			},
+			{
+				id: DEV_STATUS_COLUMN_ID,
+				label: "开发状态",
+				width: 180,
+				title:
+					"主行：最近一次有效生成的时间（来自 AI 开发信息文件）\n" +
+					"副行：上次未解决的提醒（无可用联系人 / 未找到合适联系人 / 上次失败）\n" +
+					"点击单元格查看这个客户的开发邮件；点表头排序",
+				render: (row) =>
+					renderDevStatusCell(row, plugin, generation.byCustomer, now),
 			},
 		];
 		for (const propertyId of propertyColumns) {
@@ -227,7 +257,6 @@ function renderBasesRoot(
 			onOpenContacts: (row) => {
 				void plugin.openContacts(row.record);
 			},
-			status: (row) => statusForCustomer(plugin, row),
 			emptyText:
 				entries.length === 0
 					? "当前 Base 没有匹配的客户。请在 Base 里调整筛选条件。"
@@ -251,14 +280,28 @@ function renderBasesRoot(
 						)
 						.join("，")
 				: "未设置排序";
-		info.setText(
-			`共 ${rows.length} 家 · 已排除 ${excludedCount} 家 · 排序：${sortText}（由 Base 控制）`,
-		);
+		const unknownCount = allRows.filter(
+			({ record }) => generation.byCustomer.get(record.path)?.state === "unknown",
+		).length;
+		const infoParts = [`共 ${rows.length} 家`];
+		if (hiddenByGeneration > 0) {
+			infoParts.push(`因生成时间隐藏 ${hiddenByGeneration} 家`);
+		}
+		if (unknownCount > 0) infoParts.push(`无法判断 ${unknownCount} 家`);
+		infoParts.push(`已排除 ${excludedCount} 家`);
+		if (generation.unmatchedFiles.length > 0) {
+			infoParts.push(
+				`有 ${generation.unmatchedFiles.length} 个 AI 文件无法对应客户`,
+			);
+		}
+		infoParts.push(`排序：${sortText}（由 Base 控制）`);
+		info.setText(infoParts.join(" · "));
 
 		const footer = body.createDiv({ cls: "eo-footer" });
 		const taskContainer = footer.createDiv({ cls: "eo-taskbar-container" });
 		runBar = renderRunBar(taskContainer, {
 			selectedCount: selected.size,
+			running: plugin.isRunning(),
 			onRun: () => {
 				const chosen = selected.size
 					? allRows
@@ -273,24 +316,91 @@ function renderBasesRoot(
 
 	searchInput.addEventListener("input", drawTable);
 	excludeToggle.addEventListener("change", drawTable);
+	renderGenerationControls(generationBar, plugin, drawTable);
 	drawTable();
 }
 
-function statusForCustomer(
+/** Bases 视图里的「最近生成」控件；写的是与内置工作台同一份设置。 */
+function renderGenerationControls(
+	container: HTMLElement,
 	plugin: OutreachPluginApi,
-	row: CustomerRow,
-): CustomerStatus {
-	const status = plugin.getCustomerDevStatus(row.record.path);
-	if (status) {
-		return {
-			text: statusLabel(status),
-			level: statusLevel(status),
-			title: status.message,
-		};
+	onChange: () => void,
+): void {
+	container.empty();
+	const filter = plugin.settings.generationFilter;
+	const row = container.createDiv({ cls: "eo-filter-row eo-filter-generation" });
+	row.createSpan({ cls: "eo-filter-label", text: "最近生成" });
+
+	const modeSelect = row.createEl("select", {
+		attr: { "aria-label": "最近生成筛选" },
+	});
+	const modes: Array<[GenerationFilterMode, string]> = [
+		["off", "不限"],
+		["stale", "≥ N 天未生成"],
+		["fresh", "N 天内生成过"],
+		["never", "从未生成"],
+	];
+	for (const [value, label] of modes) {
+		modeSelect.createEl("option", { value, text: label });
 	}
-	return {
-		text: row.record.fm[plugin.settings.linkPropertyName] ? "✓" : "—",
+	modeSelect.value = filter.mode;
+	modeSelect.addEventListener("change", () => {
+		filter.mode = modeSelect.value as GenerationFilterMode;
+		void plugin.saveSettings();
+		// 模式变化要重画控件本身：天数输入 / 包含从未生成只在特定模式下出现。
+		renderGenerationControls(container, plugin, onChange);
+		onChange();
+	});
+
+	const recreate = (): void => {
+		renderGenerationControls(container, plugin, onChange);
+		onChange();
 	};
+
+	if (filter.mode === "stale" || filter.mode === "fresh") {
+		const daysInput = row.createEl("input", {
+			type: "number",
+			value: String(filter.days),
+			cls: "eo-generation-days",
+			attr: { min: "0.5", step: "0.5", "aria-label": "天数" },
+		});
+		daysInput.addEventListener("change", () => {
+			const parsed = Number(daysInput.value);
+			filter.days = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+			void plugin.saveSettings();
+			recreate();
+		});
+		row.createSpan({ text: "天" });
+	}
+
+	if (filter.mode === "stale") {
+		const label = row.createEl("label", { cls: "eo-filter-excluded" });
+		const checkbox = label.createEl("input", { type: "checkbox" });
+		checkbox.checked = filter.includeNever;
+		checkbox.addEventListener("change", () => {
+			filter.includeNever = checkbox.checked;
+			void plugin.saveSettings();
+			onChange();
+		});
+		label.createSpan({ text: "包含从未生成" });
+	}
+
+	const quick = row.createDiv({ cls: "eo-filter-presets eo-generation-presets" });
+	const addQuick = (label: string, next: GenerationFilter): void => {
+		quick.createEl("button", { text: label }).addEventListener("click", () => {
+			plugin.settings.generationFilter = { ...next };
+			void plugin.saveSettings();
+			recreate();
+		});
+	};
+	addQuick("今日待开发", { mode: "stale", days: 1, includeNever: true });
+	addQuick("24h 内已生成", { mode: "fresh", days: 1, includeNever: true });
+	addQuick("不限", { mode: "off", days: 1, includeNever: true });
+
+	row.createSpan({
+		cls: "eo-muted eo-bases-hint",
+		text: "Base 原生筛选/排序看不到这个派生字段，由插件视图提供。",
+	});
 }
 
 function renderBasesRunBanner(

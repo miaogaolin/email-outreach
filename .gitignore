@@ -3,6 +3,7 @@ node_modules/
 .npm-cache/
 data.json
 .write-probe
+*.tmpdir/
 *.log
 *.tsbuildinfo
 .DS_Store

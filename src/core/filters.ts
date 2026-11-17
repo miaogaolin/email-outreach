@@ -1,3 +1,8 @@
+import {
+	matchesGenerationFilter,
+	type CustomerGeneration,
+	type GenerationFilter,
+} from "./generation";
 import type { CustomerRecord } from "./types";
 
 export type FilterOp =
@@ -250,22 +255,52 @@ export function matchesFilters(
 	});
 }
 
+/**
+ * 属性条件之外的运行时筛选上下文。
+ *
+ * 生成时间不是客户属性（客户笔记零写入），无法用通用 `FilterCondition`
+ * 表达，所以单独传进来；两个视图共用同一份 `settings.generationFilter`。
+ */
+export interface FilterRuntime {
+	generation?: {
+		filter: GenerationFilter;
+		of: (record: CustomerRecord) => CustomerGeneration | undefined;
+		now: Date;
+	};
+}
+
 export function applyFilters(
 	records: CustomerRecord[],
 	config: FilterConfig,
 	rules: ExclusionRules,
-): { included: CustomerRecord[]; excluded: CustomerRecord[] } {
+	runtime?: FilterRuntime,
+): {
+	included: CustomerRecord[];
+	excluded: CustomerRecord[];
+	/** 通过了属性筛选与排除规则，但被生成时间筛掉的客户数。 */
+	hiddenByGeneration: number;
+} {
 	const included: CustomerRecord[] = [];
 	const excluded: CustomerRecord[] = [];
+	let hiddenByGeneration = 0;
+	const generation = runtime?.generation;
 	for (const record of records) {
 		if (!matchesFilters(record, config)) continue;
 		if (!config.showExcluded && isExcluded(record, rules)) {
 			excluded.push(record);
 			continue;
 		}
+		// 顺序：属性条件 → 公海/共享排除 → 生成时间。
+		if (
+			generation &&
+			!matchesGenerationFilter(generation.of(record), generation.filter, generation.now)
+		) {
+			hiddenByGeneration++;
+			continue;
+		}
 		included.push(record);
 	}
-	return { included, excluded };
+	return { included, excluded, hiddenByGeneration };
 }
 
 export type PropertyType = "number" | "date" | "tags" | "text" | "empty";

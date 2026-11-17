@@ -18,6 +18,16 @@ import {
 	isExcluded,
 } from "../core/filters";
 import {
+	buildGenerationIndex,
+	customerGenerationInput,
+	formatGenerationAge,
+	normalizeGenerationFilter,
+	parseGenerationTime,
+	withinCooldown,
+	type CustomerGeneration,
+	type GenerationIndex,
+} from "../core/generation";
+import {
 	feedbackFilePath,
 	isoNow,
 	localStamp,
@@ -37,7 +47,7 @@ import {
 	type PromptCustomer,
 	type RuleDraft,
 } from "../core/prompt";
-import { summarizeRunStatuses } from "../core/run-status";
+import { summarizeRunStatuses, mergeDevStatuses } from "../core/run-status";
 import { parseJsonLoose, validateAIResult } from "../core/schema";
 import { pruneSelection } from "../core/selection";
 import { planSendTime, sendHistoryFrom } from "../core/send-time";
@@ -78,7 +88,7 @@ import { VaultAdapter } from "./vault-adapter";
 import { WorkbenchView } from "./workbench-view";
 import { BaseStarterModal } from "./modals/base-starter";
 import { ColumnsModal } from "./modals/columns";
-import { confirm, ProgressModal } from "./modals/confirm";
+import { confirm, confirmChoice, ProgressModal } from "./modals/confirm";
 import { ContactModal } from "./modals/contacts";
 import {
 	EmailDetailModal,
@@ -125,6 +135,7 @@ export default class EmailOutreachPlugin
 	private selectionSaveTimer: number | null = null;
 	private devStatus: DevStatusMap = {};
 	private lastRunStatusFile: RunStatusFile | null = null;
+	private running = false;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -237,9 +248,10 @@ export default class EmailOutreachPlugin
 	private async loadDevStatus(): Promise<void> {
 		try {
 			const file = await this.state.loadLastRunStatus();
-			if (!file) return;
-			this.lastRunStatusFile = file;
-			this.devStatus = file.customers;
+			if (file) this.lastRunStatusFile = file;
+			const stored = await this.state.loadCustomerStatuses();
+			// 升级种子：新文件还不存在时用 last-run 的记录，避免第一屏没有状态。
+			this.devStatus = stored ?? file?.customers ?? {};
 		} catch (error) {
 			console.error("[email-outreach] 加载上次执行状态失败", error);
 		}
@@ -249,19 +261,27 @@ export default class EmailOutreachPlugin
 		return this.devStatus[path] ?? null;
 	}
 
+	isRunning(): boolean {
+		return this.running;
+	}
+
 	getLastRunStatus(): RunStatusFile | null {
 		return this.lastRunStatusFile;
 	}
 
 	private async persistDevStatus(results: RunOutcome["results"]): Promise<void> {
 		if (results.length === 0) return;
-		const customers: DevStatusMap = {};
+		const updates: DevStatusMap = {};
 		for (const result of results) {
-			customers[result.customer.path] = result.status;
+			updates[result.customer.path] = result.status;
 		}
-		this.devStatus = customers;
-		this.lastRunStatusFile = { at: isoNow(), customers };
-		await this.state.saveLastRunStatus(customers);
+		// 每客户状态按客户合并，跨批次保留；last-run 仍然只记本次，给顶部横幅用。
+		this.devStatus = mergeDevStatuses(this.devStatus, updates);
+		this.lastRunStatusFile = { at: isoNow(), customers: updates };
+		await Promise.all([
+			this.state.saveLastRunStatus(updates),
+			this.state.saveCustomerStatuses(this.devStatus),
+		]);
 	}
 
 	private registerEvents(): void {
@@ -326,6 +346,15 @@ export default class EmailOutreachPlugin
 		}
 		if (!Array.isArray(merged.selectedCustomers)) merged.selectedCustomers = [];
 		if (!Array.isArray(merged.availableModels)) merged.availableModels = [];
+		// 手改坏的 data.json 不能让筛选/冷却失效。
+		merged.generationFilter = normalizeGenerationFilter(
+			(stored as Partial<Settings> | null)?.generationFilter,
+		);
+		const cooldown = Number(merged.generateCooldownHours);
+		merged.generateCooldownHours =
+			Number.isFinite(cooldown) && cooldown >= 0 && cooldown <= 720
+				? Math.round(cooldown)
+				: DEFAULT_SETTINGS.generateCooldownHours;
 		this.settings = merged;
 
 		const secret = this.secretStorage();
@@ -463,8 +492,27 @@ export default class EmailOutreachPlugin
 			await leaf.setViewState({ type: EMAIL_LIST_VIEW_TYPE, active: true });
 		} else if (leaf.view instanceof EmailListView) {
 			await leaf.view.refresh();
+			// 顶部「邮件列表」按钮看到的是全部客户。
+			leaf.view.setCustomerFilter(null);
 		}
 		await this.app.workspace.revealLeaf(leaf);
+	}
+
+	async openEmailListForCustomer(
+		record: CustomerRecord,
+		aiFilePath?: string | null,
+	): Promise<void> {
+		await this.openEmailList();
+		const leaf = this.app.workspace.getLeavesOfType(EMAIL_LIST_VIEW_TYPE)[0];
+		const view = leaf?.view;
+		if (view instanceof EmailListView) {
+			// 客户识别优先用该客户对应的 AI 文件路径，客户改名后仍能命中。
+			view.setCustomerFilter({
+				path: record.path,
+				name: record.name,
+				aiFilePath: aiFilePath ?? null,
+			});
+		}
 	}
 
 	async refreshEmailList(): Promise<void> {
@@ -493,6 +541,26 @@ export default class EmailOutreachPlugin
 
 	getAIFile(path: string): CustomerAIFile | null {
 		return this.emailStore.getFile(path);
+	}
+
+	getGenerationReport(records?: CustomerRecord[]): GenerationIndex {
+		const customers = records ?? this.repo.list();
+		return buildGenerationIndex(
+			this.emailStore.listFiles().map(({ path, file }) => ({
+				path,
+				customerLink: file.customerLink,
+				emails: file.emails,
+			})),
+			customers.map((record) =>
+				customerGenerationInput(record, this.settings.linkPropertyName),
+			),
+		);
+	}
+
+	getGenerationIndex(
+		records?: CustomerRecord[],
+	): Map<string, CustomerGeneration> {
+		return this.getGenerationReport(records).byCustomer;
 	}
 
 	getRow(key: string): EmailRow | null {
@@ -582,6 +650,10 @@ export default class EmailOutreachPlugin
 	// -------------------------------------------------------------------- run
 
 	async runTasks(records: CustomerRecord[]): Promise<void> {
+		if (this.running) {
+			new Notice("上一次生成还在进行中，请等它结束");
+			return;
+		}
 		const problems = getConfigProblems(this.settings);
 		if (problems.length > 0) {
 			new Notice(
@@ -591,141 +663,276 @@ export default class EmailOutreachPlugin
 			);
 			return;
 		}
-		const chosen = records.filter((record) => this.selected.has(record.path));
+		let chosen = records.filter((record) => this.selected.has(record.path));
 		if (chosen.length === 0) {
 			new Notice("请先在客户列表里勾选客户");
 			return;
 		}
 
-		let languageOverrides = new Map<string, string>();
-		const unknown = chosen.filter(
-			(record) => !guessLanguage(record.fm["地区"]),
-		);
-		if (unknown.length > 0) {
-			const result = await new LanguageModal(this.app, unknown).openAndWait();
-			if (result === null) return;
-			languageOverrides = result;
-		}
-
-		let knowledge: KnowledgeBundle;
+		this.running = true;
+		this.refreshWorkbenchViews();
+		let skippedByCooldown = 0;
 		try {
-			const loaded = await this.knowledgeLoader.load();
-			if (!loaded.bundle) {
-				throw new Error(loaded.errors.join("；") || "知识库加载失败");
-			}
-			knowledge = loaded.bundle;
-		} catch (error) {
-			new Notice(
-				`知识库加载失败：${error instanceof Error ? error.message : String(error)}`,
-				9000,
-			);
-			return;
-		}
-
-		const feedbackRules = await this.readFeedbackRules();
-		const confirmed = await confirm(this.app, {
-			title: "生成开发邮件",
-			confirmText: `开始生成（最多 ${chosen.length} 个请求）`,
-			build: (container) => {
-				container.createEl("p", { text: `客户数量：${chosen.length} 家` });
-				const list = container.createEl("ul");
-				list.createEl("li", {
-					text: "只为有邮箱且适合的联系人生成，一个客户可能生成多封（最多 5 封）",
+			// 冷却判断是「用户意图」问题，放在入口，三个入口都覆盖。
+			const cooldown = await this.splitByCooldown(chosen);
+			if (cooldown.cooling.length > 0) {
+				const choice = await confirmChoice(this.app, {
+					title: "生成开发邮件",
+					primaryText:
+						cooldown.runnable.length > 0
+							? `跳过并生成 ${cooldown.runnable.length} 家`
+							: "知道了",
+					secondaryText: "仍然全部生成",
+					build: (container) => {
+						container.createEl("p", {
+							text: `已选 ${chosen.length} 家，其中 ${cooldown.cooling.length} 家在 ${this.settings.generateCooldownHours} 小时内生成过：`,
+						});
+						const list = container.createEl("ul");
+						for (const record of cooldown.cooling.slice(0, 12)) {
+							list.createEl("li", {
+								text: this.describeCooling(record, cooldown),
+							});
+						}
+						if (cooldown.cooling.length > 12) {
+							list.createEl("li", {
+								text: `… 另外 ${cooldown.cooling.length - 12} 家`,
+							});
+						}
+						container.createEl("p", {
+							text:
+								cooldown.runnable.length > 0
+									? `将跳过这 ${cooldown.cooling.length} 家，只处理其余 ${cooldown.runnable.length} 家。`
+									: "所选客户都在冷却窗口内。",
+						});
+						if (cooldown.unknownCount > 0) {
+							container.createEl("p", {
+								cls: "eo-muted",
+								text: `另有 ${cooldown.unknownCount} 家无法判断最近生成时间，且没有上次生成记录，不拦截。`,
+							});
+						}
+						container.createEl("p", {
+							cls: "eo-muted",
+							text: `冷却窗口可在设置里调整（当前 ${this.settings.generateCooldownHours} 小时，0 表示关闭）。`,
+						});
+					},
 				});
-				list.createEl("li", {
-					text: "发送时间按客户地区时区、跟进次数和已发送记录自动计算",
-				});
-				list.createEl("li", {
-					text: "没有可用联系人的客户不会调用 AI，并会在列表里标记",
-				});
-				container.createEl("p", {
-					cls: "eo-muted",
-					text: `知识库：${knowledge.mainPath} + ${knowledge.articles.length} 篇关联文章（${knowledge.totalChars} 字）`,
-				});
-				if (feedbackRules.trim()) {
-					container.createEl("p", {
-						cls: "eo-muted",
-						text: "本次会参考已确认的 Feedback 规则。",
-					});
+				if (choice === null) return;
+				if (choice === "secondary") {
+					// 显式覆盖：冷却中的客户也一起跑。
+					chosen = cooldown.all;
+				} else {
+					skippedByCooldown = cooldown.cooling.length;
+					chosen = cooldown.runnable;
+					if (chosen.length === 0) {
+						new Notice("所选客户都在冷却窗口内，已全部跳过");
+						return;
+					}
 				}
-			},
-		});
-		if (!confirmed) return;
+			}
 
-		const token = { canceled: false };
-		const progress = new ProgressModal(this.app);
-		progress.setOnCancel(() => {
-			token.canceled = true;
-		});
-		progress.setMessage("正在准备…", `${chosen.length} 家客户`);
-		progress.open();
+			let languageOverrides = new Map<string, string>();
+			const unknown = chosen.filter(
+				(record) => !guessLanguage(record.fm["地区"]),
+			);
+			if (unknown.length > 0) {
+				const result = await new LanguageModal(this.app, unknown).openAndWait();
+				if (result === null) return;
+				languageOverrides = result;
+			}
 
-		const pipeline = new Pipeline({
-			settings: this.settings,
-			knowledge,
-			feedbackRules,
-			adapter: this.adapter,
-			repo: this.repo,
-			client: this.client,
-			state: this.state,
-		});
-
-		let outcome: RunOutcome;
-		try {
-			outcome = await pipeline.run({
-				customers: chosen,
-				languageOverrides,
-				token,
-				onProgress: (event) => {
-					progress.setMessage(
-						`${event.phase} · ${event.customerName}`,
-						`${Math.min(event.index + 1, event.total)} / ${event.total}`,
-					);
-				},
-			});
-		} catch (error) {
-			if (error instanceof CanceledError) {
-				new Notice("已取消");
+			let knowledge: KnowledgeBundle;
+			try {
+				const loaded = await this.knowledgeLoader.load();
+				if (!loaded.bundle) {
+					throw new Error(loaded.errors.join("；") || "知识库加载失败");
+				}
+				knowledge = loaded.bundle;
+			} catch (error) {
+				new Notice(
+					`知识库加载失败：${error instanceof Error ? error.message : String(error)}`,
+					9000,
+				);
 				return;
 			}
-			new Notice(
-				`执行失败：${error instanceof Error ? error.message : String(error)}`,
-				9000,
-			);
-			return;
+
+			const feedbackRules = await this.readFeedbackRules();
+			// 已经用冷却弹窗确认过的批次不再弹第二个确认框。
+			if (cooldown.cooling.length === 0) {
+				const confirmed = await confirm(this.app, {
+					title: "生成开发邮件",
+					confirmText: `开始生成（最多 ${chosen.length} 个请求）`,
+					build: (container) => {
+						container.createEl("p", { text: `客户数量：${chosen.length} 家` });
+						const list = container.createEl("ul");
+						list.createEl("li", {
+							text: "只为有邮箱且适合的联系人生成，一个客户可能生成多封（最多 5 封）",
+						});
+						list.createEl("li", {
+							text: "发送时间按客户地区时区、跟进次数和已发送记录自动计算",
+						});
+						list.createEl("li", {
+							text: "没有可用联系人的客户不会调用 AI，并会在列表里标记",
+						});
+						container.createEl("p", {
+							cls: "eo-muted",
+							text: `知识库：${knowledge.mainPath} + ${knowledge.articles.length} 篇关联文章（${knowledge.totalChars} 字）`,
+						});
+						if (feedbackRules.trim()) {
+							container.createEl("p", {
+								cls: "eo-muted",
+								text: "本次会参考已确认的 Feedback 规则。",
+							});
+						}
+					},
+				});
+				if (!confirmed) return;
+			}
+
+			const token = { canceled: false };
+			const progress = new ProgressModal(this.app);
+			progress.setOnCancel(() => {
+				token.canceled = true;
+			});
+			progress.setMessage("正在准备…", `${chosen.length} 家客户`);
+			progress.open();
+
+			const pipeline = new Pipeline({
+				settings: this.settings,
+				knowledge,
+				feedbackRules,
+				adapter: this.adapter,
+				repo: this.repo,
+				client: this.client,
+				state: this.state,
+			});
+
+			let outcome: RunOutcome;
+			try {
+				outcome = await pipeline.run({
+					customers: chosen,
+					languageOverrides,
+					token,
+					onProgress: (event) => {
+						progress.setMessage(
+							`${event.phase} · ${event.customerName}`,
+							`${Math.min(event.index + 1, event.total)} / ${event.total}`,
+						);
+					},
+				});
+			} catch (error) {
+				if (error instanceof CanceledError) {
+					new Notice("已取消");
+					return;
+				}
+				new Notice(
+					`执行失败：${error instanceof Error ? error.message : String(error)}`,
+					9000,
+				);
+				return;
+			} finally {
+				progress.close();
+			}
+
+			await this.persistDevStatus(outcome.results);
+			this.refreshWorkbenchViews();
+			await this.refreshEmailList();
+			if (outcome.errors.length > 0) {
+				console.error("[email-outreach] 本次执行错误", outcome.errors);
+			}
+
+			const summary = summarizeRunStatuses(this.lastRunStatusFile?.customers ?? {});
+			const parts: string[] = [];
+			if (summary.generatedCustomers > 0) {
+				parts.push(
+					`已生成 ${summary.generatedEmailCount} 封（${summary.generatedCustomers} 家）`,
+				);
+			}
+			if (summary.noContact > 0) {
+				parts.push(`${summary.noContact} 家无可用联系人`);
+			}
+			if (summary.noSuitable > 0) {
+				parts.push(`${summary.noSuitable} 家未找到合适联系人`);
+			}
+			if (summary.failed > 0) {
+				parts.push(`${summary.failed} 家失败，详情见开发状态列和控制台`);
+			}
+			if (skippedByCooldown > 0) {
+				parts.push(
+					`跳过 ${skippedByCooldown} 家（${this.settings.generateCooldownHours} 小时内已生成）`,
+				);
+			}
+			if (outcome.canceled) {
+				parts.push("已取消，已完成的内容已保存");
+			}
+			new Notice(parts.length > 0 ? parts.join("；") : "本次没有生成邮件", 9000);
 		} finally {
-			progress.close();
+			this.running = false;
+			this.refreshWorkbenchViews();
 		}
+	}
 
-		await this.persistDevStatus(outcome.results);
-		this.refreshWorkbenchViews();
+	/**
+	 * 把勾选客户分成「冷却中」与「可生成」。
+	 *
+	 * 锚点取 max(AI 文件的最近生成时间, 上次「已生成」尝试的时间)：
+	 * AI 文件被删/损坏时仍能拦住 24h 内的重复生成。
+	 */
+	private async splitByCooldown(
+		chosen: CustomerRecord[],
+	): Promise<{
+		all: CustomerRecord[];
+		cooling: CustomerRecord[];
+		runnable: CustomerRecord[];
+		unknownCount: number;
+		index: Map<string, CustomerGeneration>;
+		now: Date;
+	}> {
+		// 用最新 AI 文件建索引，不信任可能过期的内存缓存。
 		await this.refreshEmailList();
-		if (outcome.errors.length > 0) {
-			console.error("[email-outreach] 本次执行错误", outcome.errors);
+		const index = this.getGenerationIndex(this.repo.list(true));
+		const now = new Date();
+		const hours = this.settings.generateCooldownHours;
+		const cooling: CustomerRecord[] = [];
+		const runnable: CustomerRecord[] = [];
+		let unknownCount = 0;
+		for (const record of chosen) {
+			const info = index.get(record.path);
+			const attempt = this.getCustomerDevStatus(record.path);
+			// 只有 AI 文件不可用时，才用上次「已生成」记录兜底；
+			// 文件里有邮件但全被拒绝时，视为用户显式放弃，不拦截。
+			const aiUnavailable =
+				!info || info.state !== "known" || info.totalEmailCount === 0;
+			const fallbackMs =
+				aiUnavailable && attempt?.kind === "generated"
+					? parseGenerationTime(attempt.at)
+					: null;
+			if (withinCooldown(info, now, hours, fallbackMs)) {
+				cooling.push(record);
+				continue;
+			}
+			if ((!info || info.state === "unknown") && attempt?.kind !== "generated") {
+				unknownCount++;
+			}
+			runnable.push(record);
 		}
+		return { all: chosen, cooling, runnable, unknownCount, index, now };
+	}
 
-		const summary = summarizeRunStatuses(
-			outcome.results.length > 0 ? this.devStatus : {},
-		);
-		const parts: string[] = [];
-		if (summary.generatedCustomers > 0) {
-			parts.push(
-				`已生成 ${summary.generatedEmailCount} 封（${summary.generatedCustomers} 家）`,
-			);
+	private describeCooling(
+		record: CustomerRecord,
+		cooldown: { index: Map<string, CustomerGeneration>; now: Date },
+	): string {
+		const info = cooldown.index.get(record.path);
+		const age = formatGenerationAge(info, cooldown.now);
+		if (!info || info.totalEmailCount === 0) {
+			const attempt = this.getCustomerDevStatus(record.path);
+			const suffix =
+				attempt?.kind === "generated"
+					? "（AI 文件缺失或无法解析，按上次生成记录判断）"
+					: "";
+			return `${record.name} · ${age}${suffix}`;
 		}
-		if (summary.noContact > 0) {
-			parts.push(`${summary.noContact} 家无可用联系人`);
-		}
-		if (summary.noSuitable > 0) {
-			parts.push(`${summary.noSuitable} 家未找到合适联系人`);
-		}
-		if (summary.failed > 0) {
-			parts.push(`${summary.failed} 家失败，详情见开发状态列和控制台`);
-		}
-		if (outcome.canceled) {
-			parts.push("已取消，已完成的内容已保存");
-		}
-		new Notice(parts.length > 0 ? parts.join("；") : "本次没有生成邮件", 9000);
+		return `${record.name} · ${age} · 有效 ${info.emailCount} 封 / 共 ${info.totalEmailCount} 封`;
 	}
 
 	// -------------------------------------------------------------- email flow

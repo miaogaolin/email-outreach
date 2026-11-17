@@ -11,13 +11,9 @@ export interface CustomerColumn {
 	id: string;
 	label: string;
 	width?: number;
-	render: (row: CustomerRow) => string | Node | null;
-}
-
-export interface CustomerStatus {
-	text: string;
-	level?: "ok" | "warn" | "error";
+	/** 表头 tooltip，例如解释「开发状态」两行分别是什么。 */
 	title?: string;
+	render: (row: CustomerRow) => string | Node | null;
 }
 
 /**
@@ -42,7 +38,6 @@ export interface CustomerTableOptions {
 	onOpenContacts: (row: CustomerRow) => void;
 	sort?: { columnId: string; dir: 1 | -1 } | null;
 	onSort?: (columnId: string) => void;
-	status?: (row: CustomerRow) => CustomerStatus | null;
 	emptyText?: string;
 }
 
@@ -88,6 +83,7 @@ export function renderCustomerTable(
 			text: column.label,
 			cls: options.onSort ? "eo-sortable" : undefined,
 		});
+		if (column.title) th.setAttr("title", column.title);
 		if (column.width) th.style.width = `${column.width}px`;
 		if (options.sort?.columnId === column.id) {
 			th.createSpan({
@@ -99,7 +95,6 @@ export function renderCustomerTable(
 			th.addEventListener("click", () => options.onSort?.(column.id));
 		}
 	}
-	headRow.createEl("th", { cls: "eo-col-status", text: "开发状态" });
 
 	const rowElements = new Map<string, HTMLTableRowElement>();
 	const rowCheckboxes = new Map<string, HTMLInputElement>();
@@ -149,18 +144,6 @@ export function renderCustomerTable(
 				td.setText(value);
 			}
 		}
-
-		const statusCell = tr.createEl("td", { cls: "eo-col-status" });
-		const status =
-			options.status?.(row) ??
-			({
-				text: row.record.fm["AI开发信息"] ? "✓" : "—",
-			} satisfies CustomerStatus);
-		const statusSpan = statusCell.createSpan({
-			cls: `eo-dev-status eo-dev-status-${status.level ?? "none"}`,
-			text: status.text,
-		});
-		if (status.title) statusSpan.setAttr("title", status.title);
 	}
 
 	const applySelectionSummary = (): void => {

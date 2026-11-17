@@ -1,4 +1,7 @@
 import {
+	mergeDevStatuses,
+	parseCustomerStatusFile,
+	parseDevStatusMap,
 	parseRunStatusFile,
 	statusLabel,
 	statusNeedsAttention,
@@ -88,5 +91,53 @@ test("rejects invalid status files", () => {
 		Object.keys(invalidEntry!.customers).length,
 		0,
 		"非法条目被忽略",
+	);
+});
+
+test("parseDevStatusMap 跳过坏条目", () => {
+	const parsed = parseDevStatusMap({
+		"a.md": map()["a.md"],
+		"": map()["b.md"],
+		"b.md": { kind: "nope" },
+		"c.md": "也不是对象",
+	});
+	assertEqual(Object.keys(parsed), ["a.md"], "只保留合法条目");
+	assertEqual(parseDevStatusMap(null), {}, "null → 空 map");
+	assertEqual(parseDevStatusMap([]), {}, "数组 → 空 map");
+});
+
+test("mergeDevStatuses 覆盖出现的客户、保留其他客户", () => {
+	const base = map();
+	const updates: DevStatusMap = {
+		"b.md": {
+			kind: "generated",
+			customerName: "B",
+			emailCount: 1,
+			message: "已生成 1 封",
+			at: "2026-11-17T09:00:00+08:00",
+		},
+	};
+	const merged = mergeDevStatuses(base, updates);
+	assertEqual(merged["b.md"]?.kind, "generated", "覆盖出现的客户");
+	assertEqual(merged["a.md"]?.customerName, "A", "保留未出现的客户");
+	assertEqual(merged["d.md"]?.kind, "failed", "其余客户也保留");
+	assertEqual(base["b.md"]?.kind, "no_contact", "不改原对象");
+	assertEqual(Object.keys(merged).length, 4, "客户数量不变");
+});
+
+test("parseCustomerStatusFile 读取新文件结构", () => {
+	const parsed = parseCustomerStatusFile({
+		version: 1,
+		customers: map(),
+	});
+	assert(parsed, "应解析成功");
+	assertEqual(Object.keys(parsed!).length, 4, "四个客户");
+	assertEqual(parsed!["a.md"]?.emailCount, 2, "邮件数");
+	assertEqual(parseCustomerStatusFile("not json"), null, "非 JSON");
+	assertEqual(parseCustomerStatusFile({ version: 1 }), null, "缺 customers");
+	assertEqual(
+		parseCustomerStatusFile({ version: 1, customers: { "a.md": { kind: "x" } } }),
+		{},
+		"坏条目被跳过但仍返回 map",
 	);
 });

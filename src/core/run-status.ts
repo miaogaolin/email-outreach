@@ -109,6 +109,62 @@ function parseStatus(value: unknown): CustomerDevStatus | null {
 }
 
 /**
+ * 解析「客户路径 → 上次尝试结果」的 map。
+ * 坏条目跳过；结构不是对象时返回空 map。
+ */
+export function parseDevStatusMap(value: unknown): DevStatusMap {
+	const customers: DevStatusMap = {};
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		Array.isArray(value)
+	) {
+		return customers;
+	}
+	for (const [path, raw] of Object.entries(
+		value as Record<string, unknown>,
+	)) {
+		if (!path.trim()) continue;
+		const status = parseStatus(raw);
+		if (status) customers[path] = status;
+	}
+	return customers;
+}
+
+/** 按客户合并：本次出现的客户覆盖自己的旧记录，未出现的保留。 */
+export function mergeDevStatuses(
+	base: DevStatusMap,
+	updates: DevStatusMap,
+): DevStatusMap {
+	return { ...base, ...updates };
+}
+
+/**
+ * 读取 `.state/customer-status.json`。
+ * 文件不存在或结构不对返回 null，让调用方决定是否用 last-run 做升级种子。
+ */
+export function parseCustomerStatusFile(value: unknown): DevStatusMap | null {
+	let data = value;
+	if (typeof value === "string") {
+		try {
+			data = JSON.parse(value);
+		} catch {
+			return null;
+		}
+	}
+	if (typeof data !== "object" || data === null) return null;
+	const customersRaw = (data as Record<string, unknown>).customers;
+	if (
+		typeof customersRaw !== "object" ||
+		customersRaw === null ||
+		Array.isArray(customersRaw)
+	) {
+		return null;
+	}
+	return parseDevStatusMap(customersRaw);
+}
+
+/**
  * 读取 `.state/last-run.json`。
  * 接受已解析对象或 JSON 字符串；任何不合法内容都返回 null，避免坏状态影响列表。
  */
@@ -132,13 +188,5 @@ export function parseRunStatusFile(value: unknown): RunStatusFile | null {
 	) {
 		return null;
 	}
-	const customers: DevStatusMap = {};
-	for (const [path, raw] of Object.entries(
-		customersRaw as Record<string, unknown>,
-	)) {
-		if (!path.trim()) continue;
-		const status = parseStatus(raw);
-		if (status) customers[path] = status;
-	}
-	return { at, customers };
+	return { at, customers: parseDevStatusMap(customersRaw) };
 }

@@ -1,5 +1,5 @@
 import { isoNow, joinPath, sanitizeFileName } from "../core/filenames";
-import { parseRunStatusFile } from "../core/run-status";
+import { parseCustomerStatusFile, parseRunStatusFile } from "../core/run-status";
 import type { DevStatusMap, RunStatusFile } from "../core/types";
 import { VaultAdapter } from "./vault-adapter";
 
@@ -65,6 +65,37 @@ export class StateStore {
 			return parseRunStatusFile(raw);
 		} catch (error) {
 			console.error("[email-outreach] 读取上次执行状态失败", error);
+			return null;
+		}
+	}
+
+	/**
+	 * 每客户上次尝试结果，跨批次保留。
+	 * 与只记录本次执行的 `last-run.json` 分开，避免下一次执行覆盖掉别的客户。
+	 */
+	async saveCustomerStatuses(customers: DevStatusMap): Promise<void> {
+		if (!this.getOutputDir().trim()) return;
+		try {
+			await this.adapter.writeStateJson(
+				this.dir(),
+				"customer-status.json",
+				{ version: 1, customers },
+			);
+		} catch (error) {
+			console.error("[email-outreach] 保存每客户开发状态失败", error);
+		}
+	}
+
+	async loadCustomerStatuses(): Promise<DevStatusMap | null> {
+		if (!this.getOutputDir().trim()) return null;
+		try {
+			const raw = await this.adapter.readStateFile(
+				joinPath(this.dir(), ".state", "customer-status.json"),
+			);
+			if (!raw) return null;
+			return parseCustomerStatusFile(raw);
+		} catch (error) {
+			console.error("[email-outreach] 读取每客户开发状态失败", error);
 			return null;
 		}
 	}

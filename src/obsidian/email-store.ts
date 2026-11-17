@@ -37,6 +37,11 @@ export class EmailStore {
 		return this.files.get(path) ?? null;
 	}
 
+	/** 只读快照：生成时间索引等派生计算用，调用方不得修改返回的 file 对象。 */
+	listFiles(): Array<{ path: string; file: CustomerAIFile }> {
+		return Array.from(this.files, ([path, file]) => ({ path, file }));
+	}
+
 	async refresh(): Promise<EmailRow[]> {
 		const dir = this.getDir().trim();
 		this.rows = [];

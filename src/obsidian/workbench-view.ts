@@ -10,6 +10,12 @@ import {
 	type FilterCondition,
 	type FilterOp,
 } from "../core/filters";
+import {
+	describeGenerationFilter,
+	type CustomerGeneration,
+	type GenerationFilter,
+	type GenerationFilterMode,
+} from "../core/generation";
 import type { CustomerRecord } from "../core/types";
 import type { ColumnPreference } from "./settings";
 import type { OutreachPluginApi } from "./plugin-api";
@@ -17,12 +23,12 @@ import {
 	renderCustomerTable,
 	type CustomerColumn,
 	type CustomerRow,
-	type CustomerStatus,
 } from "./table";
 import { renderRunBar, type RunBarHandle } from "./run-bar";
 import { fillContactCounts } from "./contact-counts";
-import { summarizeRunStatuses, statusLabel, statusLevel } from "../core/run-status";
+import { summarizeRunStatuses, statusLabel } from "../core/run-status";
 import { ColumnsModal } from "./modals/columns";
+import { DEV_STATUS_COLUMN_ID, renderDevStatusCell } from "./dev-status-cell";
 
 const DEFAULT_COLUMNS = [
 	"客户类型",
@@ -86,6 +92,9 @@ export class WorkbenchView extends ItemView {
 
 	async onOpen(): Promise<void> {
 		this.render();
+		// 首次启动时 AI 开发信息文件可能还没读完：先画一版，读完再重绘，
+		// 否则「开发状态」会短暂全部显示「从未」。
+		void this.plugin.refreshEmailList().then(() => this.render());
 	}
 
 	async onClose(): Promise<void> {
@@ -127,12 +136,23 @@ export class WorkbenchView extends ItemView {
 		const filterBox = container.createDiv({ cls: "eo-filter-box" });
 		this.renderFilters(filterBox, records);
 
-		const { included } = applyFilters(
+		// 最近生成时间来自 AI 开发信息文件。一次渲染只建一次索引，
+		// 并且必须用全量客户，否则 basename 唯一性判断会失真。
+		const generation = plugin.getGenerationReport();
+		const now = new Date();
+		const { included, excluded, hiddenByGeneration } = applyFilters(
 			records,
 			plugin.settings.builtinFilters,
 			{
 				tags: plugin.settings.excludeTags,
 				progressPrefixes: plugin.settings.excludeProgressPrefixes,
+			},
+			{
+				generation: {
+					filter: plugin.settings.generationFilter,
+					of: (record) => generation.byCustomer.get(record.path),
+					now,
+				},
 			},
 		);
 		const rows: CustomerRow[] = this.sortRows(
@@ -141,6 +161,7 @@ export class WorkbenchView extends ItemView {
 				name: record.name,
 				record,
 			})),
+			generation.byCustomer,
 		);
 
 		// 筛选条件变化后，已经不可见的客户不能继续留在选区里，
@@ -148,7 +169,7 @@ export class WorkbenchView extends ItemView {
 		const selected = plugin.pruneSelection(rows.map((row) => row.key));
 		this.renderRunBanner(container);
 		const tableContainer = container.createDiv({ cls: "eo-table-wrap" });
-		const columns = this.buildColumns(records);
+		const columns = this.buildColumns(records, generation.byCustomer, now);
 		let runBar: RunBarHandle | null = null;
 		const applySelection = (): void => {
 			plugin.setSelected(selected);
@@ -175,7 +196,6 @@ export class WorkbenchView extends ItemView {
 			onOpenContacts: (row) => {
 				void plugin.openContacts(row.record);
 			},
-			status: (row) => this.statusFor(row),
 			sort: this.sortState
 				? { columnId: this.sortState.key, dir: this.sortState.dir }
 				: null,
@@ -203,31 +223,36 @@ export class WorkbenchView extends ItemView {
 		);
 
 		const footer = container.createDiv({ cls: "eo-footer" });
+		const info = footer.createDiv({ cls: "eo-muted eo-workbench-info" });
+		const infoParts = [`共 ${rows.length} 家`];
+		if (hiddenByGeneration > 0) {
+			infoParts.push(`因生成时间隐藏 ${hiddenByGeneration} 家`);
+		}
+		if (excluded.length > 0) infoParts.push(`已排除 ${excluded.length} 家`);
+		if (generation.unmatchedFiles.length > 0) {
+			infoParts.push(
+				`有 ${generation.unmatchedFiles.length} 个 AI 文件无法对应客户`,
+			);
+		}
+		infoParts.push(
+			`筛选：${describeGenerationFilter(plugin.settings.generationFilter)}`,
+		);
+		infoParts.push(
+			`排序：${
+				this.sortState
+					? `${this.sortState.key === DEV_STATUS_COLUMN_ID ? "开发状态" : this.sortState.key} ${this.sortState.dir === 1 ? "升序" : "降序"}`
+					: "默认"
+			}`,
+		);
+		info.setText(infoParts.join(" · "));
 		const taskContainer = footer.createDiv({ cls: "eo-taskbar-container" });
 		runBar = renderRunBar(taskContainer, {
 			selectedCount: selected.size,
+			running: plugin.isRunning(),
 			onRun: () => {
 				void plugin.runTasks(records);
 			},
 		});
-		if (this.sortState) {
-			const hint = footer.createDiv({ cls: "eo-muted eo-sort-hint" });
-			hint.setText(`当前排序：${this.sortState.key} ${this.sortState.dir === 1 ? "升序" : "降序"}`);
-		}
-	}
-
-	private statusFor(row: CustomerRow): CustomerStatus {
-		const status = this.plugin.getCustomerDevStatus(row.record.path);
-		if (status) {
-			return {
-				text: statusLabel(status),
-				level: statusLevel(status),
-				title: status.message,
-			};
-		}
-		return {
-			text: row.record.fm[this.plugin.settings.linkPropertyName] ? "✓" : "—",
-		};
 	}
 
 	private renderRunBanner(container: HTMLElement): void {
@@ -261,10 +286,29 @@ export class WorkbenchView extends ItemView {
 		banner.setText(`上次执行：${parts.join("；")}。`);
 	}
 
-	private sortRows(rows: CustomerRow[]): CustomerRow[] {
+	private sortRows(
+		rows: CustomerRow[],
+		index: Map<string, CustomerGeneration>,
+	): CustomerRow[] {
 		const sort = this.sortState;
 		if (!sort) return rows;
 		const sorted = [...rows];
+		if (sort.key === DEV_STATUS_COLUMN_ID) {
+			// 升序 = 从未 / 最久未生成的在前，正好是「该开发谁」的顺序。
+			const msOf = (row: CustomerRow): number => {
+				const info = index.get(row.record.path);
+				if (!info || info.state === "never") return Number.NEGATIVE_INFINITY;
+				if (info.lastGeneratedMs !== null) return info.lastGeneratedMs;
+				return Number.POSITIVE_INFINITY;
+			};
+			sorted.sort((a, b) => {
+				const left = msOf(a);
+				const right = msOf(b);
+				if (left === right) return a.name.localeCompare(b.name, "zh-CN");
+				return (left < right ? -1 : 1) * sort.dir;
+			});
+			return sorted;
+		}
 		sorted.sort((a, b) => {
 			if (sort.key === "name") {
 				return a.name.localeCompare(b.name, "zh-CN") * sort.dir;
@@ -276,7 +320,11 @@ export class WorkbenchView extends ItemView {
 		return sorted;
 	}
 
-	private buildColumns(records: CustomerRecord[]): CustomerColumn[] {
+	private buildColumns(
+		records: CustomerRecord[],
+		index: Map<string, CustomerGeneration>,
+		now: Date,
+	): CustomerColumn[] {
 		const preferences = this.plugin.settings.builtinColumns;
 		const keys = preferences
 			? preferences.filter((item) => item.visible).map((item) => item.key)
@@ -301,6 +349,17 @@ export class WorkbenchView extends ItemView {
 					return link;
 				},
 			},
+			{
+				id: DEV_STATUS_COLUMN_ID,
+				label: "开发状态",
+				width: 180,
+				title:
+					"主行：最近一次有效生成的时间（来自 AI 开发信息文件）\n" +
+					"副行：上次未解决的提醒（无可用联系人 / 未找到合适联系人 / 上次失败）\n" +
+					"点击单元格查看这个客户的开发邮件；点表头排序",
+				render: (row) =>
+					renderDevStatusCell(row, this.plugin, index, now),
+			},
 		];
 		for (const key of keys) {
 			if (key === "name") continue;
@@ -312,6 +371,77 @@ export class WorkbenchView extends ItemView {
 			});
 		}
 		return columns;
+	}
+
+	/** 「最近生成」筛选：与属性条件相互独立（AND），两个视图共用同一份设置。 */
+	private renderGenerationRow(box: HTMLElement): void {
+		const plugin = this.plugin;
+		const filter = plugin.settings.generationFilter;
+		const row = box.createDiv({ cls: "eo-filter-row eo-filter-generation" });
+		row.createSpan({ cls: "eo-filter-label", text: "最近生成" });
+
+		const modeSelect = row.createEl("select", {
+			attr: { "aria-label": "最近生成筛选" },
+		});
+		const modes: Array<[GenerationFilterMode, string]> = [
+			["off", "不限"],
+			["stale", "≥ N 天未生成"],
+			["fresh", "N 天内生成过"],
+			["never", "从未生成"],
+		];
+		for (const [value, label] of modes) {
+			modeSelect.createEl("option", { value, text: label });
+		}
+		modeSelect.value = filter.mode;
+		modeSelect.addEventListener("change", () => {
+			filter.mode = modeSelect.value as GenerationFilterMode;
+			void plugin.saveSettings();
+			this.render();
+		});
+
+		if (filter.mode === "stale" || filter.mode === "fresh") {
+			const daysInput = row.createEl("input", {
+				type: "number",
+				value: String(filter.days),
+				cls: "eo-generation-days",
+				attr: { min: "0.5", step: "0.5", "aria-label": "天数" },
+			});
+			daysInput.addEventListener("change", () => {
+				const parsed = Number(daysInput.value);
+				filter.days = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+				void plugin.saveSettings();
+				this.render();
+			});
+			row.createSpan({ text: "天" });
+		}
+
+		if (filter.mode === "stale") {
+			const label = row.createEl("label", { cls: "eo-filter-excluded" });
+			const checkbox = label.createEl("input", { type: "checkbox" });
+			checkbox.checked = filter.includeNever;
+			checkbox.addEventListener("change", () => {
+				filter.includeNever = checkbox.checked;
+				void plugin.saveSettings();
+				this.render();
+			});
+			label.createSpan({ text: "包含从未生成" });
+		}
+
+		const quick = row.createDiv({ cls: "eo-filter-presets eo-generation-presets" });
+		const addQuick = (label: string, next: GenerationFilter): void => {
+			quick.createEl("button", { text: label }).addEventListener("click", () => {
+				plugin.settings.generationFilter = { ...next };
+				void plugin.saveSettings();
+				this.render();
+			});
+		};
+		addQuick("今日待开发", { mode: "stale", days: 1, includeNever: true });
+		addQuick("24h 内已生成", { mode: "fresh", days: 1, includeNever: true });
+		addQuick("不限", { mode: "off", days: 1, includeNever: true });
+		row.createSpan({
+			cls: "eo-muted",
+			text: "（由 AI 开发信息文件推导，Base 原生筛选看不到）",
+		});
 	}
 
 	private renderFilters(
@@ -330,6 +460,14 @@ export class WorkbenchView extends ItemView {
 				.createEl("button", { text: label })
 				.addEventListener("click", () => {
 					config.conditions = condition ? [condition] : [];
+					// 「清空」同时把生成时间筛选恢复为「不限」。
+					if (!condition) {
+						plugin.settings.generationFilter = {
+							mode: "off",
+							days: 1,
+							includeNever: true,
+						};
+					}
 					void plugin.saveSettings();
 					this.render();
 				});
@@ -353,6 +491,8 @@ export class WorkbenchView extends ItemView {
 			this.render();
 		});
 		showExcludedLabel.createSpan({ text: "显示已排除（公海/共享等）" });
+
+		this.renderGenerationRow(box);
 
 		const conditionsEl = box.createDiv({ cls: "eo-filter-conditions" });
 		config.conditions.forEach((condition, index) => {

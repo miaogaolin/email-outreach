@@ -391,6 +391,25 @@ export class EmailOutreachSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("重复生成保护（小时）")
+			.setDesc(
+				"勾选客户中，N 小时内已生成过有效邮件的默认跳过；0 表示关闭。",
+			)
+			.addText((text) =>
+				text
+					.setValue(String(this.host.settings.generateCooldownHours))
+					.onChange(async (value) => {
+						const raw = value.trim();
+						const parsed = raw === "" ? Number.NaN : Number(raw);
+						this.host.settings.generateCooldownHours =
+							Number.isFinite(parsed) && parsed >= 0 && parsed <= 720
+								? Math.round(parsed)
+								: 24;
+						await this.host.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
 			.setName("验收时写入客户双链")
 			.addToggle((toggle) =>
 				toggle

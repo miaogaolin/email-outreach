@@ -1,4 +1,5 @@
 import type { FilterConfig } from "../core/filters";
+import type { GenerationFilter } from "../core/generation";
 import {
 	DEFAULT_EMAIL_SYSTEM_PROMPT,
 	DEFAULT_RULE_SYSTEM_PROMPT,
@@ -32,6 +33,10 @@ export interface Settings {
 	// Filtering
 	excludeTags: string[];
 	excludeProgressPrefixes: string[];
+	/** 生成前冷却窗口（小时）；0 表示关闭。 */
+	generateCooldownHours: number;
+	/** 工作台「最近生成」筛选；两个视图共用。 */
+	generationFilter: GenerationFilter;
 
 	// Writing
 	linkPropertyName: string;
@@ -73,6 +78,8 @@ export const DEFAULT_SETTINGS: Settings = {
 
 	excludeTags: ["公海", "共享"],
 	excludeProgressPrefixes: [],
+	generateCooldownHours: 24,
+	generationFilter: { mode: "off", days: 1, includeNever: true },
 
 	linkPropertyName: "AI开发信息",
 	writeCustomerLink: true,
