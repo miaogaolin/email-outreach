@@ -72,7 +72,7 @@ npm run build          # 生成 main.js
 
 1. 更新 `manifest.json` 的 `version`，并把同一版本写进 `versions.json`（`"版本": "minAppVersion"`）。
 2. `npm run test && npm run build`，提交。
-3. `git tag 0.2.0 && git push origin main --tags`（tag 必须与 `manifest.json` 的 `version` 一致，允许 `v` 前缀）。
+3. `git tag 0.2.1 && git push origin main --tags`（tag 必须与 `manifest.json` 的 `version` 一致，允许 `v` 前缀；已发布过的 tag 不能复用）。
 4. GitHub Actions（`.github/workflows/release.yml`）在 tag 上执行 typecheck/test/build，创建 Release 并上传 `main.js`、`manifest.json`、`styles.css`；BRAT 读取最新 Release。
 
 ## 首次配置
