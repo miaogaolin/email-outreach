@@ -100,6 +100,23 @@ test("上次记录已生成但文件缺失", () => {
 	);
 });
 
+test("显式清空的 AI 文件：主行回退到从未，不再提示文件缺失", () => {
+	const emptyFile: CustomerGeneration = {
+		...NEVER_GENERATION,
+		state: "never",
+		filePath: "输出/Acme - AI开发信息.md",
+	};
+	const view = describeDevState(
+		emptyFile,
+		attempt("generated", NOW_MS - HOUR),
+		NOW,
+	);
+	assertEqual(view.text, "从未", "主行回退");
+	assertEqual(view.detail, null, "没有文件缺失副行");
+	assertEqual(view.level, "none", "中性色");
+	assert(view.title.includes("没有邮件"), "tooltip 说明已清空");
+});
+
 test("全部已拒绝显示已拒绝", () => {
 	const view = describeDevState(
 		{ ...NEVER_GENERATION, state: "known", allRejected: true, totalEmailCount: 1 },

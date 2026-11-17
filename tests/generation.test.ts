@@ -176,6 +176,17 @@ test("AI 文件存在但解析不出邮件 → unknown", () => {
 	assertEqual(summarizeGeneration([], false).state, "never", "没有文件 → never");
 });
 
+test("email_count: 0 的显式空文件 → never", () => {
+	const info = summarizeGeneration([], true, 0);
+	assertEqual(info.state, "never", "回到从未");
+	assertEqual(info.totalEmailCount, 0, "没有邮件");
+	assertEqual(
+		summarizeGeneration([], true, null).state,
+		"unknown",
+		"旧文件缺少声明时仍按无法解析处理",
+	);
+});
+
 test("pendingCount 只数 Generated", () => {
 	const info = summarizeGeneration(
 		[
@@ -363,6 +374,31 @@ test("命中文件但没有邮件块 → unknown，并保留 filePath", () => {
 	assertEqual(info.state, "unknown", "unknown");
 	assertEqual(info.filePath, "输出/Acme - AI开发信息.md", "filePath 保留");
 	assertEqual(info.pendingCount, 0, "没有待审");
+});
+
+test("email_count: 0 的显式空文件命中客户 → never，并保留 filePath", () => {
+	const index = buildGenerationIndex(
+		[
+			{
+				path: "输出/Acme - AI开发信息.md",
+				customerLink: "客户/Acme",
+				emails: [],
+				declaredEmailCount: 0,
+			},
+		],
+		[customer("客户/Acme.md", "Acme")],
+	);
+	const info = index.byCustomer.get("客户/Acme.md")!;
+	assertEqual(info.state, "never", "回到从未");
+	assertEqual(info.filePath, "输出/Acme - AI开发信息.md", "filePath 保留");
+	assert(
+		matchesGenerationFilter(
+			info,
+			{ mode: "never", days: 1, includeNever: true },
+			NOW,
+		),
+		"筛选里算从未生成",
+	);
 });
 
 suite("generation filter");

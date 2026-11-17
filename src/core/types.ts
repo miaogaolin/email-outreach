@@ -190,6 +190,8 @@ export interface CustomerAIFile {
 	customerLink: string;
 	updated: string;
 	emailCount: number;
+	/** frontmatter 里声明的 email_count；旧文件没有该字段时为 null。 */
+	declaredEmailCount: number | null;
 	lastStatus: string;
 	analysis: AnalysisRecord | null;
 	analysisHistory: string[];

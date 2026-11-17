@@ -169,6 +169,7 @@ export function formatDateOnly(ms: number): string {
 export function summarizeGeneration(
 	emails: EmailRecord[],
 	hasAIFile: boolean,
+	declaredEmailCount: number | null = null,
 ): CustomerGeneration {
 	const totalEmailCount = emails.length;
 	let lastGeneratedAt: string | null = null;
@@ -196,8 +197,18 @@ export function summarizeGeneration(
 		}
 	}
 	const allRejected = totalEmailCount > 0 && rejected === totalEmailCount;
+	// `email_count: 0` 是插件删除全部邮件后写回的显式空文件，不能当成
+	// 「文件存在但解析不出邮件」的 unknown，否则开发状态不会回退。
+	const explicitlyEmpty =
+		totalEmailCount === 0 && hasAIFile && declaredEmailCount === 0;
 	const state: GenerationState =
-		totalEmailCount > 0 ? "known" : hasAIFile ? "unknown" : "never";
+		totalEmailCount > 0
+			? "known"
+			: explicitlyEmpty
+				? "never"
+				: hasAIFile
+					? "unknown"
+					: "never";
 	return {
 		state,
 		lastGeneratedAt,
@@ -217,6 +228,8 @@ export interface GenerationFileInput {
 	path: string;
 	customerLink: string;
 	emails: EmailRecord[];
+	/** frontmatter 声明的 email_count；旧文件或调用方没传时为 null。 */
+	declaredEmailCount?: number | null;
 }
 
 export interface GenerationCustomerInput {
@@ -329,10 +342,23 @@ export function buildGenerationIndex(
 
 	for (const [customerPath, customerFiles] of matched) {
 		const emails = customerFiles.flatMap((file) => file.emails);
-		const info = summarizeGeneration(emails, true);
+		// 同一客户的所有 AI 文件都声明 0 封邮件时，才是显式清空；
+		// 只要有一个文件可能损坏，仍按 unknown 处理。
+		const declaredEmpty =
+			customerFiles.length > 0 &&
+			customerFiles.every((file) => file.declaredEmailCount === 0);
+		const info = summarizeGeneration(
+			emails,
+			true,
+			declaredEmpty ? 0 : null,
+		);
 		let best: { path: string; ms: number } | null = null;
 		for (const file of customerFiles) {
-			const summary = summarizeGeneration(file.emails, true);
+			const summary = summarizeGeneration(
+				file.emails,
+				true,
+				file.declaredEmailCount ?? null,
+			);
 			if (summary.lastGeneratedMs === null) continue;
 			if (!best || summary.lastGeneratedMs > best.ms) {
 				best = { path: file.path, ms: summary.lastGeneratedMs };
@@ -466,7 +492,12 @@ export function formatGenerationAge(
 export function generationTooltip(
 	info: CustomerGeneration | undefined,
 ): string {
-	if (!info || info.state === "never") return "从未生成开发邮件";
+	if (!info) return "从未生成开发邮件";
+	if (info.state === "never") {
+		return info.filePath
+			? "AI 开发信息文件里没有邮件（可能已全部删除）"
+			: "从未生成开发邮件";
+	}
 	if (info.state === "unknown") {
 		return "AI 开发信息文件存在，但无法解析出邮件块";
 	}

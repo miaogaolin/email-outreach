@@ -47,11 +47,19 @@ const META_RE = /^-\s+([A-Za-z_][\w]*)\s*:\s?(.*)$/;
 const SECTION_RE = /^####\s+(Subject|Body|修改历史)\s*$/;
 const H2_RE = /^##\s+/;
 
+/** frontmatter 声明的 email_count；缺失或非法时返回 null，交给解析结果判断。 */
+function parseDeclaredEmailCount(value: string | undefined): number | null {
+	if (value === undefined) return null;
+	const parsed = Number(value.trim());
+	return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
 export function emptyCustomerAIFile(customerLink: string): CustomerAIFile {
 	return {
 		customerLink,
 		updated: isoNow(),
 		emailCount: 0,
+		declaredEmailCount: 0,
 		lastStatus: "",
 		analysis: null,
 		analysisHistory: [],
@@ -491,6 +499,7 @@ export function parseCustomerAIFile(content: string): ParsedAIFile {
 	const { frontmatter, bodyStart } = parseFrontmatter(lines, warnings);
 
 	const customerLink = parseSingleWikilink(frontmatter["customer"]) ?? "";
+	const declaredEmailCount = parseDeclaredEmailCount(frontmatter["email_count"]);
 	const extraFrontmatter: Record<string, string> = {};
 	const knownFrontmatter = new Set([
 		"type",
@@ -554,6 +563,7 @@ export function parseCustomerAIFile(content: string): ParsedAIFile {
 			customerLink,
 			updated: frontmatter["updated"] ?? "",
 			emailCount: emails.length,
+			declaredEmailCount,
 			lastStatus,
 			analysis,
 			analysisHistory: history,
@@ -899,6 +909,7 @@ export function appendEmailsToContent(
 		file.lastStatus = withId.status;
 	}
 	file.emailCount = file.emails.length;
+	file.declaredEmailCount = file.emails.length;
 	file.updated = isoNow();
 	return renderCustomerAIFile(file);
 }
@@ -956,6 +967,7 @@ export function removeEmailsFromContent(
 
 	parsed.file.emails = remaining;
 	parsed.file.emailCount = remaining.length;
+	parsed.file.declaredEmailCount = remaining.length;
 	parsed.file.lastStatus = remaining[remaining.length - 1]?.status ?? "";
 	parsed.file.updated = isoNow();
 	return { content: renderCustomerAIFile(parsed.file), removed, missing };
@@ -975,6 +987,7 @@ export function updateEmailInContent(
 		email.id === record.id ? record : email,
 	);
 	file.emailCount = file.emails.length;
+	file.declaredEmailCount = file.emails.length;
 	file.lastStatus = record.status;
 	file.updated = isoNow();
 	return renderCustomerAIFile(file);

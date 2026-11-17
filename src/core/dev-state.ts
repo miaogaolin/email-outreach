@@ -82,6 +82,9 @@ export function describeDevState(
 	let detail: string | null = null;
 	let detailLevel: CustomerDevView["detailLevel"] = null;
 	const titleLines = [generationTooltip(info)];
+	// `email_count: 0` 的显式空文件不是「文件缺失」，不要吓用户。
+	const explicitlyEmptyFile =
+		info?.state === "never" && Boolean(info.filePath);
 
 	if (attempt) {
 		const atMs = parseGenerationTime(attempt.at);
@@ -89,7 +92,7 @@ export function describeDevState(
 			? `上次尝试：${(attempt.at ?? "").trim() || "时间未知"} · ${attemptLabel(attempt)}`
 			: `上次尝试：${formatGenerationDate(atMs)} · ${attemptLabel(attempt)}`;
 
-		if (!hasGeneration && attempt.kind === "generated") {
+		if (!explicitlyEmptyFile && !hasGeneration && attempt.kind === "generated") {
 			// AI 文件被删 / 移走 / 损坏，但记录说生成过：提示，并让冷却继续生效。
 			detail = attemptDetail(attempt, "上次已生成但文件缺失", atMs, now);
 			detailLevel = "warn";

@@ -222,6 +222,8 @@ export default class EmailOutreachPlugin
 		} catch (error) {
 			console.error("[email-outreach] 初始加载邮件失败", error);
 		}
+		// 修复历史空文件留下的「上次已生成」：启动时按当前文件状态清一次。
+		await this.clearStaleGeneratedStatuses();
 	}
 
 	private initializeServices(): void {
@@ -555,6 +557,7 @@ export default class EmailOutreachPlugin
 				path,
 				customerLink: file.customerLink,
 				emails: file.emails,
+				declaredEmailCount: file.declaredEmailCount,
 			})),
 			customers.map((record) =>
 				customerGenerationInput(record, this.settings.linkPropertyName),
@@ -1291,6 +1294,7 @@ export default class EmailOutreachPlugin
 		}
 
 		await this.refreshEmailList();
+		await this.clearStaleGeneratedStatuses(byFile.keys());
 		this.refreshWorkbenchViews();
 
 		const parts = [`已删除 ${removed} 封邮件`];
@@ -1301,6 +1305,36 @@ export default class EmailOutreachPlugin
 			);
 		}
 		new Notice(parts.join("；"), failures.length > 0 ? 9000 : undefined);
+	}
+
+	/**
+	 * 邮件删空后，「上次已生成」不再成立：清掉该客户的 generated 记录，
+	 * 让开发状态回到「从未」，也避免生成冷却继续用旧记录兜底。
+	 * 只处理 `email_count: 0` 的显式空文件；unknown（可能损坏）保留提醒。
+	 */
+	private async clearStaleGeneratedStatuses(
+		aiFilePaths?: Iterable<string>,
+	): Promise<void> {
+		try {
+			const report = this.getGenerationReport(this.repo.list());
+			const touched = aiFilePaths ? new Set(aiFilePaths) : null;
+			const cleared: string[] = [];
+			for (const [customerPath, info] of report.byCustomer) {
+				if (info.totalEmailCount > 0) continue;
+				// state === "never" + filePath 表示文件存在且声明了 0 封邮件。
+				if (info.state !== "never" || !info.filePath) continue;
+				if (touched && !touched.has(info.filePath)) continue;
+				if (this.devStatus[customerPath]?.kind !== "generated") continue;
+				cleared.push(customerPath);
+			}
+			if (cleared.length === 0) return;
+			for (const customerPath of cleared) {
+				delete this.devStatus[customerPath];
+			}
+			await this.state.saveCustomerStatuses(this.devStatus);
+		} catch (error) {
+			console.error("[email-outreach] 清理旧的生成状态失败", error);
+		}
 	}
 
 	/** 读取邮件对应当前联系人的 `#Contact/...` 渠道；失败时只返回空数组。 */

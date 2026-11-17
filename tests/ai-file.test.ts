@@ -37,6 +37,7 @@ test("append + parse keeps every field", () => {
 	const parsed = parseCustomerAIFile(content);
 	assertEqual(parsed.file.customerLink, "Gallaway Safety & Supply", "客户双链");
 	assertEqual(parsed.file.emails.length, 1, "一封邮件");
+	assertEqual(parsed.file.declaredEmailCount, 1, "frontmatter 声明的邮件数");
 	const email = parsed.file.emails[0]!;
 	assertEqual(email.id, "001", "邮件 ID");
 	assertEqual(email.contact, "Kim Lucas 采购", "联系人");
@@ -328,6 +329,7 @@ test("删除全部邮件：保留 AI 文件、双链与用户内容", () => {
 	assertEqual(parsed.file.emails.length, 0, "没有邮件块");
 	assertEqual(parsed.file.customerLink, "G", "客户双链保留");
 	assertEqual(parsed.file.emailCount, 0, "email_count: 0");
+	assertEqual(parsed.file.declaredEmailCount, 0, "frontmatter 声明 0 封");
 	assertEqual(parsed.file.lastStatus, "", "last_status 为空");
 	assert(result.content.includes('customer: "[[G]]"'), "frontmatter 双链仍在");
 	assert(result.content.includes("## 邮件"), "邮件区段标题仍在");
