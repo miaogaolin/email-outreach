@@ -8,6 +8,7 @@ import {
 	nextEmailId,
 	parseCustomerAIFile,
 	parseEmailStatus,
+	removeEmailsFromContent,
 	renderCustomerAIFile,
 } from "../src/core/ai-file";
 import { EMAIL_STATUSES } from "../src/core/types";
@@ -279,3 +280,77 @@ test("trailing user content is preserved", () => {
 	const rendered = renderCustomerAIFile(parsed.file);
 	assert(rendered.includes("下周再跟进"), "重新渲染仍保留");
 });
+
+suite("email deletion");
+
+function twoEmails(): string {
+	let content = appendEmailToContent(null, "G", record());
+	return appendEmailToContent(
+		content,
+		"G",
+		record({
+			contactRaw: "Colin Gallaway 老板",
+			email: "colin@gallawaysafety.com",
+			subject: "Second subject",
+			body: "Second body",
+		}),
+	);
+}
+
+test("删除指定邮件：其余邮件保留，计数/状态刷新，ID 不重排", () => {
+	const content =
+		twoEmails() + "\n## 我的备注\n\n- 下周再跟进\n";
+	const result = removeEmailsFromContent(content, ["001"]);
+	assertEqual(result.removed, ["001"], "实际删除 001");
+	assertEqual(result.missing, [], "没有缺失 ID");
+
+	const parsed = parseCustomerAIFile(result.content);
+	assertEqual(
+		parsed.file.emails.map((email) => email.id),
+		["002"],
+		"只剩 002，不重排",
+	);
+	assertEqual(parsed.file.emails[0]!.subject, "Second subject", "剩余邮件内容不变");
+	assertEqual(parsed.file.emailCount, 1, "email_count 刷新");
+	assert(result.content.includes("email_count: 1"), "frontmatter 计数写回");
+	assert(result.content.includes("last_status: Generated"), "last_status 指向剩余邮件");
+	assert(result.content.includes("下周再跟进"), "用户 trailing 保留");
+	assertEqual(nextEmailId(parsed.file.emails), "003", "下一封仍按最大 ID + 1");
+});
+
+test("删除全部邮件：保留 AI 文件、双链与用户内容", () => {
+	const content =
+		twoEmails() + "\n## 我的备注\n\n- 下周再跟进\n";
+	const result = removeEmailsFromContent(content, ["001", "002"]);
+	assertEqual(result.removed, ["001", "002"], "两封都删掉");
+
+	const parsed = parseCustomerAIFile(result.content);
+	assertEqual(parsed.file.emails.length, 0, "没有邮件块");
+	assertEqual(parsed.file.customerLink, "G", "客户双链保留");
+	assertEqual(parsed.file.emailCount, 0, "email_count: 0");
+	assertEqual(parsed.file.lastStatus, "", "last_status 为空");
+	assert(result.content.includes('customer: "[[G]]"'), "frontmatter 双链仍在");
+	assert(result.content.includes("## 邮件"), "邮件区段标题仍在");
+	assert(result.content.includes("下周再跟进"), "用户 trailing 保留");
+});
+
+test("找不到的 ID 不改内容，返回 missing", () => {
+	const content = twoEmails();
+	const result = removeEmailsFromContent(content, ["999"]);
+	assertEqual(result.removed, [], "没有删除");
+	assertEqual(result.missing, ["999"], "报告 missing");
+	assertEqual(result.content, content, "内容原样返回，调用方跳过写盘");
+});
+
+test("空白与重复 ID 先去重，再按文件顺序删除", () => {
+	const content = twoEmails();
+	const result = removeEmailsFromContent(content, [" 002 ", "002", ""]);
+	assertEqual(result.removed, ["002"], "只删一次");
+	assertEqual(result.missing, [], "没有缺失 ID");
+	assertEqual(
+		parseCustomerAIFile(result.content).file.emails.map((email) => email.id),
+		["001"],
+		"001 保留",
+	);
+});
+

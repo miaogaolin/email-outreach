@@ -21,6 +21,14 @@ export interface ParsedAIFile {
 	blocks: ParsedEmailBlock[];
 }
 
+export interface RemoveEmailsResult {
+	content: string;
+	/** 实际删除的邮件 ID，按文件内顺序。 */
+	removed: string[];
+	/** 入参里有、但文件里找不到的 ID，按入参顺序。 */
+	missing: string[];
+}
+
 const EMAIL_HEADING_RE =
 	/^###\s+邮件\s+([0-9A-Za-z_-]+)\s*·\s*(.*)\s*·\s*(Generated|Revision|Accepted|Rejected)\s*$/;
 
@@ -901,6 +909,56 @@ export function appendEmailToContent(
 	record: EmailRecord,
 ): string {
 	return appendEmailsToContent(content, customerLink, [record]);
+}
+
+/**
+ * 永久删除 AI 开发信息文件里的邮件块。
+ *
+ * - 只动 `## 邮件` 区段；frontmatter、AI 分析、trailing（发送提醒 / 用户备注）原样保留；
+ * - `email_count` / `last_status` / `updated` 按剩余邮件重新计算；
+ * - 删除后不重排剩余 ID，避免 `## 发送提醒` 的 `<!-- eo-reminder: ID -->` 失效；
+ * - 一个都没命中时原样返回 content，调用方可以据此跳过写盘。
+ */
+export function removeEmailsFromContent(
+	content: string,
+	ids: Iterable<string>,
+): RemoveEmailsResult {
+	const wanted: string[] = [];
+	const wantedSet = new Set<string>();
+	for (const raw of ids) {
+		const id = (raw ?? "").trim();
+		if (!id || wantedSet.has(id)) continue;
+		wantedSet.add(id);
+		wanted.push(id);
+	}
+	if (wantedSet.size === 0) {
+		return { content, removed: [], missing: [] };
+	}
+
+	const parsed = parseCustomerAIFile(content);
+	const removed: string[] = [];
+	const removedSet = new Set<string>();
+	const remaining: EmailRecord[] = [];
+	for (const email of parsed.file.emails) {
+		if (wantedSet.has(email.id)) {
+			// 同一 ID 理论上只有一个块；文件被手改出重复 ID 时也一并删掉，
+			// 但 removed 只记一次，避免调用方把一封邮件算成多封。
+			if (!removedSet.has(email.id)) removed.push(email.id);
+			removedSet.add(email.id);
+			continue;
+		}
+		remaining.push(email);
+	}
+	const missing = wanted.filter((id) => !removedSet.has(id));
+	if (removed.length === 0) {
+		return { content, removed, missing };
+	}
+
+	parsed.file.emails = remaining;
+	parsed.file.emailCount = remaining.length;
+	parsed.file.lastStatus = remaining[remaining.length - 1]?.status ?? "";
+	parsed.file.updated = isoNow();
+	return { content: renderCustomerAIFile(parsed.file), removed, missing };
 }
 
 export function updateEmailInContent(

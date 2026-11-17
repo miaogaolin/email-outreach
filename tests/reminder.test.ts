@@ -2,6 +2,7 @@ import {
 	appendEmailToContent,
 	createEmailRecord,
 	parseCustomerAIFile,
+	removeEmailsFromContent,
 	renderCustomerAIFile,
 	updateEmailInContent,
 } from "../src/core/ai-file";
@@ -196,5 +197,28 @@ test("用户 trailing 位于提醒区段之前时不会被重排丢内容", () =
 		withReminder.indexOf("## 我的备注") <
 			withReminder.indexOf("## 发送提醒"),
 		"用户内容在前，提醒在后",
+	);
+});
+
+test("删除邮件后清理同一 ID 的发送提醒", () => {
+	let content = emailContent();
+	content = upsertEmailReminderInContent(content, buildEmailReminder(input())!);
+	assert(content.includes("eo-reminder: 001"), "提醒已写入");
+
+	const removed = removeEmailsFromContent(content, ["001"]);
+	assertEqual(removed.removed, ["001"], "邮件已删除");
+	assertEqual(parseCustomerAIFile(removed.content).file.emails.length, 0, "没有邮件块");
+
+	const cleaned = removeEmailReminderFromContent(removed.content, "001");
+	assert(!cleaned.includes("eo-reminder: 001"), "提醒标记删除");
+	assert(!cleaned.includes("## 发送提醒"), "删空后移除提醒区段标题");
+	assert(
+		cleaned.includes('customer: "[[Airgas Store]]"'),
+		"AI 文件与客户双链保留",
+	);
+	assertEqual(
+		parseCustomerAIFile(cleaned).file.emails.length,
+		0,
+		"清理提醒后仍可解析",
 	);
 });

@@ -2,12 +2,15 @@ import { App } from "obsidian";
 import {
 	appendEmailToContent,
 	parseCustomerAIFile,
+	removeEmailsFromContent,
 	updateEmailInContent,
 } from "../core/ai-file";
+import type { RemoveEmailsResult } from "../core/ai-file";
 import {
 	AI_FILE_SUFFIX,
 	customerNameFromAIFile,
 } from "../core/filenames";
+import { removeEmailReminderFromContent } from "../core/reminder";
 import type {
 	CustomerAIFile,
 	EmailRecord,
@@ -124,6 +127,26 @@ export class EmailStore {
 		const updated = appendEmailToContent(content, customerLink, record);
 		await this.adapter.write(path, updated);
 		await this.refresh();
+	}
+
+	/**
+	 * 永久删除 AI 文件里的邮件块，并在同一次写盘里移除对应发送提醒。
+	 * 一个都没命中时不重写文件；找不到的 ID 通过 missing 返回。
+	 */
+	async removeRecords(
+		path: string,
+		ids: string[],
+	): Promise<RemoveEmailsResult> {
+		const content = await this.adapter.read(path);
+		const result = removeEmailsFromContent(content, ids);
+		if (result.removed.length === 0) return result;
+		let updated = result.content;
+		for (const id of result.removed) {
+			updated = removeEmailReminderFromContent(updated, id);
+		}
+		await this.adapter.write(path, updated);
+		await this.refresh();
+		return result;
 	}
 
 	rowsForCustomer(customerPath: string): EmailRow[] {
