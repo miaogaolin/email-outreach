@@ -23,9 +23,9 @@ const contact_parser_1 = require("src/core/contact-parser.ts");
 const filters_1 = require("src/core/filters.ts");
 const generation_1 = require("src/core/generation.ts");
 const filenames_1 = require("src/core/filenames.ts");
-const follow_up_1 = require("src/core/follow-up.ts");
 const language_1 = require("src/core/language.ts");
 const prompt_1 = require("src/core/prompt.ts");
+const reminder_1 = require("src/core/reminder.ts");
 const run_status_1 = require("src/core/run-status.ts");
 const schema_1 = require("src/core/schema.ts");
 const selection_1 = require("src/core/selection.ts");
@@ -621,7 +621,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
                             text: "只为有邮箱且适合的联系人生成，一个客户可能生成多封（最多 5 封）",
                         });
                         list.createEl("li", {
-                            text: "发送时间按客户地区时区、跟进次数和已发送记录自动计算",
+                            text: "发送时间按客户地区时区、跟进次数和最近联系时间自动计算",
                         });
                         list.createEl("li", {
                             text: "没有可用联系人的客户不会调用 AI，并会在列表里标记",
@@ -761,18 +761,14 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
     }
     // -------------------------------------------------------------- email flow
     async saveEmailEdit(row, subject, body) {
-        if (row.record.sent) {
-            new obsidian_1.Notice("这封邮件已标记为已发送，不能再修改");
-            return;
-        }
         const updated = (0, ai_file_1.addEmailVersion)(row.record, {
             subject,
             body,
             action: "Edited",
             comment: "手动修改",
-            status: "Revision",
+            status: "Generated",
         });
-        await this.emailStore.saveRecord(row.filePath, updated);
+        await this.emailStore.saveRecord(row.filePath, updated, this.reminderRemoval(row.record.id));
         new obsidian_1.Notice("已保存为新版本");
         await this.refreshEmailList();
     }
@@ -780,10 +776,6 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         const report = (step, detail, fraction) => {
             onProgress === null || onProgress === void 0 ? void 0 : onProgress({ step, detail, fraction });
         };
-        if (row.record.sent) {
-            new obsidian_1.Notice("已发送的邮件不能重新生成");
-            return false;
-        }
         const problems = (0, settings_1.getConfigProblems)(this.settings);
         if (problems.length > 0) {
             new obsidian_1.Notice(problems.map((problem) => problem.message).join("\n"));
@@ -796,10 +788,6 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         const record = parsed.file.emails.find((item) => item.id === row.record.id);
         if (!record)
             throw new Error("AI 文件中找不到这封邮件");
-        if (record.sent) {
-            new obsidian_1.Notice("已发送的邮件不能重新生成");
-            return false;
-        }
         const version = (0, ai_file_1.currentEmailVersion)(record);
         report("准备客户资料", `已保存版本 v${version} · ${record.subject || "（无 Subject）"}`, 0.12);
         const customer = await this.resolveCustomer(row.filePath, parsed.file.customerLink);
@@ -880,7 +868,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             body: draft.body,
             action: "Revised",
             comment: comment.trim() || "重新生成",
-            status: "Revision",
+            status: "Generated",
         });
         updated = {
             ...updated,
@@ -894,7 +882,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             timeReason: plan.timeReason,
         };
         report("写入输出目录", row.filePath, 0.95);
-        await this.emailStore.saveRecord(row.filePath, updated);
+        await this.emailStore.saveRecord(row.filePath, updated, this.reminderRemoval(record.id));
         report("完成", `已写入 v${(0, ai_file_1.currentEmailVersion)(updated)}`, 1);
         new obsidian_1.Notice("已生成新版本");
         await this.refreshEmailList();
@@ -918,6 +906,19 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
                 existingLink = String(existing);
             }
         }
+        const channels = await this.loadContactChannels(customer, row);
+        const reminder = (0, reminder_1.buildEmailReminder)({
+            customerName: row.customerName,
+            emailId: row.record.id,
+            aiFilePath: row.filePath,
+            contact: row.record.contact,
+            email: row.record.email,
+            subject: row.record.subject,
+            summaryZh: row.record.summaryZh,
+            suggestedTime: row.record.suggestedTime,
+            timezone: row.record.timezone,
+            channels,
+        });
         const confirmed = await (0, confirm_1.confirm)(this.app, {
             title: "验收通过",
             confirmText: "确认验收",
@@ -925,6 +926,23 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
                 container.createEl("p", {
                     text: "验收通过代表邮件内容审核通过，不代表已经发送。",
                 });
+                if (reminder) {
+                    container.createEl("p", {
+                        text: `会在 AI 开发信息文件生成发送提醒（北京时间 ${reminder.time}）。`,
+                    });
+                    if (channels.length > 0) {
+                        container.createEl("p", {
+                            cls: "eo-muted",
+                            text: `联系人带 ${channels.length} 个 #Contact 渠道，会一起写入提醒。`,
+                        });
+                    }
+                }
+                else {
+                    container.createEl("p", {
+                        cls: "eo-muted",
+                        text: "这封邮件没有可用的建议发送时间，本次不会生成发送提醒。",
+                    });
+                }
                 if (willWriteLink && customer) {
                     container.createEl("p", {
                         text: `会把客户属性「${propertyName}」写为 ${(0, wikilinks_1.toWikilink)(linkPath)}。`,
@@ -947,89 +965,79 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         if (!confirmed)
             return;
         const updated = (0, ai_file_1.setEmailStatus)(row.record, "Accepted");
-        await this.emailStore.saveRecord(row.filePath, updated);
+        let reminderError = null;
+        const transform = reminder
+            ? (content) => {
+                try {
+                    return (0, reminder_1.upsertEmailReminderInContent)(content, reminder);
+                }
+                catch (error) {
+                    reminderError =
+                        error instanceof Error ? error.message : String(error);
+                    console.error("[email-outreach] 写入发送提醒失败", error);
+                    return content;
+                }
+            }
+            : this.reminderRemoval(row.record.id);
+        await this.emailStore.saveRecord(row.filePath, updated, transform);
+        const messages = ["已验收"];
         if (willWriteLink && customer) {
             try {
                 await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
                     frontmatter[propertyName] = (0, wikilinks_1.toWikilink)(linkPath);
                 });
-                new obsidian_1.Notice(`已验收，并写入客户属性「${propertyName}」`);
+                messages.push(`已写入客户属性「${propertyName}」`);
             }
             catch (error) {
-                new obsidian_1.Notice(`邮件已验收，但写客户属性失败：${error instanceof Error ? error.message : String(error)}`, 9000);
+                messages.push(`写客户属性失败：${error instanceof Error ? error.message : String(error)}`);
             }
         }
-        else {
-            new obsidian_1.Notice("已验收");
+        if (!reminder) {
+            messages.push("没有可用的建议发送时间，未生成提醒");
         }
+        else if (reminderError) {
+            messages.push(`发送提醒生成失败：${reminderError}`);
+        }
+        else {
+            messages.push(`已生成发送提醒（北京时间 ${reminder.time}）`);
+        }
+        new obsidian_1.Notice(messages.join("；"), reminderError ? 9000 : undefined);
         this.repo.invalidate();
         this.refreshWorkbenchViews();
         await this.refreshEmailList();
     }
     async rejectEmail(row) {
         const updated = (0, ai_file_1.setEmailStatus)(row.record, "Rejected");
-        await this.emailStore.saveRecord(row.filePath, updated);
+        await this.emailStore.saveRecord(row.filePath, updated, this.reminderRemoval(row.record.id));
         new obsidian_1.Notice("已拒绝这封邮件");
         await this.refreshEmailList();
     }
-    async markEmailSent(row) {
+    /** 读取邮件对应当前联系人的 `#Contact/...` 渠道；失败时只返回空数组。 */
+    async loadContactChannels(customer, row) {
         var _a;
-        if (row.record.status !== "Accepted") {
-            new obsidian_1.Notice("只有验收通过的邮件才能标记为已发送");
-            return;
-        }
-        if (row.record.sent) {
-            new obsidian_1.Notice("这封邮件已经标记为已发送");
-            return;
-        }
-        const aiFile = await this.reloadAIFile(row.filePath);
-        const link = (_a = aiFile === null || aiFile === void 0 ? void 0 : aiFile.customerLink) !== null && _a !== void 0 ? _a : row.customerLink;
-        const customer = await this.resolveCustomer(row.filePath, link);
-        if (!customer) {
-            new obsidian_1.Notice("客户文件链接失效，无法更新跟进次数和最近联系时间");
-            return;
-        }
-        const today = (0, filenames_1.localStamp)().date;
-        const oldFollow = customer.fm["跟进次数"];
-        const nextFollow = (0, follow_up_1.nextFollowUpCount)(oldFollow);
-        const oldLastContact = customer.fm["最近联系时间"];
-        const confirmed = await (0, confirm_1.confirm)(this.app, {
-            title: "标记为已发送",
-            confirmText: "确认已发送",
-            build: (container) => {
-                container.createEl("p", {
-                    text: `邮件：${row.record.subject}`,
-                });
-                const list = container.createEl("ul");
-                list.createEl("li", {
-                    text: `跟进次数：${oldFollow === undefined ? "（空）" : String(oldFollow)} → ${nextFollow}`,
-                });
-                list.createEl("li", {
-                    text: `最近联系时间：${oldLastContact === undefined || String(oldLastContact).trim() === "" ? "（空）" : String(oldLastContact)} → ${today}`,
-                });
-                container.createEl("p", {
-                    cls: "eo-muted",
-                    text: "这是唯一会修改跟进次数与最近联系时间的操作。",
-                });
-            },
-        });
-        if (!confirmed)
-            return;
-        const sentAt = (0, filenames_1.isoNow)();
-        const updated = { ...row.record, sent: true, sentAt, updatedAt: sentAt };
-        await this.emailStore.saveRecord(row.filePath, updated);
+        if (!customer)
+            return [];
         try {
-            await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
-                frontmatter["跟进次数"] = nextFollow;
-                frontmatter["最近联系时间"] = today;
-            });
+            const payload = await this.repo.load(customer, Math.max(500, this.settings.truncateBodyChars));
+            const contact = (0, contact_parser_1.findContactByEmail)(payload.contacts.contacts, row.record.email, row.record.contact);
+            return (_a = contact === null || contact === void 0 ? void 0 : contact.channels) !== null && _a !== void 0 ? _a : [];
         }
         catch (error) {
-            new obsidian_1.Notice(`邮件已标记发送，但更新客户属性失败：${error instanceof Error ? error.message : String(error)}`, 9000);
+            console.error("[email-outreach] 读取联系人渠道失败", error);
+            return [];
         }
-        this.repo.invalidate();
-        this.refreshWorkbenchViews();
-        await this.refreshEmailList();
+    }
+    /** 删除某封邮件在 AI 文件里的旧提醒；失败不阻塞保存。 */
+    reminderRemoval(emailId) {
+        return (content) => {
+            try {
+                return (0, reminder_1.removeEmailReminderFromContent)(content, emailId);
+            }
+            catch (error) {
+                console.error("[email-outreach] 删除发送提醒失败", error);
+                return content;
+            }
+        };
     }
     async saveRuleFromEmail(row, comment) {
         const loaded = await this.knowledgeLoader.load();
@@ -1212,6 +1220,7 @@ exports.default = EmailOutreachPlugin;
 __modules["src/core/ai-file.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.parseEmailStatus = parseEmailStatus;
 exports.emptyCustomerAIFile = emptyCustomerAIFile;
 exports.parseCustomerAIFile = parseCustomerAIFile;
 exports.renderEmailBlock = renderEmailBlock;
@@ -1234,6 +1243,17 @@ const filenames_1 = require("src/core/filenames.ts");
 const wikilinks_1 = require("src/core/wikilinks.ts");
 const types_1 = require("src/core/types.ts");
 const EMAIL_HEADING_RE = /^###\s+邮件\s+([0-9A-Za-z_-]+)\s*·\s*(.*)\s*·\s*(Generated|Revision|Accepted|Rejected)\s*$/;
+/**
+ * 状态归一化：旧文件里的「已修改，待审核」(Revision) 已合并到待审核
+ * (Generated)。标题正则仍接受 Revision，避免旧文件解析失败。
+ */
+function parseEmailStatus(value) {
+    if (value === "Revision")
+        return "Generated";
+    return types_1.EMAIL_STATUSES.includes(value)
+        ? value
+        : null;
+}
 const VERSION_HEADING_RE = /^#####\s+v(\d+)\s*·\s*(.*)$/;
 const META_RE = /^-\s+([A-Za-z_][\w]*)\s*:\s?(.*)$/;
 const SECTION_RE = /^####\s+(Subject|Body|修改历史)\s*$/;
@@ -1530,7 +1550,7 @@ function parseVersions(lines, warnings) {
     return versions;
 }
 function parseEmailBlock(lines, start, end, warnings) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x;
     const heading = (_a = lines[start]) !== null && _a !== void 0 ? _a : "";
     const headingMatch = heading.match(EMAIL_HEADING_RE);
     if (!headingMatch) {
@@ -1539,16 +1559,16 @@ function parseEmailBlock(lines, start, end, warnings) {
     }
     const id = (_b = headingMatch[1]) !== null && _b !== void 0 ? _b : "001";
     const headingContact = ((_c = headingMatch[2]) !== null && _c !== void 0 ? _c : "").trim();
-    const headingStatus = headingMatch[3];
+    const headingStatus = (_e = parseEmailStatus((_d = headingMatch[3]) !== null && _d !== void 0 ? _d : "")) !== null && _e !== void 0 ? _e : "Generated";
     const meta = {};
     let index = start + 1;
     while (index < end) {
-        const line = ((_d = lines[index]) !== null && _d !== void 0 ? _d : "").trim();
+        const line = ((_f = lines[index]) !== null && _f !== void 0 ? _f : "").trim();
         if (isHeading4(line))
             break;
         const match = line.match(META_RE);
         if (match)
-            meta[(_e = match[1]) !== null && _e !== void 0 ? _e : ""] = ((_f = match[2]) !== null && _f !== void 0 ? _f : "").trim();
+            meta[(_g = match[1]) !== null && _g !== void 0 ? _g : ""] = ((_h = match[2]) !== null && _h !== void 0 ? _h : "").trim();
         index++;
     }
     const sections = {
@@ -1564,10 +1584,10 @@ function parseEmailBlock(lines, start, end, warnings) {
         修改历史: "history",
     };
     while (index < end) {
-        const line = (_g = lines[index]) !== null && _g !== void 0 ? _g : "";
+        const line = (_j = lines[index]) !== null && _j !== void 0 ? _j : "";
         const headingMatch2 = line.match(SECTION_RE);
         if (headingMatch2) {
-            const name = (_h = headingMatch2[1]) !== null && _h !== void 0 ? _h : "";
+            const name = (_k = headingMatch2[1]) !== null && _k !== void 0 ? _k : "";
             const key = sectionKeys[name];
             if (key) {
                 current = key;
@@ -1593,12 +1613,12 @@ function parseEmailBlock(lines, start, end, warnings) {
     const versionsStart = sectionOffsets["history"];
     const versionLines = versionsStart !== undefined ? lines.slice(versionsStart + 1, end) : [];
     let versions = parseVersions(versionLines, warnings);
-    const storedVersions = Number((_j = meta["versions"]) !== null && _j !== void 0 ? _j : "0");
+    const storedVersions = Number((_l = meta["versions"]) !== null && _l !== void 0 ? _l : "0");
     if (versions.length === 0 && subject && body) {
         versions = [
             {
                 version: 1,
-                at: (_k = meta["generated_at"]) !== null && _k !== void 0 ? _k : "",
+                at: (_m = meta["generated_at"]) !== null && _m !== void 0 ? _m : "",
                 action: "Generated",
                 userComment: "",
                 subject,
@@ -1609,8 +1629,7 @@ function parseEmailBlock(lines, start, end, warnings) {
     else if (Number.isFinite(storedVersions) && versions.length < storedVersions) {
         warnings.push(`邮件 ${id} 的版本数少于记录值（${versions.length}/${storedVersions}）`);
     }
-    const statusRaw = ((_l = meta["status"]) !== null && _l !== void 0 ? _l : headingStatus);
-    const status = types_1.EMAIL_STATUSES.includes(statusRaw) ? statusRaw : headingStatus;
+    const status = (_p = parseEmailStatus((_o = meta["status"]) !== null && _o !== void 0 ? _o : "")) !== null && _p !== void 0 ? _p : headingStatus;
     const knownKeys = new Set([
         "contact",
         "email",
@@ -1634,18 +1653,18 @@ function parseEmailBlock(lines, start, end, warnings) {
     }
     const record = {
         id,
-        contact: (_m = meta["contact"]) !== null && _m !== void 0 ? _m : headingContact,
-        email: (_o = meta["email"]) !== null && _o !== void 0 ? _o : "",
-        language: (_p = meta["language"]) !== null && _p !== void 0 ? _p : "",
-        languageLabel: (_q = meta["language_label"]) !== null && _q !== void 0 ? _q : "",
-        summaryZh: (_r = meta["email_summary_zh"]) !== null && _r !== void 0 ? _r : "",
+        contact: (_q = meta["contact"]) !== null && _q !== void 0 ? _q : headingContact,
+        email: (_r = meta["email"]) !== null && _r !== void 0 ? _r : "",
+        language: (_s = meta["language"]) !== null && _s !== void 0 ? _s : "",
+        languageLabel: (_t = meta["language_label"]) !== null && _t !== void 0 ? _t : "",
+        summaryZh: (_u = meta["email_summary_zh"]) !== null && _u !== void 0 ? _u : "",
         suggestedTime: meta["suggested_send_time"] || null,
         timezone: meta["timezone"] || null,
         timeReason: meta["time_reason"] || null,
         status,
-        generatedAt: (_s = meta["generated_at"]) !== null && _s !== void 0 ? _s : "",
-        updatedAt: (_t = meta["updated_at"]) !== null && _t !== void 0 ? _t : "",
-        sent: ((_u = meta["sent"]) !== null && _u !== void 0 ? _u : "").toLowerCase() === "true",
+        generatedAt: (_v = meta["generated_at"]) !== null && _v !== void 0 ? _v : "",
+        updatedAt: (_w = meta["updated_at"]) !== null && _w !== void 0 ? _w : "",
+        sent: ((_x = meta["sent"]) !== null && _x !== void 0 ? _x : "").toLowerCase() === "true",
         sentAt: meta["sent_at"] || null,
         subject,
         body,
@@ -2480,6 +2499,27 @@ function cleanText(text) {
         .trim();
 }
 /**
+ * 联系人行里的 `#Contact/...` 渠道标签：标签保留原样，内容取同一行去掉
+ * 该标签后的说明（电话、链接或备注）。支持标签在值后面或前面。
+ */
+function extractContactChannels(text) {
+    var _a;
+    const channels = [];
+    const seen = new Set();
+    for (const match of text.matchAll(TAG_RE)) {
+        const tag = (_a = match[0]) !== null && _a !== void 0 ? _a : "";
+        if (!/^#Contact\b/i.test(tag))
+            continue;
+        const content = cleanText(text.replace(tag, " "));
+        const key = `${tag}\u0000${content}`;
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        channels.push({ tag, content });
+    }
+    return channels;
+}
+/**
  * Split a contact line into name / parenthesized role / trailing remark.
  *
  * Supported shapes (both full-width and ASCII parentheses, spaces allowed
@@ -2584,6 +2624,7 @@ function parseContacts(markdown) {
             phones: current.phones,
             links: current.links,
             notes: current.notes,
+            channels: current.channels,
             line: current.line,
         });
         current = null;
@@ -2665,6 +2706,7 @@ function parseContacts(markdown) {
                 phones: tokens.phones,
                 links: tokens.links,
                 notes: contactNotes(split.rest, tokens.tags),
+                channels: extractContactChannels(trimmed),
                 line: i + 1,
             };
             plainMode = true;
@@ -2690,6 +2732,7 @@ function parseContacts(markdown) {
                     phones: preview.phones,
                     links: preview.links,
                     notes: contactNotes(split.rest, preview.tags),
+                    channels: extractContactChannels(body),
                     line: i + 1,
                 };
                 plainMode = false;
@@ -2709,6 +2752,7 @@ function parseContacts(markdown) {
         current.emails.push(...tokens.emails);
         current.phones.push(...tokens.phones);
         current.links.push(...tokens.links);
+        current.channels.push(...extractContactChannels(bodyText));
         const roleMatch = bodyText.match(ROLE_LINE_RE);
         if (roleMatch) {
             const role = cleanText((_f = roleMatch[2]) !== null && _f !== void 0 ? _f : "");
@@ -2727,6 +2771,14 @@ function parseContacts(markdown) {
         contact.emails = dedupe(contact.emails);
         contact.phones = dedupe(contact.phones);
         contact.links = dedupe(contact.links);
+        const seenChannels = new Set();
+        contact.channels = contact.channels.filter((channel) => {
+            const key = `${channel.tag}\u0000${channel.content}`;
+            if (seenChannels.has(key))
+                return false;
+            seenChannels.add(key);
+            return true;
+        });
     }
     if (contacts.length === 0) {
         warnings.push({
@@ -2898,7 +2950,7 @@ exports.filterEmailRows = filterEmailRows;
 const ai_file_1 = require("src/core/ai-file.ts");
 const generation_1 = require("src/core/generation.ts");
 function isPendingStatus(status) {
-    return status === "Generated" || status === "Revision";
+    return status === "Generated";
 }
 function normalizeEmail(value) {
     return (value !== null && value !== void 0 ? value : "").trim().toLowerCase();
@@ -3500,7 +3552,6 @@ __modules["src/core/follow-up.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.parseFollowUpCount = parseFollowUpCount;
-exports.nextFollowUpCount = nextFollowUpCount;
 /** 客户 frontmatter 里的「跟进次数」可能是数字，也可能是字符串。 */
 function parseFollowUpCount(value) {
     if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
@@ -3513,10 +3564,6 @@ function parseFollowUpCount(value) {
     if (!Number.isFinite(parsed) || parsed < 0)
         return 0;
     return Math.floor(parsed);
-}
-/** 「标记已发送」时把跟进次数 +1。 */
-function nextFollowUpCount(current) {
-    return parseFollowUpCount(current) + 1;
 }
 
 };
@@ -3667,7 +3714,7 @@ function summarizeGeneration(emails, hasAIFile) {
             rejected++;
             continue;
         }
-        if (email.status === "Generated" || email.status === "Revision") {
+        if (email.status === "Generated") {
             pendingCount++;
         }
         const raw = emailGeneratedAt(email);
@@ -4612,6 +4659,193 @@ function describeEmailTask() {
 }
 
 };
+__modules["src/core/reminder.ts"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.REMINDER_SECTION_HEADING = void 0;
+exports.reminderMarker = reminderMarker;
+exports.buildEmailReminder = buildEmailReminder;
+exports.upsertEmailReminderInContent = upsertEmailReminderInContent;
+exports.removeEmailReminderFromContent = removeEmailReminderFromContent;
+const ai_file_1 = require("src/core/ai-file.ts");
+const send_time_1 = require("src/core/send-time.ts");
+const wikilinks_1 = require("src/core/wikilinks.ts");
+/**
+ * 已验收邮件的 Reminder 任务。
+ *
+ * 任务写在 AI 开发信息文件末尾的 `## 发送提醒` 区段（属于文件的 trailing），
+ * 用隐藏的 `<!-- eo-reminder: ID -->` 标记与邮件 ID 关联，方便重复验收时
+ * 替换而不是追加。时间用北京时间，格式与 Reminder 插件兼容：
+ * `(@YYYY-MM-DD HH:mm)`。
+ */
+exports.REMINDER_SECTION_HEADING = "## 发送提醒";
+const SECTION_HEADING_RE = /^##\s+发送提醒\s*$/;
+const TASK_LINE_RE = /^- \[[ xX]\] /;
+const MARKER_PREFIX = "<!-- eo-reminder:";
+function oneLine(value) {
+    return (value !== null && value !== void 0 ? value : "").replace(/\s*[\r\n]+\s*/g, " ").trim();
+}
+function reminderMarker(emailId) {
+    return `${MARKER_PREFIX} ${oneLine(emailId)} -->`;
+}
+/** 为一个已验收邮件构建 Reminder 任务；没有可用的建议发送时间时返回 null。 */
+function buildEmailReminder(input) {
+    var _a;
+    const time = (0, send_time_1.formatBeijingTime)(input.suggestedTime, input.timezone);
+    if (!time)
+        return null;
+    const emailId = oneLine(input.emailId) || "001";
+    const contact = oneLine(input.contact) || oneLine(input.email) || "联系人";
+    const customer = oneLine(input.customerName);
+    const subject = oneLine(input.subject) || "（无主题）";
+    const title = `${customer ? `${customer} · ` : ""}发送开发邮件给 ${contact}：${subject}`;
+    const lines = [
+        `- [ ] ${title} (@${time})`,
+        `    - 邮件：${(0, wikilinks_1.toWikilink)((0, wikilinks_1.pathToLinkTarget)(input.aiFilePath))} · 邮件 ${emailId}`,
+    ];
+    const email = oneLine(input.email);
+    if (email)
+        lines.push(`    - 邮箱：${email}`);
+    const summary = oneLine(input.summaryZh);
+    if (summary)
+        lines.push(`    - 摘要：${summary}`);
+    const suggested = oneLine(input.suggestedTime);
+    const timezone = oneLine(input.timezone);
+    if (suggested && timezone && timezone !== "Asia/Shanghai") {
+        lines.push(`    - 客户当地时间：${suggested} · ${timezone}`);
+    }
+    for (const channel of (_a = input.channels) !== null && _a !== void 0 ? _a : []) {
+        const tag = oneLine(channel.tag);
+        if (!tag)
+            continue;
+        const content = oneLine(channel.content);
+        lines.push(content ? `    - ${tag}：${content}` : `    - ${tag}`);
+    }
+    const marker = reminderMarker(emailId);
+    lines.push(marker);
+    return { emailId, time, marker, block: lines.join("\n") };
+}
+function findSection(lines) {
+    var _a;
+    const start = lines.findIndex((line) => SECTION_HEADING_RE.test(line.trim()));
+    if (start < 0)
+        return null;
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+        if (/^#{1,2}\s+/.test((_a = lines[i]) !== null && _a !== void 0 ? _a : "")) {
+            end = i;
+            break;
+        }
+    }
+    return { start, end };
+}
+function findMarkerIndex(lines, marker) {
+    return lines.findIndex((line) => line.trim() === marker);
+}
+/** 从标记行往上找到所属任务行；遇到别的标记/标题就停，避免误伤。 */
+function findTaskStart(lines, markerIndex) {
+    var _a;
+    for (let i = markerIndex - 1; i >= 0; i--) {
+        const line = (_a = lines[i]) !== null && _a !== void 0 ? _a : "";
+        if (TASK_LINE_RE.test(line))
+            return i;
+        if (line.trim().startsWith(MARKER_PREFIX))
+            return markerIndex;
+        if (/^#{1,2}\s+/.test(line))
+            return markerIndex;
+    }
+    return markerIndex;
+}
+function joinTrailing(lines) {
+    return lines.join("\n").trim();
+}
+/**
+ * 在 AI 文件内容里追加或更新一条发送提醒。
+ *
+ * - 同一邮件 ID 的旧任务会被整块替换；
+ * - 没有 `## 发送提醒` 区段时在文件末尾新建；
+ * - 不触碰 trailing 里的其他用户内容。
+ */
+function upsertEmailReminderInContent(content, reminder) {
+    var _a, _b;
+    const parsed = (0, ai_file_1.parseCustomerAIFile)(content);
+    const lines = parsed.file.trailing
+        ? parsed.file.trailing.split("\n")
+        : [];
+    const blockLines = reminder.block.split("\n");
+    const markerIndex = findMarkerIndex(lines, reminder.marker);
+    let next;
+    if (markerIndex >= 0) {
+        const start = findTaskStart(lines, markerIndex);
+        next = [
+            ...lines.slice(0, start),
+            ...blockLines,
+            ...lines.slice(markerIndex + 1),
+        ];
+    }
+    else {
+        const section = findSection(lines);
+        if (section) {
+            // 插到区段最后一个非空行之后；保留区段尾部的空行。
+            let insertAt = section.end;
+            while (insertAt > section.start + 1 &&
+                ((_a = lines[insertAt - 1]) !== null && _a !== void 0 ? _a : "").trim() === "") {
+                insertAt--;
+            }
+            next = lines.slice(0, insertAt);
+            if (next.length > 0 && next[next.length - 1].trim() !== "") {
+                next.push("");
+            }
+            next.push(...blockLines);
+            if (insertAt < lines.length &&
+                ((_b = lines[insertAt]) !== null && _b !== void 0 ? _b : "").trim() !== "") {
+                next.push("");
+            }
+            next.push(...lines.slice(insertAt));
+        }
+        else {
+            next = [...lines];
+            while (next.length > 0 && next[next.length - 1].trim() === "") {
+                next.pop();
+            }
+            if (next.length > 0)
+                next.push("");
+            next.push(exports.REMINDER_SECTION_HEADING, "", ...blockLines);
+        }
+    }
+    parsed.file.trailing = joinTrailing(next);
+    return (0, ai_file_1.renderCustomerAIFile)(parsed.file);
+}
+/**
+ * 删除某封邮件的提醒。没有对应标记时原样返回，避免无意义地重写文件。
+ * 区段删空后连同 `## 发送提醒` 标题一起移除；区段里还有用户内容或其他任务
+ * 时保留标题。
+ */
+function removeEmailReminderFromContent(content, emailId) {
+    const parsed = (0, ai_file_1.parseCustomerAIFile)(content);
+    const lines = parsed.file.trailing
+        ? parsed.file.trailing.split("\n")
+        : [];
+    const markerIndex = findMarkerIndex(lines, reminderMarker(emailId));
+    if (markerIndex < 0)
+        return content;
+    const start = findTaskStart(lines, markerIndex);
+    let next = [
+        ...lines.slice(0, start),
+        ...lines.slice(markerIndex + 1),
+    ];
+    const section = findSection(next);
+    if (section) {
+        const body = next.slice(section.start + 1, section.end);
+        if (body.every((line) => line.trim() === "")) {
+            next = [...next.slice(0, section.start), ...next.slice(section.end)];
+        }
+    }
+    parsed.file.trailing = joinTrailing(next);
+    return (0, ai_file_1.renderCustomerAIFile)(parsed.file);
+}
+
+};
 __modules["src/core/run-status.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -5493,7 +5727,6 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.MAX_EMAILS_PER_CUSTOMER = exports.EMAIL_STATUSES = void 0;
 exports.EMAIL_STATUSES = [
     "Generated",
-    "Revision",
     "Accepted",
     "Rejected",
 ];
@@ -6636,6 +6869,7 @@ __modules["src/obsidian/dev-status-cell.ts"] = function(module, exports, require
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DEV_STATUS_COLUMN_ID = void 0;
 exports.renderDevStatusCell = renderDevStatusCell;
+const obsidian_1 = require("obsidian");
 const dev_state_1 = require("src/core/dev-state.ts");
 /** 合并后的「开发状态」列（主行最近生成，副行未解决提醒）。 */
 exports.DEV_STATUS_COLUMN_ID = "eo:devStatus";
@@ -6681,8 +6915,14 @@ function renderDevStatusCell(row, plugin, index, now) {
     const hint = clickable
         ? `点击查看该客户的开发邮件（待审 ${pending} 封 / 共 ${total} 封）`
         : "还没有开发邮件";
-    cell.title = [view.title, hint].filter(Boolean).join("\n");
-    cell.setAttribute("aria-label", `${row.name} 开发状态：${view.text}；${hint}`);
+    // 只用 Obsidian 的 tooltip：再设原生 title 会同时弹出两个内容相同的提示。
+    (0, obsidian_1.setTooltip)(cell, [
+        `${row.name} 开发状态：${view.text}`,
+        view.title,
+        hint,
+    ]
+        .filter(Boolean)
+        .join("\n"));
     if (clickable) {
         cell.addEventListener("click", (event) => {
             var _a;
@@ -6709,7 +6949,6 @@ const preview_popover_1 = require("src/obsidian/preview-popover.ts");
 const STATUS_LABELS = {
     all: "全部状态",
     Generated: "待审核",
-    Revision: "已修改，待审核",
     Accepted: "已验收",
     Rejected: "已拒绝",
 };
@@ -7100,9 +7339,15 @@ class EmailStore {
         this.files.set(path, parsed.file);
         return parsed.file;
     }
-    async saveRecord(path, record) {
+    /**
+     * 保存邮件记录。可选的 transform 在同一份内容上追加/删除验收提醒，
+     * 保证「状态 + 提醒」一次写盘。
+     */
+    async saveRecord(path, record, transform) {
         const content = await this.adapter.read(path);
-        const updated = (0, ai_file_1.updateEmailInContent)(content, record);
+        let updated = (0, ai_file_1.updateEmailInContent)(content, record);
+        if (transform)
+            updated = transform(updated);
         await this.adapter.write(path, updated);
         await this.refresh();
     }
@@ -7671,7 +7916,6 @@ const send_time_1 = require("src/core/send-time.ts");
 const confirm_1 = require("src/obsidian/modals/confirm.ts");
 const STATUS_LABELS = {
     Generated: "待审核",
-    Revision: "已修改，待审核",
     Accepted: "已验收",
     Rejected: "已拒绝",
 };
@@ -7815,7 +8059,7 @@ class EmailDetailModal extends obsidian_1.Modal {
     }
     // ----------------------------------------------------------------- render
     render() {
-        var _a, _b, _c, _d, _e, _f, _g, _h;
+        var _a, _b, _c, _d, _e, _f, _g;
         const { contentEl } = this;
         this.subjectInput = null;
         this.bodyInput = null;
@@ -7861,7 +8105,6 @@ class EmailDetailModal extends obsidian_1.Modal {
         addMeta("中文摘要", record.summaryZh);
         // 只有一个「更新时间」：首次生成时是创建时间，之后每次改动都会刷新。
         addMeta("更新时间", (0, ai_file_1.emailUpdatedAt)(record));
-        addMeta("已发送", record.sent ? `是（${(_c = record.sentAt) !== null && _c !== void 0 ? _c : ""}）` : "否");
         const subjectGroup = contentEl.createDiv({ cls: "eo-detail-field" });
         subjectGroup.createEl("label", { text: "Subject" });
         this.subjectInput = subjectGroup.createEl("input", {
@@ -7934,10 +8177,6 @@ class EmailDetailModal extends obsidian_1.Modal {
             await this.host.acceptEmail(this.row);
             await this.afterAction();
         }, "mod-cta", record.status === "Accepted");
-        addButton("标记已发送", async () => {
-            await this.host.markEmailSent(this.row);
-            await this.afterAction();
-        }, undefined, record.status !== "Accepted" || record.sent);
         addButton("拒绝", async () => {
             await this.host.rejectEmail(this.row);
             await this.afterAction();
@@ -7958,10 +8197,10 @@ class EmailDetailModal extends obsidian_1.Modal {
             analysis.createEl("h3", { text: "客户分析" });
             const list = analysis.createEl("ul");
             list.createEl("li", {
-                text: `客户类型：${(_d = aiFile.analysis.customerType) !== null && _d !== void 0 ? _d : "未知"}`,
+                text: `客户类型：${(_c = aiFile.analysis.customerType) !== null && _c !== void 0 ? _c : "未知"}`,
             });
             list.createEl("li", {
-                text: `Fit ${(_e = aiFile.analysis.fit) !== null && _e !== void 0 ? _e : "—"} · Intent ${(_f = aiFile.analysis.intent) !== null && _f !== void 0 ? _f : "—"} · Potential ${(_g = aiFile.analysis.potential) !== null && _g !== void 0 ? _g : "—"} · Risk ${(_h = aiFile.analysis.risk) !== null && _h !== void 0 ? _h : "—"}`,
+                text: `Fit ${(_d = aiFile.analysis.fit) !== null && _d !== void 0 ? _d : "—"} · Intent ${(_e = aiFile.analysis.intent) !== null && _e !== void 0 ? _e : "—"} · Potential ${(_f = aiFile.analysis.potential) !== null && _f !== void 0 ? _f : "—"} · Risk ${(_g = aiFile.analysis.risk) !== null && _g !== void 0 ? _g : "—"}`,
             });
             for (const note of aiFile.analysis.riskNotes) {
                 list.createEl("li", { text: `风险：${note}` });
@@ -7992,10 +8231,6 @@ class EmailDetailModal extends obsidian_1.Modal {
             return;
         const comment = this.commentValue();
         const intent = (0, prompt_1.emailEditIntent)(comment);
-        if (this.row.record.sent) {
-            new obsidian_1.Notice("已发送的邮件不能修改或重新生成");
-            return;
-        }
         const subject = (_b = (_a = this.subjectInput) === null || _a === void 0 ? void 0 : _a.value.trim()) !== null && _b !== void 0 ? _b : "";
         const body = (_d = (_c = this.bodyInput) === null || _c === void 0 ? void 0 : _c.value) !== null && _d !== void 0 ? _d : "";
         if (!subject || !body.trim()) {
