@@ -7645,11 +7645,6 @@ function attachColumnResize(table, headerCells, options) {
             const pointerId = event.pointerId;
             const startX = event.clientX;
             const startWidth = (_b = widths[column.id]) !== null && _b !== void 0 ? _b : column.width;
-            // 表格比容器窄时 CSS 的 min-width: 100% 会把各列按比例放大；
-            // 这里换算回「设置里的像素」，避免拖动时手柄和指针越拖越偏。
-            const total = totalWidth();
-            const rendered = table.getBoundingClientRect().width;
-            const scale = total > 0 && rendered > total ? rendered / total : 1;
             // 指针捕获让手指移出手柄后仍能继续拖；旧内核不支持时靠 window 监听兜底。
             const pointerHost = (_d = (_c = table.ownerDocument) === null || _c === void 0 ? void 0 : _c.defaultView) !== null && _d !== void 0 ? _d : window;
             if (typeof handle.setPointerCapture === "function") {
@@ -7665,7 +7660,7 @@ function attachColumnResize(table, headerCells, options) {
             const move = (moveEvent) => {
                 if (moveEvent.pointerId !== pointerId)
                     return;
-                applyWidth(column.id, (0, column_widths_1.resizeColumnWidth)(startWidth, (moveEvent.clientX - startX) / scale));
+                applyWidth(column.id, (0, column_widths_1.resizeColumnWidth)(startWidth, moveEvent.clientX - startX));
             };
             const finish = () => {
                 pointerHost.removeEventListener("pointermove", move);

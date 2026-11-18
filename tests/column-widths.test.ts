@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
 	clampColumnWidth,
 	MAX_COLUMN_WIDTH,
@@ -8,7 +9,7 @@ import {
 	resizeColumnWidth,
 	sumColumnWidths,
 } from "../src/core/column-widths";
-import { assertEqual, suite, test } from "./harness";
+import { assert, assertEqual, suite, test } from "./harness";
 
 suite("表格列宽");
 
@@ -86,4 +87,20 @@ test("表格宽度等于可见列宽度之和", () => {
 		"三列相加",
 	);
 	assertEqual(sumColumnWidths(["name", "missing"], { name: 240 }), 240, "缺列按 0 计");
+});
+
+test("表格不拉伸填满面板，否则拖动一列会连累其它列", () => {
+	// 去掉注释再匹配：注释里可能提到被禁用的写法。
+	const css = readFileSync("styles.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+	const rule = css.match(/\.eo-table\s*\{[^}]*\}/);
+	assert(rule, "styles.css 里应有 .eo-table 规则");
+	const body = rule![0];
+	assert(
+		/table-layout:\s*fixed/.test(body),
+		"表格必须用固定布局，列宽才能由 <colgroup> 决定",
+	);
+	assert(
+		!/min-width:\s*100%/.test(body),
+		"不要用 min-width: 100% 撑满面板：剩余宽度会被均摊给各列，拖动一列时其它列跟着变",
+	);
 });

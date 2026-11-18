@@ -188,8 +188,11 @@
 }
 
 .eo-table {
-	width: 100%;
-	min-width: 100%;
+	/* 表格宽度 = 各列宽度之和（JS 会写 inline width），不拉到 100%。
+	   以前用 min-width: 100% 撑满面板：面板比表格宽时，浏览器会把剩余宽度
+	   均摊给所有列，导致「拖动右边一列，左边的列也跟着变宽」。 */
+	width: auto;
+	max-width: none;
 	/* 固定布局：列宽由 <colgroup> 决定，不随内容忽宽忽窄，拖动才是 1:1。 */
 	table-layout: fixed;
 	border-collapse: collapse;

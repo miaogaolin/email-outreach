@@ -5,8 +5,8 @@ import { clampColumnWidth, resizeColumnWidth } from "../core/column-widths";
  *
  * 列宽不写进每个 `th`/`td`，而是统一放进 `<colgroup>`：表格用
  * `table-layout: fixed`，拖动时只改这一列的 `<col>` 和表格总宽度，
- * 其它列不会被浏览器按内容重新分配，宽度才是「拖多少变多少」。
- * 表格总宽度 = 各列之和，超出列表面板时由 `.eo-table-wrap` 横向滚动。
+ * 其它列不会被浏览器按内容或剩余空间重新分配，宽度才是「拖多少变多少」。
+ * 表格总宽度 = 各列之和：比面板窄时右侧留白，超出时 `.eo-table-wrap` 横向滚动。
  */
 export interface ResizableColumn {
 	id: string;
@@ -127,11 +127,6 @@ export function attachColumnResize(
 			const pointerId = event.pointerId;
 			const startX = event.clientX;
 			const startWidth = widths[column.id] ?? column.width;
-			// 表格比容器窄时 CSS 的 min-width: 100% 会把各列按比例放大；
-			// 这里换算回「设置里的像素」，避免拖动时手柄和指针越拖越偏。
-			const total = totalWidth();
-			const rendered = table.getBoundingClientRect().width;
-			const scale = total > 0 && rendered > total ? rendered / total : 1;
 			// 指针捕获让手指移出手柄后仍能继续拖；旧内核不支持时靠 window 监听兜底。
 			const pointerHost = table.ownerDocument?.defaultView ?? window;
 			if (typeof handle.setPointerCapture === "function") {
@@ -148,10 +143,7 @@ export function attachColumnResize(
 				if (moveEvent.pointerId !== pointerId) return;
 				applyWidth(
 					column.id,
-					resizeColumnWidth(
-						startWidth,
-						(moveEvent.clientX - startX) / scale,
-					),
+					resizeColumnWidth(startWidth, moveEvent.clientX - startX),
 				);
 			};
 			const finish = (): void => {
