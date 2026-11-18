@@ -267,6 +267,14 @@
 	user-select: none !important;
 }
 
+/* 末端填充列：把表格撑满容器，拖动时只由它吸收多余宽度。
+   没有内容、不能拖动；边框照常延续，看起来仍是整张表铺满。 */
+.eo-table th.eo-col-filler,
+.eo-table td.eo-col-filler {
+	padding: 0;
+	border-left: none;
+}
+
 .eo-table th.eo-sortable {
 	cursor: pointer;
 	user-select: none;

@@ -4,9 +4,12 @@ import { clampColumnWidth, resizeColumnWidth } from "../core/column-widths";
  * 表格列宽拖拽。
  *
  * 列宽不写进每个 `th`/`td`，而是统一放进 `<colgroup>`：表格用
- * `table-layout: fixed`，拖动时只改这一列的 `<col>` 和表格总宽度，
- * 其它列不会被浏览器按内容或剩余空间重新分配，宽度才是「拖多少变多少」。
- * 表格总宽度 = 各列之和：比面板窄时右侧留白，超出时 `.eo-table-wrap` 横向滚动。
+ * `table-layout: fixed`，拖动时只改这一列的 `<col>`，其它列不会被浏览器
+ * 按内容重新分配，宽度才是「拖多少变多少」。
+ *
+ * 默认用一列透明的「填充列」把表格撑满容器（列表铺满窗口），拖动时多余
+ * 宽度只进出填充列：拖一列不会连带改变别的列。
+ * 表格宽度 = max(容器宽度, 各列宽度之和)：比容器宽时横向滚动。
  */
 export interface ResizableColumn {
 	id: string;
@@ -22,14 +25,24 @@ export interface ColumnResizeOptions {
 	columns: ResizableColumn[];
 	/** 拖拽结束 / 双击恢复 / 键盘微调后调用；拖动过程中不写盘。 */
 	onChange: (widths: Record<string, number>) => void;
+	/** 是否用末端填充列撑满容器（默认 true）。 */
+	fill?: boolean;
+}
+
+export interface ColumnResizer {
+	/** 重新测量容器并更新填充列（ResizeObserver 已自动处理）。 */
+	layout(): void;
+	/** 表格移除前调用：断开 ResizeObserver。 */
+	destroy(): void;
 }
 
 export function attachColumnResize(
 	table: HTMLTableElement,
 	headerCells: HTMLElement[],
 	options: ColumnResizeOptions,
-): void {
+): ColumnResizer {
 	const columns = options.columns;
+	const fill = options.fill !== false;
 	const widths: Record<string, number> = {};
 	for (const column of columns) {
 		widths[column.id] = clampColumnWidth(column.width);
@@ -43,25 +56,83 @@ export function attachColumnResize(
 		colgroup.appendChild(col);
 		colById.set(column.id, col);
 	}
+	// 填充列没有固定宽度，由 layout() 按容器剩余空间写入。
+	const fillerCol = fill ? document.createElement("col") : null;
+	if (fillerCol) colgroup.appendChild(fillerCol);
 	// colgroup 必须是 table 的第一个子元素，否则浏览器会忽略它。
 	table.insertBefore(colgroup, table.firstChild);
+
+	// 填充格的边框会随行/表头延伸，看起来仍是「整张表铺满」，但没有任何内容。
+	const fillerCells: HTMLElement[] = [];
+	if (fill) {
+		const headerRow = headerCells[0]?.parentElement ?? null;
+		if (headerRow) {
+			const fillerHead = document.createElement("th");
+			fillerHead.className = "eo-col-filler";
+			fillerHead.setAttribute("aria-hidden", "true");
+			headerRow.appendChild(fillerHead);
+			fillerCells.push(fillerHead);
+		}
+		for (const body of Array.from(table.tBodies)) {
+			for (const row of Array.from(body.rows)) {
+				const cell = document.createElement("td");
+				cell.className = "eo-col-filler";
+				cell.setAttribute("aria-hidden", "true");
+				row.appendChild(cell);
+				fillerCells.push(cell);
+			}
+		}
+	}
 
 	const totalWidth = (): number => {
 		let total = 0;
 		for (const column of columns) total += widths[column.id] ?? 0;
 		return total;
 	};
-	const syncTableWidth = (): void => {
-		table.style.width = `${totalWidth()}px`;
+
+	/** 表格可用的宽度：滚动容器的内容宽度（不含滚动条/边框）。 */
+	const containerWidth = (): number => {
+		const parent = table.parentElement;
+		return parent ? parent.clientWidth : 0;
 	};
-	syncTableWidth();
+
+	const layout = (): void => {
+		const sum = totalWidth();
+		const available = fill ? containerWidth() : 0;
+		const filler = Math.max(0, available - sum);
+		if (fillerCol) fillerCol.style.width = `${filler}px`;
+		const display = filler > 0 ? "" : "none";
+		for (const cell of fillerCells) {
+			if (cell.style.display !== display) cell.style.display = display;
+		}
+		table.style.width = `${Math.max(available, sum)}px`;
+	};
 
 	const applyWidth = (id: string, width: number): void => {
 		widths[id] = width;
 		const col = colById.get(id);
 		if (col) col.style.width = `${width}px`;
-		syncTableWidth();
+		layout();
 	};
+
+	layout();
+
+	let observer: ResizeObserver | null = null;
+	const destroy = (): void => {
+		observer?.disconnect();
+		observer = null;
+	};
+	const parent = table.parentElement;
+	if (fill && parent && typeof ResizeObserver !== "undefined") {
+		observer = new ResizeObserver(() => {
+			if (!table.isConnected) {
+				destroy();
+				return;
+			}
+			layout();
+		});
+		observer.observe(parent);
+	}
 
 	columns.forEach((column, index) => {
 		const header = headerCells[index];
@@ -169,4 +240,6 @@ export function attachColumnResize(
 
 		header.appendChild(handle);
 	});
+
+	return { layout, destroy };
 }

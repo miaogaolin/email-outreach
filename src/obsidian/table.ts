@@ -27,6 +27,8 @@ export interface CustomerTableHandle {
 	/** null 表示读取失败（显示「—」）；初始未加载时显示「…」。 */
 	setContactCount(key: string, count: number | null): void;
 	isConnected(): boolean;
+	/** 表格即将移除时调用：断开列宽 ResizeObserver。 */
+	destroy(): void;
 }
 
 export interface CustomerTableOptions {
@@ -57,6 +59,7 @@ const EMPTY_HANDLE: CustomerTableHandle = {
 	updateSelection() {},
 	setContactCount() {},
 	isConnected: () => false,
+	destroy() {},
 };
 
 export function renderCustomerTable(
@@ -134,17 +137,6 @@ export function renderCustomerTable(
 		resizeColumns.map((column) => ({ id: column.id, width: column.width })),
 		options.columnWidths,
 	);
-	attachColumnResize(
-		table,
-		headerCells,
-		{
-			columns: resizeColumns.map((column) => ({
-				...column,
-				width: mergedWidths[column.id] ?? column.width,
-			})),
-			onChange: (widths) => options.onColumnWidthsChange?.(widths),
-		},
-	);
 
 	const rowElements = new Map<string, HTMLTableRowElement>();
 	const rowCheckboxes = new Map<string, HTMLInputElement>();
@@ -206,6 +198,15 @@ export function renderCustomerTable(
 		options.onToggleAll(selectAllInput.checked);
 	});
 
+	// 行都建好后再接列宽：填充列需要给每一行补一个单元格。
+	const resizer = attachColumnResize(table, headerCells, {
+		columns: resizeColumns.map((column) => ({
+			...column,
+			width: mergedWidths[column.id] ?? column.width,
+		})),
+		onChange: (widths) => options.onColumnWidthsChange?.(widths),
+	});
+
 	return {
 		updateSelection(selected: Set<string>): void {
 			for (const [key, checkbox] of rowCheckboxes) {
@@ -222,6 +223,7 @@ export function renderCustomerTable(
 			if (button) renderContactCount(button, count);
 		},
 		isConnected: () => table.isConnected,
+		destroy: () => resizer.destroy(),
 	};
 }
 

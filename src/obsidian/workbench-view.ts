@@ -23,6 +23,7 @@ import {
 	renderCustomerTable,
 	type CustomerColumn,
 	type CustomerRow,
+	type CustomerTableHandle,
 } from "./table";
 import { renderRunBar, type RunBarHandle } from "./run-bar";
 import { fillContactCounts } from "./contact-counts";
@@ -71,6 +72,8 @@ export class WorkbenchView extends ItemView {
 	private openValuePicker: FilterCondition | null = null;
 	/** 每次重绘递增；异步补联系人数量时用它丢弃过期结果。 */
 	private renderToken = 0;
+	/** 当前表格的控制器：重绘前断开列宽 ResizeObserver。 */
+	private tableHandle: CustomerTableHandle | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: OutreachPluginApi) {
 		super(leaf);
@@ -101,6 +104,8 @@ export class WorkbenchView extends ItemView {
 	async onClose(): Promise<void> {
 		// 视图关闭后不再往已销毁的表格里补数据。
 		this.renderToken++;
+		this.tableHandle?.destroy();
+		this.tableHandle = null;
 	}
 
 	refresh(): void {
@@ -112,6 +117,8 @@ export class WorkbenchView extends ItemView {
 
 	private render(): void {
 		const token = ++this.renderToken;
+		this.tableHandle?.destroy();
+		this.tableHandle = null;
 		const container = this.contentEl;
 		container.empty();
 		container.addClass("eo-workbench");
@@ -228,6 +235,7 @@ export class WorkbenchView extends ItemView {
 				void plugin.saveSettings();
 			},
 		});
+		this.tableHandle = table;
 		fillContactCounts(
 			plugin.repo,
 			rows,

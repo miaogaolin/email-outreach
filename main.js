@@ -7185,13 +7185,17 @@ function propertyCell(view, entry, propertyId) {
         return "";
     }
 }
+/** 每次整块重画 root 前，先断掉上一张表的列宽 ResizeObserver。 */
+const tableCleanups = new WeakMap();
 function renderBasesRoot(root, view, plugin) {
-    var _a;
+    var _a, _b;
+    (_a = tableCleanups.get(root)) === null || _a === void 0 ? void 0 : _a();
+    tableCleanups.delete(root);
     // Bases 的数据更新会整块重画；勾选提醒、验收后刷新时保持当前滚动位置。
     const scroll = (0, scroll_preserve_1.captureViewScroll)(root);
     root.empty();
     root.addClass("eo-bases-root");
-    const entries = Array.isArray((_a = view.data) === null || _a === void 0 ? void 0 : _a.data) ? view.data.data : [];
+    const entries = Array.isArray((_b = view.data) === null || _b === void 0 ? void 0 : _b.data) ? view.data.data : [];
     const allRows = entries.map((entry) => ({
         entry,
         record: readRecord(entry),
@@ -7218,8 +7222,15 @@ function renderBasesRoot(root, view, plugin) {
     const body = root.createDiv({ cls: "eo-bases-body" });
     let showExcluded = false;
     let drawToken = 0;
+    /** 当前表格：重画前断开列宽 ResizeObserver。 */
+    let tableHandle = null;
+    const destroyTable = () => {
+        tableHandle === null || tableHandle === void 0 ? void 0 : tableHandle.destroy();
+        tableHandle = null;
+    };
     const drawTable = () => {
         var _a, _b, _c, _d, _e, _f;
+        destroyTable();
         const token = ++drawToken;
         body.empty();
         const search = searchInput.value.trim().toLowerCase();
@@ -7346,6 +7357,7 @@ function renderBasesRoot(root, view, plugin) {
                 void plugin.saveSettings();
             },
         });
+        tableHandle = table;
         (0, contact_counts_1.fillContactCounts)(plugin.repo, rows, table, () => token === drawToken);
         const info = body.createDiv({ cls: "eo-muted eo-bases-info" });
         const sort = (_f = (_e = (_d = view.config) === null || _d === void 0 ? void 0 : _d.getSort) === null || _e === void 0 ? void 0 : _e.call(_d)) !== null && _f !== void 0 ? _f : [];
@@ -7387,6 +7399,8 @@ function renderBasesRoot(root, view, plugin) {
     excludeToggle.addEventListener("change", drawTable);
     renderGenerationControls(generationBar, plugin, drawTable);
     drawTable();
+    // 下一次整块重画之前，先让旧表格断开 ResizeObserver。
+    tableCleanups.set(root, destroyTable);
     (0, scroll_preserve_1.restoreViewScroll)(root, scroll);
 }
 /** Bases 视图里的「最近生成」控件；写的是与内置工作台同一份设置。 */
@@ -7559,7 +7573,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.attachColumnResize = attachColumnResize;
 const column_widths_1 = require("src/core/column-widths.ts");
 function attachColumnResize(table, headerCells, options) {
+    var _a, _b;
     const columns = options.columns;
+    const fill = options.fill !== false;
     const widths = {};
     for (const column of columns) {
         widths[column.id] = (0, column_widths_1.clampColumnWidth)(column.width);
@@ -7572,8 +7588,33 @@ function attachColumnResize(table, headerCells, options) {
         colgroup.appendChild(col);
         colById.set(column.id, col);
     }
+    // 填充列没有固定宽度，由 layout() 按容器剩余空间写入。
+    const fillerCol = fill ? document.createElement("col") : null;
+    if (fillerCol)
+        colgroup.appendChild(fillerCol);
     // colgroup 必须是 table 的第一个子元素，否则浏览器会忽略它。
     table.insertBefore(colgroup, table.firstChild);
+    // 填充格的边框会随行/表头延伸，看起来仍是「整张表铺满」，但没有任何内容。
+    const fillerCells = [];
+    if (fill) {
+        const headerRow = (_b = (_a = headerCells[0]) === null || _a === void 0 ? void 0 : _a.parentElement) !== null && _b !== void 0 ? _b : null;
+        if (headerRow) {
+            const fillerHead = document.createElement("th");
+            fillerHead.className = "eo-col-filler";
+            fillerHead.setAttribute("aria-hidden", "true");
+            headerRow.appendChild(fillerHead);
+            fillerCells.push(fillerHead);
+        }
+        for (const body of Array.from(table.tBodies)) {
+            for (const row of Array.from(body.rows)) {
+                const cell = document.createElement("td");
+                cell.className = "eo-col-filler";
+                cell.setAttribute("aria-hidden", "true");
+                row.appendChild(cell);
+                fillerCells.push(cell);
+            }
+        }
+    }
     const totalWidth = () => {
         var _a;
         let total = 0;
@@ -7581,17 +7622,48 @@ function attachColumnResize(table, headerCells, options) {
             total += (_a = widths[column.id]) !== null && _a !== void 0 ? _a : 0;
         return total;
     };
-    const syncTableWidth = () => {
-        table.style.width = `${totalWidth()}px`;
+    /** 表格可用的宽度：滚动容器的内容宽度（不含滚动条/边框）。 */
+    const containerWidth = () => {
+        const parent = table.parentElement;
+        return parent ? parent.clientWidth : 0;
     };
-    syncTableWidth();
+    const layout = () => {
+        const sum = totalWidth();
+        const available = fill ? containerWidth() : 0;
+        const filler = Math.max(0, available - sum);
+        if (fillerCol)
+            fillerCol.style.width = `${filler}px`;
+        const display = filler > 0 ? "" : "none";
+        for (const cell of fillerCells) {
+            if (cell.style.display !== display)
+                cell.style.display = display;
+        }
+        table.style.width = `${Math.max(available, sum)}px`;
+    };
     const applyWidth = (id, width) => {
         widths[id] = width;
         const col = colById.get(id);
         if (col)
             col.style.width = `${width}px`;
-        syncTableWidth();
+        layout();
     };
+    layout();
+    let observer = null;
+    const destroy = () => {
+        observer === null || observer === void 0 ? void 0 : observer.disconnect();
+        observer = null;
+    };
+    const parent = table.parentElement;
+    if (fill && parent && typeof ResizeObserver !== "undefined") {
+        observer = new ResizeObserver(() => {
+            if (!table.isConnected) {
+                destroy();
+                return;
+            }
+            layout();
+        });
+        observer.observe(parent);
+    }
     columns.forEach((column, index) => {
         var _a;
         const header = headerCells[index];
@@ -7682,6 +7754,7 @@ function attachColumnResize(table, headerCells, options) {
         });
         header.appendChild(handle);
     });
+    return { layout, destroy };
 }
 
 };
@@ -8027,6 +8100,8 @@ class EmailListView extends obsidian_1.ItemView {
         this.countEl = null;
         this.dedupeWrap = null;
         this.dedupeLabelEl = null;
+        /** 当前表格的列宽控制器：重画前断开 ResizeObserver。 */
+        this.tableResizer = null;
     }
     getViewType() {
         return "email-outreach-emails";
@@ -8041,7 +8116,10 @@ class EmailListView extends obsidian_1.ItemView {
         await this.refresh();
     }
     async onClose() {
+        var _a;
         this.preview.destroy();
+        (_a = this.tableResizer) === null || _a === void 0 ? void 0 : _a.destroy();
+        this.tableResizer = null;
     }
     async refresh() {
         try {
@@ -8152,8 +8230,10 @@ class EmailListView extends obsidian_1.ItemView {
         button.addEventListener("click", () => this.plugin.openWorkbench());
     }
     renderBody() {
-        var _a, _b;
+        var _a, _b, _c;
         this.preview.hide();
+        (_a = this.tableResizer) === null || _a === void 0 ? void 0 : _a.destroy();
+        this.tableResizer = null;
         const target = this.tableContainer;
         if (!target)
             return;
@@ -8178,7 +8258,7 @@ class EmailListView extends obsidian_1.ItemView {
                 ? `已显示 ${result.hiddenDuplicateCount} 封旧待审`
                 : `已隐藏 ${result.hiddenDuplicateCount} 封同邮箱旧待审`);
         }
-        (_a = this.countEl) === null || _a === void 0 ? void 0 : _a.setText(countParts.join(" · "));
+        (_b = this.countEl) === null || _b === void 0 ? void 0 : _b.setText(countParts.join(" · "));
         if (this.dedupeWrap && this.dedupeLabelEl) {
             const relevant = result.hiddenDuplicateCount > 0 || this.showDuplicatePending;
             this.dedupeWrap.style.display = relevant ? "" : "none";
@@ -8220,21 +8300,6 @@ class EmailListView extends obsidian_1.ItemView {
         // 列宽和客户列表一样可以拖，并且记在设置里（按列 id）。
         const storedWidths = this.plugin.settings.columnWidths.emails;
         const mergedWidths = (0, column_widths_1.mergeColumnWidths)(EMAIL_COLUMNS.map((column) => ({ id: column.id, width: column.width })), storedWidths);
-        (0, column_resize_1.attachColumnResize)(table, headerCells, {
-            columns: EMAIL_COLUMNS.map((column) => {
-                var _a;
-                return ({
-                    id: column.id,
-                    label: column.label,
-                    width: (_a = mergedWidths[column.id]) !== null && _a !== void 0 ? _a : column.width,
-                    defaultWidth: column.width,
-                });
-            }),
-            onChange: (widths) => {
-                this.plugin.settings.columnWidths.emails = widths;
-                void this.plugin.saveSettings();
-            },
-        });
         const body = table.createEl("tbody");
         for (const row of rows) {
             const tr = body.createEl("tr", { cls: "eo-row" });
@@ -8287,7 +8352,7 @@ class EmailListView extends obsidian_1.ItemView {
                 row.record.suggestedTime
                     ? `客户当地时间 ${row.record.suggestedTime}${row.record.timezone ? ` · ${row.record.timezone}` : ""}`
                     : "",
-                (_b = row.record.timeReason) !== null && _b !== void 0 ? _b : "",
+                (_c = row.record.timeReason) !== null && _c !== void 0 ? _c : "",
             ]
                 .filter(Boolean)
                 .join("\n");
@@ -8324,6 +8389,22 @@ class EmailListView extends obsidian_1.ItemView {
                 updatedCell.setAttr("title", updatedAt);
             tr.createEl("td", { text: String(row.record.versions.length) });
         }
+        // 行都建好后再接列宽：填充列需要给每一行补一个单元格。
+        this.tableResizer = (0, column_resize_1.attachColumnResize)(table, headerCells, {
+            columns: EMAIL_COLUMNS.map((column) => {
+                var _a;
+                return ({
+                    id: column.id,
+                    label: column.label,
+                    width: (_a = mergedWidths[column.id]) !== null && _a !== void 0 ? _a : column.width,
+                    defaultWidth: column.width,
+                });
+            }),
+            onChange: (widths) => {
+                this.plugin.settings.columnWidths.emails = widths;
+                void this.plugin.saveSettings();
+            },
+        });
         this.syncSelectionUi();
     }
     /** 同步全选框、行选中样式与删除按钮；勾选时只更新界面，不整表重绘。 */
@@ -11060,6 +11141,7 @@ const EMPTY_HANDLE = {
     updateSelection() { },
     setContactCount() { },
     isConnected: () => false,
+    destroy() { },
 };
 function renderCustomerTable(container, options) {
     var _a, _b;
@@ -11129,16 +11211,6 @@ function renderCustomerTable(container, options) {
         }),
     ];
     const mergedWidths = (0, column_widths_1.mergeColumnWidths)(resizeColumns.map((column) => ({ id: column.id, width: column.width })), options.columnWidths);
-    (0, column_resize_1.attachColumnResize)(table, headerCells, {
-        columns: resizeColumns.map((column) => {
-            var _a;
-            return ({
-                ...column,
-                width: (_a = mergedWidths[column.id]) !== null && _a !== void 0 ? _a : column.width,
-            });
-        }),
-        onChange: (widths) => { var _a; return (_a = options.onColumnWidthsChange) === null || _a === void 0 ? void 0 : _a.call(options, widths); },
-    });
     const rowElements = new Map();
     const rowCheckboxes = new Map();
     const contactCounts = new Map();
@@ -11194,6 +11266,17 @@ function renderCustomerTable(container, options) {
     selectAllInput.addEventListener("change", () => {
         options.onToggleAll(selectAllInput.checked);
     });
+    // 行都建好后再接列宽：填充列需要给每一行补一个单元格。
+    const resizer = (0, column_resize_1.attachColumnResize)(table, headerCells, {
+        columns: resizeColumns.map((column) => {
+            var _a;
+            return ({
+                ...column,
+                width: (_a = mergedWidths[column.id]) !== null && _a !== void 0 ? _a : column.width,
+            });
+        }),
+        onChange: (widths) => { var _a; return (_a = options.onColumnWidthsChange) === null || _a === void 0 ? void 0 : _a.call(options, widths); },
+    });
     return {
         updateSelection(selected) {
             var _a;
@@ -11213,6 +11296,7 @@ function renderCustomerTable(container, options) {
                 renderContactCount(button, count);
         },
         isConnected: () => table.isConnected,
+        destroy: () => resizer.destroy(),
     };
 }
 function renderContactCount(button, count, loading = false) {
@@ -11461,6 +11545,8 @@ class WorkbenchView extends obsidian_1.ItemView {
         this.openValuePicker = null;
         /** 每次重绘递增；异步补联系人数量时用它丢弃过期结果。 */
         this.renderToken = 0;
+        /** 当前表格的控制器：重绘前断开列宽 ResizeObserver。 */
+        this.tableHandle = null;
         this.plugin = plugin;
         this.appRef = plugin.app;
         this.sortState = plugin.settings.builtinSort;
@@ -11481,8 +11567,11 @@ class WorkbenchView extends obsidian_1.ItemView {
         void this.plugin.refreshEmailList().then(() => this.render());
     }
     async onClose() {
+        var _a;
         // 视图关闭后不再往已销毁的表格里补数据。
         this.renderToken++;
+        (_a = this.tableHandle) === null || _a === void 0 ? void 0 : _a.destroy();
+        this.tableHandle = null;
     }
     refresh() {
         // 外部刷新（勾选提醒、验收、生成完成）不改变用户看到的位置。
@@ -11491,7 +11580,10 @@ class WorkbenchView extends obsidian_1.ItemView {
         (0, scroll_preserve_1.restoreViewScroll)(this.contentEl, scroll);
     }
     render() {
+        var _a;
         const token = ++this.renderToken;
+        (_a = this.tableHandle) === null || _a === void 0 ? void 0 : _a.destroy();
+        this.tableHandle = null;
         const container = this.contentEl;
         container.empty();
         container.addClass("eo-workbench");
@@ -11597,6 +11689,7 @@ class WorkbenchView extends obsidian_1.ItemView {
                 void plugin.saveSettings();
             },
         });
+        this.tableHandle = table;
         (0, contact_counts_1.fillContactCounts)(plugin.repo, rows, table, () => token === this.renderToken);
         const footer = container.createDiv({ cls: "eo-footer" });
         const info = footer.createDiv({ cls: "eo-muted eo-workbench-info" });

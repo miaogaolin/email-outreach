@@ -17,6 +17,7 @@ import {
 	renderCustomerTable,
 	type CustomerColumn,
 	type CustomerRow,
+	type CustomerTableHandle,
 } from "./table";
 import { DEV_STATUS_COLUMN_ID, renderDevStatusCell } from "./dev-status-cell";
 import { captureViewScroll, restoreViewScroll } from "./scroll-preserve";
@@ -95,11 +96,16 @@ function propertyCell(
 	}
 }
 
+/** 每次整块重画 root 前，先断掉上一张表的列宽 ResizeObserver。 */
+const tableCleanups = new WeakMap<HTMLElement, () => void>();
+
 function renderBasesRoot(
 	root: HTMLElement,
 	view: BasesViewLike,
 	plugin: OutreachPluginApi,
 ): void {
+	tableCleanups.get(root)?.();
+	tableCleanups.delete(root);
 	// Bases 的数据更新会整块重画；勾选提醒、验收后刷新时保持当前滚动位置。
 	const scroll = captureViewScroll(root);
 	root.empty();
@@ -135,7 +141,14 @@ function renderBasesRoot(
 	const body = root.createDiv({ cls: "eo-bases-body" });
 	let showExcluded = false;
 	let drawToken = 0;
+	/** 当前表格：重画前断开列宽 ResizeObserver。 */
+	let tableHandle: CustomerTableHandle | null = null;
+	const destroyTable = (): void => {
+		tableHandle?.destroy();
+		tableHandle = null;
+	};
 	const drawTable = (): void => {
+		destroyTable();
 		const token = ++drawToken;
 		body.empty();
 		const search = searchInput.value.trim().toLowerCase();
@@ -274,6 +287,7 @@ function renderBasesRoot(
 				void plugin.saveSettings();
 			},
 		});
+		tableHandle = table;
 		fillContactCounts(
 			plugin.repo,
 			rows,
@@ -330,6 +344,8 @@ function renderBasesRoot(
 	excludeToggle.addEventListener("change", drawTable);
 	renderGenerationControls(generationBar, plugin, drawTable);
 	drawTable();
+	// 下一次整块重画之前，先让旧表格断开 ResizeObserver。
+	tableCleanups.set(root, destroyTable);
 	restoreViewScroll(root, scroll);
 }
 

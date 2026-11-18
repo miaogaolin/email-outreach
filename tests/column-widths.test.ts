@@ -89,7 +89,7 @@ test("表格宽度等于可见列宽度之和", () => {
 	assertEqual(sumColumnWidths(["name", "missing"], { name: 240 }), 240, "缺列按 0 计");
 });
 
-test("表格不拉伸填满面板，否则拖动一列会连累其它列", () => {
+test("表格不靠 CSS 拉伸填满面板，否则拖动一列会连累其它列", () => {
 	// 去掉注释再匹配：注释里可能提到被禁用的写法。
 	const css = readFileSync("styles.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
 	const rule = css.match(/\.eo-table\s*\{[^}]*\}/);
@@ -102,5 +102,9 @@ test("表格不拉伸填满面板，否则拖动一列会连累其它列", () =>
 	assert(
 		!/min-width:\s*100%/.test(body),
 		"不要用 min-width: 100% 撑满面板：剩余宽度会被均摊给各列，拖动一列时其它列跟着变",
+	);
+	assert(
+		!/\bwidth:\s*100%/.test(body),
+		"不要用 width: 100% 撑满面板：同样会把剩余宽度分给各列；铺满应交给填充列",
 	);
 });

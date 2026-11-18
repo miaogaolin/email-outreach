@@ -15,7 +15,10 @@ import { formatBeijingTime } from "../core/send-time";
 import type { EmailRow, EmailStatus } from "../core/types";
 import { EMAIL_STATUSES } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
-import { attachColumnResize } from "./column-resize";
+import {
+	attachColumnResize,
+	type ColumnResizer,
+} from "./column-resize";
 import { confirm } from "./modals/confirm";
 import { PreviewController } from "./preview-popover";
 import { captureViewScroll, restoreViewScroll } from "./scroll-preserve";
@@ -66,6 +69,8 @@ export class EmailListView extends ItemView {
 	private countEl: HTMLElement | null = null;
 	private dedupeWrap: HTMLElement | null = null;
 	private dedupeLabelEl: HTMLElement | null = null;
+	/** 当前表格的列宽控制器：重画前断开 ResizeObserver。 */
+	private tableResizer: ColumnResizer | null = null;
 
 	constructor(
 		leaf: WorkspaceLeaf,
@@ -92,6 +97,8 @@ export class EmailListView extends ItemView {
 
 	async onClose(): Promise<void> {
 		this.preview.destroy();
+		this.tableResizer?.destroy();
+		this.tableResizer = null;
 	}
 
 	async refresh(): Promise<void> {
@@ -219,6 +226,8 @@ export class EmailListView extends ItemView {
 
 	private renderBody(): void {
 		this.preview.hide();
+		this.tableResizer?.destroy();
+		this.tableResizer = null;
 		const target = this.tableContainer;
 		if (!target) return;
 		target.empty();
@@ -294,18 +303,6 @@ export class EmailListView extends ItemView {
 			EMAIL_COLUMNS.map((column) => ({ id: column.id, width: column.width })),
 			storedWidths,
 		);
-		attachColumnResize(table, headerCells, {
-			columns: EMAIL_COLUMNS.map((column) => ({
-				id: column.id,
-				label: column.label,
-				width: mergedWidths[column.id] ?? column.width,
-				defaultWidth: column.width,
-			})),
-			onChange: (widths) => {
-				this.plugin.settings.columnWidths.emails = widths;
-				void this.plugin.saveSettings();
-			},
-		});
 
 		const body = table.createEl("tbody");
 		for (const row of rows) {
@@ -403,6 +400,19 @@ export class EmailListView extends ItemView {
 			if (updatedAt) updatedCell.setAttr("title", updatedAt);
 			tr.createEl("td", { text: String(row.record.versions.length) });
 		}
+		// 行都建好后再接列宽：填充列需要给每一行补一个单元格。
+		this.tableResizer = attachColumnResize(table, headerCells, {
+			columns: EMAIL_COLUMNS.map((column) => ({
+				id: column.id,
+				label: column.label,
+				width: mergedWidths[column.id] ?? column.width,
+				defaultWidth: column.width,
+			})),
+			onChange: (widths) => {
+				this.plugin.settings.columnWidths.emails = widths;
+				void this.plugin.saveSettings();
+			},
+		});
 		this.syncSelectionUi();
 	}
 
