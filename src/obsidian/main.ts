@@ -15,11 +15,9 @@ import {
 import type { AILogEntry } from "../core/ai-log";
 import { findContactByEmail } from "../core/contact-parser";
 import {
-	CONTACT_LOG_FOLLOW_UP_KEY,
 	CONTACT_LOG_LAST_CONTACT_KEY,
-	planContactLog,
+	formatContactLogDate,
 } from "../core/contact-log";
-import { parseFollowUpCount } from "../core/follow-up";
 import {
 	collectPropertyKeys,
 	isExcluded,
@@ -1228,7 +1226,7 @@ export default class EmailOutreachPlugin
 					}
 					container.createEl("p", {
 						cls: "eo-muted",
-						text: "发送后勾选发送提醒主任务，会先弹出确认框；确认后才更新客户最近联系时间和跟进次数。",
+						text: "发送后勾选发送提醒主任务，会直接把客户最近联系时间更新为当天，不改跟进次数。",
 					});
 				} else {
 					container.createEl("p", {
@@ -1418,7 +1416,7 @@ export default class EmailOutreachPlugin
 		}
 	}
 
-	/** 文件里的主任务被勾选后，弹确认框并更新客户联系记录。 */
+	/** 文件里的主任务被勾选后，直接把客户最近联系时间更新为当天。 */
 	private async checkCheckedReminders(path: string): Promise<void> {
 		if (!this.settings.outputDir.trim()) return;
 		let content: string;
@@ -1444,12 +1442,11 @@ export default class EmailOutreachPlugin
 			if (!record || record.status !== "Accepted") continue;
 			this.reminderCheckInFlight.add(key);
 			try {
-				const keepGoing = await this.handleCheckedReminder(
+				await this.handleCheckedReminder(
 					path,
 					record,
 					parsed.file.customerLink,
 				);
-				if (!keepGoing) break;
 			} finally {
 				this.reminderCheckInFlight.delete(key);
 			}
@@ -1460,12 +1457,12 @@ export default class EmailOutreachPlugin
 		path: string,
 		record: EmailRecord,
 		customerLink: string,
-	): Promise<boolean> {
+	): Promise<void> {
 		let content: string;
 		try {
 			content = await this.adapter.read(path);
 		} catch {
-			return true;
+			return;
 		}
 		const task = listEmailReminderTasks(content).find(
 			(item) =>
@@ -1475,53 +1472,18 @@ export default class EmailOutreachPlugin
 				!item.done &&
 				!isLegacyReminderBlock(item.block),
 		);
-		if (!task) return true;
+		if (!task) return;
 
 		const customer = await this.resolveCustomer(path, customerLink);
 		if (!customer) {
 			new Notice(`找不到客户文件，未更新联系记录：邮件 ${record.id}`);
 			await this.restoreReminderUnchecked(path, record.id);
-			return true;
+			return;
 		}
 
-		const now = new Date();
-		const currentCount = parseFollowUpCount(
-			customer.fm[CONTACT_LOG_FOLLOW_UP_KEY],
-		);
-		const planned = planContactLog(customer.fm, now);
-		const rawLast = customer.fm[CONTACT_LOG_LAST_CONTACT_KEY];
-		const lastText =
-			rawLast === undefined ||
-			rawLast === null ||
-			String(rawLast).trim() === ""
-				? "（空）"
-				: String(rawLast);
-		const confirmed = await confirm(this.app, {
-			title: "确认已发送？",
-			confirmText: "确认已发送",
-			build: (container) => {
-				container.createEl("p", { text: `客户：${customer.name}` });
-				container.createEl("p", {
-					text: `邮件：${record.id} · ${record.contact || record.email || "（无联系人）"}`,
-				});
-				container.createEl("p", {
-					text: `最近联系时间：${lastText} → ${planned.lastContact}`,
-				});
-				container.createEl("p", {
-					text: `跟进次数：${currentCount} → ${currentCount + 1}`,
-				});
-				container.createEl("p", {
-					cls: "eo-muted",
-					text: "勾选只表示准备发送，确认后才更新客户记录；取消会恢复未勾选。",
-				});
-			},
-		});
-		if (!confirmed) {
-			await this.restoreReminderUnchecked(path, record.id);
-			return false;
-		}
+		const lastContact = formatContactLogDate(new Date());
 
-		// 先写 sent 标记，避免同一任务在保存期间再次弹确认。
+		// 先写 sent 标记，避免同一任务在保存期间重复触发。
 		try {
 			const latest = await this.adapter.read(path);
 			const stillPending = listEmailReminderTasks(latest).some(
@@ -1531,7 +1493,7 @@ export default class EmailOutreachPlugin
 					item.checked &&
 					!item.done,
 			);
-			if (!stillPending) return true;
+			if (!stillPending) return;
 			const withSent = markEmailReminderSentInContent(latest, record.id);
 			if (withSent !== latest) {
 				await this.adapter.write(path, withSent);
@@ -1540,16 +1502,12 @@ export default class EmailOutreachPlugin
 			console.error("[email-outreach] 写入发送标记失败", error);
 			await this.restoreReminderUnchecked(path, record.id);
 			new Notice("写入发送标记失败，未更新客户联系记录");
-			return true;
+			return;
 		}
 
 		try {
 			await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
-				frontmatter[CONTACT_LOG_LAST_CONTACT_KEY] = planned.lastContact;
-				frontmatter[CONTACT_LOG_FOLLOW_UP_KEY] =
-					parseFollowUpCount(
-						frontmatter[CONTACT_LOG_FOLLOW_UP_KEY],
-					) + 1;
+				frontmatter[CONTACT_LOG_LAST_CONTACT_KEY] = lastContact;
 			});
 		} catch (error) {
 			console.error("[email-outreach] 更新客户联系记录失败", error);
@@ -1558,16 +1516,13 @@ export default class EmailOutreachPlugin
 				`更新客户联系记录失败：${error instanceof Error ? error.message : String(error)}`,
 				9000,
 			);
-			return true;
+			return;
 		}
 
-		new Notice(
-			`已记录发送：最近联系时间 ${planned.lastContact}；跟进次数 ${planned.followUpCount}`,
-		);
+		new Notice(`已更新最近联系时间：${lastContact}`);
 		this.repo.invalidate();
 		this.refreshWorkbenchViews();
 		await this.refreshEmailList();
-		return true;
 	}
 
 	private async restoreReminderUnchecked(

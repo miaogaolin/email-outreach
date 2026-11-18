@@ -546,7 +546,7 @@ export function markEmailReminderSentInContent(
 /**
  * 把指定主任务恢复为未勾选，并移除 sent 标记。
  *
- * 用于取消确认框、或写客户属性失败后的回滚。已勾选但没有 sent 标记的
+ * 用于写客户属性失败后的回滚。已勾选但没有 sent 标记的
  * 用户内容不受影响。
  */
 export function uncheckEmailReminderInContent(

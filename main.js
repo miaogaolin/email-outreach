@@ -21,7 +21,6 @@ const obsidian_1 = require("obsidian");
 const ai_file_1 = require("src/core/ai-file.ts");
 const contact_parser_1 = require("src/core/contact-parser.ts");
 const contact_log_1 = require("src/core/contact-log.ts");
-const follow_up_1 = require("src/core/follow-up.ts");
 const filters_1 = require("src/core/filters.ts");
 const generation_1 = require("src/core/generation.ts");
 const filenames_1 = require("src/core/filenames.ts");
@@ -980,7 +979,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
                     }
                     container.createEl("p", {
                         cls: "eo-muted",
-                        text: "发送后勾选发送提醒主任务，会先弹出确认框；确认后才更新客户最近联系时间和跟进次数。",
+                        text: "发送后勾选发送提醒主任务，会直接把客户最近联系时间更新为当天，不改跟进次数。",
                     });
                 }
                 else {
@@ -1142,7 +1141,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             new obsidian_1.Notice(`已转换 ${migrated} 条旧格式发送提醒`);
         }
     }
-    /** 文件里的主任务被勾选后，弹确认框并更新客户联系记录。 */
+    /** 文件里的主任务被勾选后，直接把客户最近联系时间更新为当天。 */
     async checkCheckedReminders(path) {
         if (!this.settings.outputDir.trim())
             return;
@@ -1167,9 +1166,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
                 continue;
             this.reminderCheckInFlight.add(key);
             try {
-                const keepGoing = await this.handleCheckedReminder(path, record, parsed.file.customerLink);
-                if (!keepGoing)
-                    break;
+                await this.handleCheckedReminder(path, record, parsed.file.customerLink);
             }
             finally {
                 this.reminderCheckInFlight.delete(key);
@@ -1182,7 +1179,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             content = await this.adapter.read(path);
         }
         catch (_a) {
-            return true;
+            return;
         }
         const task = (0, reminder_1.listEmailReminderTasks)(content).find((item) => item.kind === "email" &&
             item.emailId === record.id &&
@@ -1190,47 +1187,15 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             !item.done &&
             !(0, reminder_1.isLegacyReminderBlock)(item.block));
         if (!task)
-            return true;
+            return;
         const customer = await this.resolveCustomer(path, customerLink);
         if (!customer) {
             new obsidian_1.Notice(`找不到客户文件，未更新联系记录：邮件 ${record.id}`);
             await this.restoreReminderUnchecked(path, record.id);
-            return true;
+            return;
         }
-        const now = new Date();
-        const currentCount = (0, follow_up_1.parseFollowUpCount)(customer.fm[contact_log_1.CONTACT_LOG_FOLLOW_UP_KEY]);
-        const planned = (0, contact_log_1.planContactLog)(customer.fm, now);
-        const rawLast = customer.fm[contact_log_1.CONTACT_LOG_LAST_CONTACT_KEY];
-        const lastText = rawLast === undefined ||
-            rawLast === null ||
-            String(rawLast).trim() === ""
-            ? "（空）"
-            : String(rawLast);
-        const confirmed = await (0, confirm_1.confirm)(this.app, {
-            title: "确认已发送？",
-            confirmText: "确认已发送",
-            build: (container) => {
-                container.createEl("p", { text: `客户：${customer.name}` });
-                container.createEl("p", {
-                    text: `邮件：${record.id} · ${record.contact || record.email || "（无联系人）"}`,
-                });
-                container.createEl("p", {
-                    text: `最近联系时间：${lastText} → ${planned.lastContact}`,
-                });
-                container.createEl("p", {
-                    text: `跟进次数：${currentCount} → ${currentCount + 1}`,
-                });
-                container.createEl("p", {
-                    cls: "eo-muted",
-                    text: "勾选只表示准备发送，确认后才更新客户记录；取消会恢复未勾选。",
-                });
-            },
-        });
-        if (!confirmed) {
-            await this.restoreReminderUnchecked(path, record.id);
-            return false;
-        }
-        // 先写 sent 标记，避免同一任务在保存期间再次弹确认。
+        const lastContact = (0, contact_log_1.formatContactLogDate)(new Date());
+        // 先写 sent 标记，避免同一任务在保存期间重复触发。
         try {
             const latest = await this.adapter.read(path);
             const stillPending = (0, reminder_1.listEmailReminderTasks)(latest).some((item) => item.kind === "email" &&
@@ -1238,7 +1203,7 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
                 item.checked &&
                 !item.done);
             if (!stillPending)
-                return true;
+                return;
             const withSent = (0, reminder_1.markEmailReminderSentInContent)(latest, record.id);
             if (withSent !== latest) {
                 await this.adapter.write(path, withSent);
@@ -1248,26 +1213,23 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             console.error("[email-outreach] 写入发送标记失败", error);
             await this.restoreReminderUnchecked(path, record.id);
             new obsidian_1.Notice("写入发送标记失败，未更新客户联系记录");
-            return true;
+            return;
         }
         try {
             await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
-                frontmatter[contact_log_1.CONTACT_LOG_LAST_CONTACT_KEY] = planned.lastContact;
-                frontmatter[contact_log_1.CONTACT_LOG_FOLLOW_UP_KEY] =
-                    (0, follow_up_1.parseFollowUpCount)(frontmatter[contact_log_1.CONTACT_LOG_FOLLOW_UP_KEY]) + 1;
+                frontmatter[contact_log_1.CONTACT_LOG_LAST_CONTACT_KEY] = lastContact;
             });
         }
         catch (error) {
             console.error("[email-outreach] 更新客户联系记录失败", error);
             await this.restoreReminderUnchecked(path, record.id);
             new obsidian_1.Notice(`更新客户联系记录失败：${error instanceof Error ? error.message : String(error)}`, 9000);
-            return true;
+            return;
         }
-        new obsidian_1.Notice(`已记录发送：最近联系时间 ${planned.lastContact}；跟进次数 ${planned.followUpCount}`);
+        new obsidian_1.Notice(`已更新最近联系时间：${lastContact}`);
         this.repo.invalidate();
         this.refreshWorkbenchViews();
         await this.refreshEmailList();
-        return true;
     }
     async restoreReminderUnchecked(path, emailId) {
         try {
@@ -2837,26 +2799,16 @@ function channelDisplayLabel(tag) {
 __modules["src/core/contact-log.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.CONTACT_LOG_FOLLOW_UP_KEY = exports.CONTACT_LOG_LAST_CONTACT_KEY = void 0;
+exports.CONTACT_LOG_LAST_CONTACT_KEY = void 0;
 exports.formatContactLogDate = formatContactLogDate;
-exports.planContactLog = planContactLog;
-const follow_up_1 = require("src/core/follow-up.ts");
-/** 客户 frontmatter 里联系记录的两个字段。 */
+/** 客户 frontmatter 里记录最近联系时间的字段。 */
 exports.CONTACT_LOG_LAST_CONTACT_KEY = "最近联系时间";
-exports.CONTACT_LOG_FOLLOW_UP_KEY = "跟进次数";
 function pad(value) {
     return String(value).padStart(2, "0");
 }
 /** 本机日期，只到天：`YYYY-MM-DD`。 */
 function formatContactLogDate(now = new Date()) {
     return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-}
-/** 勾选提醒并确认后要写入客户 frontmatter 的值。 */
-function planContactLog(fm, now = new Date()) {
-    return {
-        lastContact: formatContactLogDate(now),
-        followUpCount: (0, follow_up_1.parseFollowUpCount)(fm[exports.CONTACT_LOG_FOLLOW_UP_KEY]) + 1,
-    };
 }
 
 };
@@ -5641,7 +5593,7 @@ function markEmailReminderSentInContent(content, emailId) {
 /**
  * 把指定主任务恢复为未勾选，并移除 sent 标记。
  *
- * 用于取消确认框、或写客户属性失败后的回滚。已勾选但没有 sent 标记的
+ * 用于写客户属性失败后的回滚。已勾选但没有 sent 标记的
  * 用户内容不受影响。
  */
 function uncheckEmailReminderInContent(content, emailId) {
