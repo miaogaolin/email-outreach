@@ -19,6 +19,7 @@ import {
 	type CustomerRow,
 } from "./table";
 import { DEV_STATUS_COLUMN_ID, renderDevStatusCell } from "./dev-status-cell";
+import { captureViewScroll, restoreViewScroll } from "./scroll-preserve";
 
 export const BASES_VIEW_TYPE = "email-outreach-customers";
 export const BASES_VIEW_NAME = "Email Outreach 客户工作台";
@@ -99,6 +100,8 @@ function renderBasesRoot(
 	view: BasesViewLike,
 	plugin: OutreachPluginApi,
 ): void {
+	// Bases 的数据更新会整块重画；勾选提醒、验收后刷新时保持当前滚动位置。
+	const scroll = captureViewScroll(root);
 	root.empty();
 	root.addClass("eo-bases-root");
 
@@ -318,6 +321,7 @@ function renderBasesRoot(
 	excludeToggle.addEventListener("change", drawTable);
 	renderGenerationControls(generationBar, plugin, drawTable);
 	drawTable();
+	restoreViewScroll(root, scroll);
 }
 
 /** Bases 视图里的「最近生成」控件；写的是与内置工作台同一份设置。 */

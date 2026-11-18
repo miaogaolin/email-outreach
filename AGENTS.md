@@ -80,6 +80,7 @@ node scripts/smoke-load.cjs
 - `.obsidian/` 不被 vault 索引，也不是 fast-note-sync 的同步对象；备份靠 git push。
 - 发送时间用 `Intl.DateTimeFormat` 按客户 IANA 时区计算，测试传固定 `now`；不要用运行机器本地时区猜客户时间。
 - AI 文件末尾的 `## 发送提醒` 属于 `trailing`，不是邮件块；改邮件时用 `updateEmailInContent` 会保留它，单独增删提醒用 `src/core/reminder.ts`。提醒的邮件链接是**同文件**标题链接 `[[#邮件 ...]]`，不要改成文件路径；勾选后的幂等依赖 `eo-reminder-sent` 标记，删除任务时必须一起清理。
+- 写已打开的文件会让 Obsidian 重新加载视图，阅读视图可能被滚回开头（勾选发送提醒后最明显）。所有落盘统一走 `VaultAdapter.write` / `updateFrontmatter`，它们会用 `src/obsidian/scroll-preserve.ts` 记录并还原阅读/编辑位置；不要在别处直接 `vault.modify`，也不要在刷新插件视图时跳过 `captureViewScroll` / `restoreViewScroll`。
 
 ## 提交约定
 

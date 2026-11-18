@@ -16,6 +16,7 @@ import { EMAIL_STATUSES } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
 import { confirm } from "./modals/confirm";
 import { PreviewController } from "./preview-popover";
+import { captureViewScroll, restoreViewScroll } from "./scroll-preserve";
 
 const STATUS_LABELS: Record<EmailStatus | "all", string> = {
 	all: "全部状态",
@@ -81,8 +82,12 @@ export class EmailListView extends ItemView {
 		} catch (error) {
 			console.error("[email-outreach] 刷新邮件列表失败", error);
 		}
+		// 外部刷新（勾选提醒、验收、生成完成）不改变用户看到的位置；
+		// 位置在重画前一刻取，避免读盘期间用户滚动被拉回去。
+		const scroll = captureViewScroll(this.contentEl);
 		// 刷新不清空客户筛选 / 搜索 / 状态，只重画内容。
 		this.render();
+		restoreViewScroll(this.contentEl, scroll);
 	}
 
 	/** 由工作台「开发状态」单元格调用；null 表示回到全部客户。 */

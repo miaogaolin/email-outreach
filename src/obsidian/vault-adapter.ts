@@ -1,5 +1,9 @@
 import { App, TFile, TFolder, normalizePath } from "obsidian";
 import { joinPath } from "../core/filenames";
+import {
+	captureMarkdownPositions,
+	restoreMarkdownPositions,
+} from "./scroll-preserve";
 
 export interface FrontmatterRecord {
 	[key: string]: unknown;
@@ -32,7 +36,11 @@ export class VaultAdapter {
 		const normalized = normalizePath(path);
 		const existing = this.getFile(normalized);
 		if (existing) {
+			// 文件可能正开在阅读视图里：写入后 Obsidian 会重新加载它，
+			// 位置被滚回开头时补回去，避免勾选提醒后页面跳回顶部。
+			const positions = captureMarkdownPositions(this.app, normalized);
 			await this.app.vault.modify(existing, content);
+			restoreMarkdownPositions(positions);
 			return;
 		}
 		const parent = normalized.split("/").slice(0, -1).join("/");
@@ -90,11 +98,13 @@ export class VaultAdapter {
 	): Promise<void> {
 		const file = this.getFile(path);
 		if (!file) throw new Error(`文件不存在：${path}`);
+		const positions = captureMarkdownPositions(this.app, file.path);
 		await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
 			const record = frontmatter as FrontmatterRecord;
 			delete record.position;
 			mutate(record);
 		});
+		restoreMarkdownPositions(positions);
 	}
 
 	async rename(oldPath: string, newPath: string): Promise<void> {

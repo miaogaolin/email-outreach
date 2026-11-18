@@ -29,6 +29,7 @@ import { fillContactCounts } from "./contact-counts";
 import { summarizeRunStatuses, statusLabel } from "../core/run-status";
 import { ColumnsModal } from "./modals/columns";
 import { DEV_STATUS_COLUMN_ID, renderDevStatusCell } from "./dev-status-cell";
+import { captureViewScroll, restoreViewScroll } from "./scroll-preserve";
 
 const DEFAULT_COLUMNS = [
 	"客户类型",
@@ -103,7 +104,10 @@ export class WorkbenchView extends ItemView {
 	}
 
 	refresh(): void {
+		// 外部刷新（勾选提醒、验收、生成完成）不改变用户看到的位置。
+		const scroll = captureViewScroll(this.contentEl);
 		this.render();
+		restoreViewScroll(this.contentEl, scroll);
 	}
 
 	private render(): void {

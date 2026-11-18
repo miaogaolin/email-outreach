@@ -14,6 +14,7 @@ import "./channel-labels.test";
 import "./contact-log.test";
 import "./obsidian-dom.test";
 import "./models.test";
+import "./view-scroll.test";
 import { runAll } from "./harness";
 
 void runAll();

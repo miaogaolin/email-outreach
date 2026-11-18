@@ -6513,6 +6513,22 @@ exports.EMAIL_STATUSES = [
 exports.MAX_EMAILS_PER_CUSTOMER = 5;
 
 };
+__modules["src/core/view-scroll.ts"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.decideScrollRestore = decideScrollRestore;
+function decideScrollRestore(saved, current) {
+    if (!isPosition(saved) || saved < 1)
+        return "keep";
+    if (!isPosition(current))
+        return "retry";
+    return current < 1 ? "restore" : "keep";
+}
+function isPosition(value) {
+    return typeof value === "number" && Number.isFinite(value);
+}
+
+};
 __modules["src/core/wikilinks.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -7027,6 +7043,7 @@ const contact_counts_1 = require("src/obsidian/contact-counts.ts");
 const run_bar_1 = require("src/obsidian/run-bar.ts");
 const table_1 = require("src/obsidian/table.ts");
 const dev_status_cell_1 = require("src/obsidian/dev-status-cell.ts");
+const scroll_preserve_1 = require("src/obsidian/scroll-preserve.ts");
 exports.BASES_VIEW_TYPE = "email-outreach-customers";
 exports.BASES_VIEW_NAME = "Email Outreach 客户工作台";
 function readRecord(entry) {
@@ -7076,6 +7093,8 @@ function propertyCell(view, entry, propertyId) {
 }
 function renderBasesRoot(root, view, plugin) {
     var _a;
+    // Bases 的数据更新会整块重画；勾选提醒、验收后刷新时保持当前滚动位置。
+    const scroll = (0, scroll_preserve_1.captureViewScroll)(root);
     root.empty();
     root.addClass("eo-bases-root");
     const entries = Array.isArray((_a = view.data) === null || _a === void 0 ? void 0 : _a.data) ? view.data.data : [];
@@ -7265,6 +7284,7 @@ function renderBasesRoot(root, view, plugin) {
     excludeToggle.addEventListener("change", drawTable);
     renderGenerationControls(generationBar, plugin, drawTable);
     drawTable();
+    (0, scroll_preserve_1.restoreViewScroll)(root, scroll);
 }
 /** Bases 视图里的「最近生成」控件；写的是与内置工作台同一份设置。 */
 function renderGenerationControls(container, plugin, onChange) {
@@ -7727,6 +7747,7 @@ const send_time_1 = require("src/core/send-time.ts");
 const types_1 = require("src/core/types.ts");
 const confirm_1 = require("src/obsidian/modals/confirm.ts");
 const preview_popover_1 = require("src/obsidian/preview-popover.ts");
+const scroll_preserve_1 = require("src/obsidian/scroll-preserve.ts");
 const STATUS_LABELS = {
     all: "全部状态",
     Generated: "待审核",
@@ -7777,8 +7798,12 @@ class EmailListView extends obsidian_1.ItemView {
         catch (error) {
             console.error("[email-outreach] 刷新邮件列表失败", error);
         }
+        // 外部刷新（勾选提醒、验收、生成完成）不改变用户看到的位置；
+        // 位置在重画前一刻取，避免读盘期间用户滚动被拉回去。
+        const scroll = (0, scroll_preserve_1.captureViewScroll)(this.contentEl);
         // 刷新不清空客户筛选 / 搜索 / 状态，只重画内容。
         this.render();
+        (0, scroll_preserve_1.restoreViewScroll)(this.contentEl, scroll);
     }
     /** 由工作台「开发状态」单元格调用；null 表示回到全部客户。 */
     setCustomerFilter(filter) {
@@ -9847,6 +9872,95 @@ function renderRunBar(container, options) {
 }
 
 };
+__modules["src/obsidian/scroll-preserve.ts"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.captureMarkdownPositions = captureMarkdownPositions;
+exports.restoreMarkdownPositions = restoreMarkdownPositions;
+exports.captureViewScroll = captureViewScroll;
+exports.restoreViewScroll = restoreViewScroll;
+const obsidian_1 = require("obsidian");
+const view_scroll_1 = require("src/core/view-scroll.ts");
+/** 记录当前打开着这个文件的 Markdown 视图位置；写入前调用。 */
+function captureMarkdownPositions(app, path) {
+    var _a;
+    const positions = [];
+    for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+        const view = leaf.view;
+        if (!(view instanceof obsidian_1.MarkdownView))
+            continue;
+        if (((_a = view.file) === null || _a === void 0 ? void 0 : _a.path) !== path)
+            continue;
+        const scroll = readScroll(view.currentMode);
+        if (scroll === null)
+            continue;
+        positions.push({ leaf, path, mode: view.getMode(), scroll });
+    }
+    return positions;
+}
+/**
+ * 把被重置到开头的视图拉回写入前的位置；多次尝试是因为 Obsidian 的重新渲染
+ * 是异步的（阅读视图解析完成前 `getScroll` 会返回 null）。
+ */
+function restoreMarkdownPositions(positions) {
+    if (positions.length === 0)
+        return;
+    const run = () => {
+        var _a;
+        for (const item of positions) {
+            const view = item.leaf.view;
+            if (!(view instanceof obsidian_1.MarkdownView))
+                continue;
+            if (((_a = view.file) === null || _a === void 0 ? void 0 : _a.path) !== item.path)
+                continue;
+            if (view.getMode() !== item.mode)
+                continue;
+            const current = readScroll(view.currentMode);
+            if ((0, view_scroll_1.decideScrollRestore)(item.scroll, current) !== "restore")
+                continue;
+            try {
+                view.currentMode.applyScroll(item.scroll);
+            }
+            catch (error) {
+                console.error("[email-outreach] 还原阅读位置失败", error);
+            }
+        }
+    };
+    run();
+    // 渲染完成时间不确定：逐次检查，位置回到原处后自然不再动作。
+    for (const delay of [60, 160, 320, 620, 1000]) {
+        window.setTimeout(run, delay);
+    }
+}
+function readScroll(mode) {
+    if (!mode)
+        return null;
+    const scroll = mode.getScroll();
+    return typeof scroll === "number" && Number.isFinite(scroll) ? scroll : null;
+}
+/** 记录插件视图（工作台 / 邮件列表 / Bases）的滚动位置；重绘前调用。 */
+function captureViewScroll(root) {
+    return {
+        root: root.scrollTop,
+        tables: Array.from(root.querySelectorAll(".eo-table-wrap")).map((element) => element.scrollTop),
+    };
+}
+/** 重绘完成后把插件视图的滚动位置放回去，避免刷新把列表滚回顶部。 */
+function restoreViewScroll(root, state) {
+    const apply = () => {
+        root.scrollTop = state.root;
+        const tables = root.querySelectorAll(".eo-table-wrap");
+        tables.forEach((element, index) => {
+            const top = state.tables[index];
+            if (top !== undefined)
+                element.scrollTop = top;
+        });
+    };
+    apply();
+    window.requestAnimationFrame(apply);
+}
+
+};
 __modules["src/obsidian/settings-tab.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -10818,6 +10932,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.VaultAdapter = void 0;
 const obsidian_1 = require("obsidian");
 const filenames_1 = require("src/core/filenames.ts");
+const scroll_preserve_1 = require("src/obsidian/scroll-preserve.ts");
 class VaultAdapter {
     constructor(app) {
         this.app = app;
@@ -10843,7 +10958,11 @@ class VaultAdapter {
         const normalized = (0, obsidian_1.normalizePath)(path);
         const existing = this.getFile(normalized);
         if (existing) {
+            // 文件可能正开在阅读视图里：写入后 Obsidian 会重新加载它，
+            // 位置被滚回开头时补回去，避免勾选提醒后页面跳回顶部。
+            const positions = (0, scroll_preserve_1.captureMarkdownPositions)(this.app, normalized);
             await this.app.vault.modify(existing, content);
+            (0, scroll_preserve_1.restoreMarkdownPositions)(positions);
             return;
         }
         const parent = normalized.split("/").slice(0, -1).join("/");
@@ -10905,11 +11024,13 @@ class VaultAdapter {
         const file = this.getFile(path);
         if (!file)
             throw new Error(`文件不存在：${path}`);
+        const positions = (0, scroll_preserve_1.captureMarkdownPositions)(this.app, file.path);
         await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
             const record = frontmatter;
             delete record.position;
             mutate(record);
         });
+        (0, scroll_preserve_1.restoreMarkdownPositions)(positions);
     }
     async rename(oldPath, newPath) {
         const file = this.getFile(oldPath);
@@ -10992,6 +11113,7 @@ const contact_counts_1 = require("src/obsidian/contact-counts.ts");
 const run_status_1 = require("src/core/run-status.ts");
 const columns_1 = require("src/obsidian/modals/columns.ts");
 const dev_status_cell_1 = require("src/obsidian/dev-status-cell.ts");
+const scroll_preserve_1 = require("src/obsidian/scroll-preserve.ts");
 const DEFAULT_COLUMNS = [
     "客户类型",
     "地区",
@@ -11055,7 +11177,10 @@ class WorkbenchView extends obsidian_1.ItemView {
         this.renderToken++;
     }
     refresh() {
+        // 外部刷新（勾选提醒、验收、生成完成）不改变用户看到的位置。
+        const scroll = (0, scroll_preserve_1.captureViewScroll)(this.contentEl);
         this.render();
+        (0, scroll_preserve_1.restoreViewScroll)(this.contentEl, scroll);
     }
     render() {
         const token = ++this.renderToken;
