@@ -19,6 +19,7 @@ __modules["src/obsidian/main.ts"] = function(module, exports, require) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const obsidian_1 = require("obsidian");
 const ai_file_1 = require("src/core/ai-file.ts");
+const column_widths_1 = require("src/core/column-widths.ts");
 const contact_parser_1 = require("src/core/contact-parser.ts");
 const contact_log_1 = require("src/core/contact-log.ts");
 const filters_1 = require("src/core/filters.ts");
@@ -289,6 +290,8 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
             merged.availableModels = [];
         // 手改坏的 data.json 不能让筛选/冷却失效。
         merged.generationFilter = (0, generation_1.normalizeGenerationFilter)(stored === null || stored === void 0 ? void 0 : stored.generationFilter);
+        // 列宽同理：非法值丢弃，旧版本没有这个字段时用空表（各列默认宽度）。
+        merged.columnWidths = (0, column_widths_1.normalizeTableColumnWidths)(stored === null || stored === void 0 ? void 0 : stored.columnWidths);
         const cooldown = Number(merged.generateCooldownHours);
         merged.generateCooldownHours =
             Number.isFinite(cooldown) && cooldown >= 0 && cooldown <= 720
@@ -2793,6 +2796,97 @@ function channelDisplayLabel(tag) {
     if (!suffix)
         return "其它渠道";
     return (_b = CHANNEL_LABELS[normalizeSuffix(suffix)]) !== null && _b !== void 0 ? _b : suffix;
+}
+
+};
+__modules["src/core/column-widths.ts"] = function(module, exports, require) {
+"use strict";
+/**
+ * 表格列宽的纯逻辑：夹取、归一化、默认值合并。
+ *
+ * 宽度只以「列 id → 像素」的形式保存在 data.json 里；DOM 操作在
+ * `src/obsidian/column-resize.ts`。放在 core 是为了能直接单测，
+ * 也避免把用户手改坏的 data.json 带进渲染层（负宽、字符串、NaN 一律忽略）。
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.EMPTY_TABLE_COLUMN_WIDTHS = exports.MAX_COLUMN_WIDTH = exports.MIN_COLUMN_WIDTH = void 0;
+exports.clampColumnWidth = clampColumnWidth;
+exports.resizeColumnWidth = resizeColumnWidth;
+exports.normalizeWidthMap = normalizeWidthMap;
+exports.normalizeTableColumnWidths = normalizeTableColumnWidths;
+exports.mergeColumnWidths = mergeColumnWidths;
+exports.sumColumnWidths = sumColumnWidths;
+/** 再窄就点不到表头/勾选框了；再宽会把其它列挤到看不见。 */
+exports.MIN_COLUMN_WIDTH = 32;
+exports.MAX_COLUMN_WIDTH = 1200;
+exports.EMPTY_TABLE_COLUMN_WIDTHS = {
+    customers: {},
+    emails: {},
+};
+function clampColumnWidth(width) {
+    if (Number.isNaN(width))
+        return exports.MIN_COLUMN_WIDTH;
+    return Math.min(exports.MAX_COLUMN_WIDTH, Math.max(exports.MIN_COLUMN_WIDTH, Math.round(width)));
+}
+/** 拖动时用：起始宽度 + 位移，再夹到合法区间。 */
+function resizeColumnWidth(startWidth, deltaX) {
+    if (!Number.isFinite(startWidth))
+        return exports.MIN_COLUMN_WIDTH;
+    if (!Number.isFinite(deltaX))
+        return clampColumnWidth(startWidth);
+    return clampColumnWidth(startWidth + deltaX);
+}
+/**
+ * 把任意值收敛成 `列 id → 宽度`：只接受有限正数，其余静默丢弃。
+ * 不用抛错——data.json 被手改坏时，表格应该按默认宽度继续渲染。
+ */
+function normalizeWidthMap(value) {
+    const result = {};
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        return result;
+    for (const [id, raw] of Object.entries(value)) {
+        if (!id)
+            continue;
+        const width = typeof raw === "number" ? raw : Number(raw);
+        if (!Number.isFinite(width) || width <= 0)
+            continue;
+        result[id] = clampColumnWidth(width);
+    }
+    return result;
+}
+function normalizeTableColumnWidths(value) {
+    const source = value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    return {
+        customers: normalizeWidthMap(source.customers),
+        emails: normalizeWidthMap(source.emails),
+    };
+}
+/**
+ * 默认宽度 + 已保存宽度的合并结果。已保存的键即使当前没有对应列也保留，
+ * 这样重新勾选属性列时还能沿用用户上次拖好的宽度。
+ */
+function mergeColumnWidths(defaults, stored) {
+    const result = {};
+    for (const { id, width } of defaults) {
+        result[id] = clampColumnWidth(width);
+    }
+    for (const [id, width] of Object.entries(stored !== null && stored !== void 0 ? stored : {})) {
+        if (!id || !Number.isFinite(width) || width <= 0)
+            continue;
+        result[id] = clampColumnWidth(width);
+    }
+    return result;
+}
+/** 表格实际宽度 = 各列宽度之和；用于 `table.style.width`，超出容器时横向滚动。 */
+function sumColumnWidths(ids, widths) {
+    let total = 0;
+    for (const id of ids) {
+        const width = widths[id];
+        total += Number.isFinite(width) ? Math.max(0, width) : 0;
+    }
+    return total;
 }
 
 };
@@ -7242,6 +7336,15 @@ function renderBasesRoot(root, view, plugin) {
             emptyText: entries.length === 0
                 ? "当前 Base 没有匹配的客户。请在 Base 里调整筛选条件。"
                 : "没有符合当前搜索/排除条件的客户",
+            columnWidths: plugin.settings.columnWidths.customers,
+            onColumnWidthsChange: (widths) => {
+                // 保留暂时隐藏的列的宽度：重新勾选时还能沿用。
+                plugin.settings.columnWidths.customers = {
+                    ...plugin.settings.columnWidths.customers,
+                    ...widths,
+                };
+                void plugin.saveSettings();
+            },
         });
         (0, contact_counts_1.fillContactCounts)(plugin.repo, rows, table, () => token === drawToken);
         const info = body.createDiv({ cls: "eo-muted eo-bases-info" });
@@ -7447,6 +7550,143 @@ function registerBasesView(plugin) {
         console.error("[email-outreach] 注册 Bases 视图失败", error);
         return false;
     }
+}
+
+};
+__modules["src/obsidian/column-resize.ts"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.attachColumnResize = attachColumnResize;
+const column_widths_1 = require("src/core/column-widths.ts");
+function attachColumnResize(table, headerCells, options) {
+    const columns = options.columns;
+    const widths = {};
+    for (const column of columns) {
+        widths[column.id] = (0, column_widths_1.clampColumnWidth)(column.width);
+    }
+    const colgroup = document.createElement("colgroup");
+    const colById = new Map();
+    for (const column of columns) {
+        const col = document.createElement("col");
+        col.style.width = `${widths[column.id]}px`;
+        colgroup.appendChild(col);
+        colById.set(column.id, col);
+    }
+    // colgroup 必须是 table 的第一个子元素，否则浏览器会忽略它。
+    table.insertBefore(colgroup, table.firstChild);
+    const totalWidth = () => {
+        var _a;
+        let total = 0;
+        for (const column of columns)
+            total += (_a = widths[column.id]) !== null && _a !== void 0 ? _a : 0;
+        return total;
+    };
+    const syncTableWidth = () => {
+        table.style.width = `${totalWidth()}px`;
+    };
+    syncTableWidth();
+    const applyWidth = (id, width) => {
+        widths[id] = width;
+        const col = colById.get(id);
+        if (col)
+            col.style.width = `${width}px`;
+        syncTableWidth();
+    };
+    columns.forEach((column, index) => {
+        var _a;
+        const header = headerCells[index];
+        if (!header)
+            return;
+        const handle = document.createElement("div");
+        handle.className = "eo-col-resizer";
+        handle.setAttribute("role", "separator");
+        handle.setAttribute("aria-orientation", "vertical");
+        handle.setAttribute("aria-label", `调整「${(_a = column.label) !== null && _a !== void 0 ? _a : column.id}」列宽`);
+        handle.setAttribute("title", "拖动调整列宽；双击恢复默认；聚焦后按 ←/→ 微调");
+        handle.tabIndex = 0;
+        // 表头可点排序：手柄上的点击/双击不能冒泡到 th。
+        handle.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        // 双击恢复默认。不用 dblclick 事件：拖拽里对 pointerdown 做了
+        // preventDefault，个别内核会吞掉兼容鼠标事件，自己判定更稳。
+        let lastDownAt = 0;
+        let lastDownX = 0;
+        handle.addEventListener("keydown", (event) => {
+            var _a;
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+                return;
+            event.preventDefault();
+            event.stopPropagation();
+            const step = event.shiftKey ? 40 : 8;
+            const delta = event.key === "ArrowLeft" ? -step : step;
+            applyWidth(column.id, (0, column_widths_1.resizeColumnWidth)((_a = widths[column.id]) !== null && _a !== void 0 ? _a : column.width, delta));
+            options.onChange({ ...widths });
+        });
+        handle.addEventListener("pointerdown", (event) => {
+            var _a, _b, _c, _d;
+            if (event.button !== 0)
+                return;
+            event.preventDefault();
+            event.stopPropagation();
+            // 阻止默认行为后浏览器不再给焦点，手动给上：拖完可以直接按 ←/→。
+            handle.focus({ preventScroll: true });
+            const now = Date.now();
+            const doubleClick = now - lastDownAt <= 350 && Math.abs(event.clientX - lastDownX) <= 6;
+            lastDownAt = now;
+            lastDownX = event.clientX;
+            if (doubleClick) {
+                lastDownAt = 0;
+                applyWidth(column.id, (0, column_widths_1.clampColumnWidth)((_a = column.defaultWidth) !== null && _a !== void 0 ? _a : column.width));
+                options.onChange({ ...widths });
+                return;
+            }
+            const pointerId = event.pointerId;
+            const startX = event.clientX;
+            const startWidth = (_b = widths[column.id]) !== null && _b !== void 0 ? _b : column.width;
+            // 表格比容器窄时 CSS 的 min-width: 100% 会把各列按比例放大；
+            // 这里换算回「设置里的像素」，避免拖动时手柄和指针越拖越偏。
+            const total = totalWidth();
+            const rendered = table.getBoundingClientRect().width;
+            const scale = total > 0 && rendered > total ? rendered / total : 1;
+            // 指针捕获让手指移出手柄后仍能继续拖；旧内核不支持时靠 window 监听兜底。
+            const pointerHost = (_d = (_c = table.ownerDocument) === null || _c === void 0 ? void 0 : _c.defaultView) !== null && _d !== void 0 ? _d : window;
+            if (typeof handle.setPointerCapture === "function") {
+                try {
+                    handle.setPointerCapture(pointerId);
+                }
+                catch (_e) {
+                    // 某些旧内核不支持捕获；不捕获也能拖，只是移出手柄会断。
+                }
+            }
+            handle.classList.add("is-dragging");
+            table.classList.add("is-col-resizing");
+            const move = (moveEvent) => {
+                if (moveEvent.pointerId !== pointerId)
+                    return;
+                applyWidth(column.id, (0, column_widths_1.resizeColumnWidth)(startWidth, (moveEvent.clientX - startX) / scale));
+            };
+            const finish = () => {
+                pointerHost.removeEventListener("pointermove", move);
+                pointerHost.removeEventListener("pointerup", finish);
+                pointerHost.removeEventListener("pointercancel", finish);
+                handle.classList.remove("is-dragging");
+                table.classList.remove("is-col-resizing");
+                if (typeof handle.hasPointerCapture === "function" &&
+                    handle.hasPointerCapture(pointerId)) {
+                    handle.releasePointerCapture(pointerId);
+                }
+                if (widths[column.id] !== startWidth) {
+                    options.onChange({ ...widths });
+                }
+            };
+            pointerHost.addEventListener("pointermove", move);
+            pointerHost.addEventListener("pointerup", finish);
+            pointerHost.addEventListener("pointercancel", finish);
+        });
+        header.appendChild(handle);
+    });
 }
 
 };
@@ -7740,11 +7980,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.EmailListView = void 0;
 const obsidian_1 = require("obsidian");
 const ai_file_1 = require("src/core/ai-file.ts");
+const column_widths_1 = require("src/core/column-widths.ts");
 const email_list_1 = require("src/core/email-list.ts");
 const run_status_1 = require("src/core/run-status.ts");
 const selection_1 = require("src/core/selection.ts");
 const send_time_1 = require("src/core/send-time.ts");
 const types_1 = require("src/core/types.ts");
+const column_resize_1 = require("src/obsidian/column-resize.ts");
 const confirm_1 = require("src/obsidian/modals/confirm.ts");
 const preview_popover_1 = require("src/obsidian/preview-popover.ts");
 const scroll_preserve_1 = require("src/obsidian/scroll-preserve.ts");
@@ -7754,6 +7996,21 @@ const STATUS_LABELS = {
     Accepted: "已验收",
     Rejected: "已拒绝",
 };
+/**
+ * 邮件列表的列定义：id 用于保存列宽，width 是新用户的默认宽度。
+ * 顺序即渲染顺序；`__select` 是勾选列，渲染时特殊处理。
+ */
+const EMAIL_COLUMNS = [
+    { id: "__select", label: "选择", width: 40 },
+    { id: "customer", label: "客户", width: 170 },
+    { id: "contact", label: "联系人", width: 110 },
+    { id: "email", label: "邮箱", width: 210 },
+    { id: "summary", label: "中文摘要", width: 320 },
+    { id: "time", label: "建议发送时间（北京）", width: 175 },
+    { id: "status", label: "状态", width: 90 },
+    { id: "updated", label: "更新时间", width: 110 },
+    { id: "versions", label: "版本", width: 56 },
+];
 class EmailListView extends obsidian_1.ItemView {
     constructor(leaf, plugin) {
         super(leaf);
@@ -7941,34 +8198,48 @@ class EmailListView extends obsidian_1.ItemView {
         }
         const table = target.createEl("table", { cls: "eo-table eo-email-table" });
         const head = table.createEl("thead").createEl("tr");
-        const selectTh = head.createEl("th", { cls: "eo-col-select" });
-        this.selectAllInput = selectTh.createEl("input", {
-            type: "checkbox",
-            attr: { "aria-label": "全选当前邮件" },
-        });
-        this.selectAllInput.addEventListener("change", () => {
-            var _a;
-            if ((_a = this.selectAllInput) === null || _a === void 0 ? void 0 : _a.checked) {
-                for (const key of this.visibleKeys)
-                    this.selected.add(key);
+        const headerCells = [];
+        for (const column of EMAIL_COLUMNS) {
+            if (column.id === "__select") {
+                const selectTh = head.createEl("th", { cls: "eo-col-select" });
+                headerCells.push(selectTh);
+                this.selectAllInput = selectTh.createEl("input", {
+                    type: "checkbox",
+                    attr: { "aria-label": "全选当前邮件" },
+                });
+                this.selectAllInput.addEventListener("change", () => {
+                    var _a;
+                    if ((_a = this.selectAllInput) === null || _a === void 0 ? void 0 : _a.checked) {
+                        for (const key of this.visibleKeys)
+                            this.selected.add(key);
+                    }
+                    else {
+                        this.selected.clear();
+                    }
+                    this.syncSelectionUi();
+                });
+                continue;
             }
-            else {
-                this.selected.clear();
-            }
-            this.syncSelectionUi();
-        });
-        for (const label of [
-            "客户",
-            "联系人",
-            "邮箱",
-            "中文摘要",
-            "建议发送时间（北京）",
-            "状态",
-            "更新时间",
-            "版本",
-        ]) {
-            head.createEl("th", { text: label });
+            headerCells.push(head.createEl("th", { text: column.label }));
         }
+        // 列宽和客户列表一样可以拖，并且记在设置里（按列 id）。
+        const storedWidths = this.plugin.settings.columnWidths.emails;
+        const mergedWidths = (0, column_widths_1.mergeColumnWidths)(EMAIL_COLUMNS.map((column) => ({ id: column.id, width: column.width })), storedWidths);
+        (0, column_resize_1.attachColumnResize)(table, headerCells, {
+            columns: EMAIL_COLUMNS.map((column) => {
+                var _a;
+                return ({
+                    id: column.id,
+                    label: column.label,
+                    width: (_a = mergedWidths[column.id]) !== null && _a !== void 0 ? _a : column.width,
+                    defaultWidth: column.width,
+                });
+            }),
+            onChange: (widths) => {
+                this.plugin.settings.columnWidths.emails = widths;
+                void this.plugin.saveSettings();
+            },
+        });
         const body = table.createEl("tbody");
         for (const row of rows) {
             const tr = body.createEl("tr", { cls: "eo-row" });
@@ -10626,6 +10897,7 @@ exports.DEFAULT_SETTINGS = {
     builtinColumns: null,
     builtinFilters: { conditions: [], showExcluded: false },
     builtinSort: null,
+    columnWidths: { customers: {}, emails: {} },
     truncateBodyChars: 6000,
     maxKnowledgeChars: 60000,
     maxKnowledgeFiles: 20,
@@ -10779,8 +11051,16 @@ exports.StateStore = StateStore;
 __modules["src/obsidian/table.ts"] = function(module, exports, require) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.CONTACTS_COLUMN_ID = exports.SELECT_COLUMN_ID = void 0;
 exports.renderCustomerTable = renderCustomerTable;
+const column_widths_1 = require("src/core/column-widths.ts");
 const selection_1 = require("src/core/selection.ts");
+const column_resize_1 = require("src/obsidian/column-resize.ts");
+const SELECT_COLUMN_WIDTH = 40;
+const CONTACTS_COLUMN_WIDTH = 76;
+/** 固定列的宽度键：加前缀避免和客户属性同名。 */
+exports.SELECT_COLUMN_ID = "__select";
+exports.CONTACTS_COLUMN_ID = "__contacts";
 const EMPTY_HANDLE = {
     updateSelection() { },
     setContactCount() { },
@@ -10806,10 +11086,11 @@ function renderCustomerTable(container, options) {
         attr: { "aria-label": "全选当前结果" },
     });
     const visibleKeys = options.rows.map((row) => row.key);
-    headRow.createEl("th", {
+    const contactsHead = headRow.createEl("th", {
         cls: "eo-col-contacts",
         text: "联系人",
     });
+    const headerCells = [selectAll, contactsHead];
     for (const column of options.columns) {
         const th = headRow.createEl("th", {
             text: column.label,
@@ -10817,8 +11098,7 @@ function renderCustomerTable(container, options) {
         });
         if (column.title)
             th.setAttr("title", column.title);
-        if (column.width)
-            th.style.width = `${column.width}px`;
+        headerCells.push(th);
         if (((_b = options.sort) === null || _b === void 0 ? void 0 : _b.columnId) === column.id) {
             th.createSpan({
                 cls: "eo-sort-indicator",
@@ -10829,6 +11109,41 @@ function renderCustomerTable(container, options) {
             th.addEventListener("click", () => { var _a; return (_a = options.onSort) === null || _a === void 0 ? void 0 : _a.call(options, column.id); });
         }
     }
+    // 列宽按「列 id」保存。选择列/联系人列的 id 与属性名隔离，避免撞键。
+    const resizeColumns = [
+        {
+            id: exports.SELECT_COLUMN_ID,
+            label: "选择",
+            width: SELECT_COLUMN_WIDTH,
+            defaultWidth: SELECT_COLUMN_WIDTH,
+        },
+        {
+            id: exports.CONTACTS_COLUMN_ID,
+            label: "联系人",
+            width: CONTACTS_COLUMN_WIDTH,
+            defaultWidth: CONTACTS_COLUMN_WIDTH,
+        },
+        ...options.columns.map((column) => {
+            var _a, _b;
+            return ({
+                id: column.id,
+                label: column.label,
+                width: (_a = column.width) !== null && _a !== void 0 ? _a : 130,
+                defaultWidth: (_b = column.width) !== null && _b !== void 0 ? _b : 130,
+            });
+        }),
+    ];
+    const mergedWidths = (0, column_widths_1.mergeColumnWidths)(resizeColumns.map((column) => ({ id: column.id, width: column.width })), options.columnWidths);
+    (0, column_resize_1.attachColumnResize)(table, headerCells, {
+        columns: resizeColumns.map((column) => {
+            var _a;
+            return ({
+                ...column,
+                width: (_a = mergedWidths[column.id]) !== null && _a !== void 0 ? _a : column.width,
+            });
+        }),
+        onChange: (widths) => { var _a; return (_a = options.onColumnWidthsChange) === null || _a === void 0 ? void 0 : _a.call(options, widths); },
+    });
     const rowElements = new Map();
     const rowCheckboxes = new Map();
     const contactCounts = new Map();
@@ -10866,8 +11181,6 @@ function renderCustomerTable(container, options) {
         contactCounts.set(row.key, countButton);
         for (const column of options.columns) {
             const td = tr.createEl("td");
-            if (column.width)
-                td.style.width = `${column.width}px`;
             const value = column.render(row);
             if (value instanceof Node) {
                 td.appendChild(value);
@@ -11279,6 +11592,15 @@ class WorkbenchView extends obsidian_1.ItemView {
             emptyText: records.length === 0
                 ? "客户目录为空：请先在插件设置里指定客户目录"
                 : "没有符合筛选条件的客户",
+            columnWidths: plugin.settings.columnWidths.customers,
+            onColumnWidthsChange: (widths) => {
+                // 保留暂时隐藏的列的宽度：重新勾选时还能沿用。
+                plugin.settings.columnWidths.customers = {
+                    ...plugin.settings.columnWidths.customers,
+                    ...widths,
+                };
+                void plugin.saveSettings();
+            },
         });
         (0, contact_counts_1.fillContactCounts)(plugin.repo, rows, table, () => token === this.renderToken);
         const footer = container.createDiv({ cls: "eo-footer" });

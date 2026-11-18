@@ -264,6 +264,15 @@ function renderBasesRoot(
 				entries.length === 0
 					? "当前 Base 没有匹配的客户。请在 Base 里调整筛选条件。"
 					: "没有符合当前搜索/排除条件的客户",
+			columnWidths: plugin.settings.columnWidths.customers,
+			onColumnWidthsChange: (widths) => {
+				// 保留暂时隐藏的列的宽度：重新勾选时还能沿用。
+				plugin.settings.columnWidths.customers = {
+					...plugin.settings.columnWidths.customers,
+					...widths,
+				};
+				void plugin.saveSettings();
+			},
 		});
 		fillContactCounts(
 			plugin.repo,

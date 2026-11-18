@@ -1,5 +1,7 @@
+import { mergeColumnWidths } from "../core/column-widths";
 import { selectionSummary } from "../core/selection";
 import type { CustomerRecord } from "../core/types";
+import { attachColumnResize } from "./column-resize";
 
 export interface CustomerRow {
 	key: string;
@@ -39,7 +41,17 @@ export interface CustomerTableOptions {
 	sort?: { columnId: string; dir: 1 | -1 } | null;
 	onSort?: (columnId: string) => void;
 	emptyText?: string;
+	/** 用户保存过的列宽（按列 id）；缺省时用各列默认宽度。 */
+	columnWidths?: Record<string, number> | null;
+	/** 拖完列宽后落盘；不传则本次调整不保存。 */
+	onColumnWidthsChange?: (widths: Record<string, number>) => void;
 }
+
+const SELECT_COLUMN_WIDTH = 40;
+const CONTACTS_COLUMN_WIDTH = 76;
+/** 固定列的宽度键：加前缀避免和客户属性同名。 */
+export const SELECT_COLUMN_ID = "__select";
+export const CONTACTS_COLUMN_ID = "__contacts";
 
 const EMPTY_HANDLE: CustomerTableHandle = {
 	updateSelection() {},
@@ -73,18 +85,19 @@ export function renderCustomerTable(
 	});
 	const visibleKeys = options.rows.map((row) => row.key);
 
-	headRow.createEl("th", {
+	const contactsHead = headRow.createEl("th", {
 		cls: "eo-col-contacts",
 		text: "联系人",
 	});
 
+	const headerCells: HTMLElement[] = [selectAll, contactsHead];
 	for (const column of options.columns) {
 		const th = headRow.createEl("th", {
 			text: column.label,
 			cls: options.onSort ? "eo-sortable" : undefined,
 		});
 		if (column.title) th.setAttr("title", column.title);
-		if (column.width) th.style.width = `${column.width}px`;
+		headerCells.push(th);
 		if (options.sort?.columnId === column.id) {
 			th.createSpan({
 				cls: "eo-sort-indicator",
@@ -95,6 +108,43 @@ export function renderCustomerTable(
 			th.addEventListener("click", () => options.onSort?.(column.id));
 		}
 	}
+
+	// 列宽按「列 id」保存。选择列/联系人列的 id 与属性名隔离，避免撞键。
+	const resizeColumns = [
+		{
+			id: SELECT_COLUMN_ID,
+			label: "选择",
+			width: SELECT_COLUMN_WIDTH,
+			defaultWidth: SELECT_COLUMN_WIDTH,
+		},
+		{
+			id: CONTACTS_COLUMN_ID,
+			label: "联系人",
+			width: CONTACTS_COLUMN_WIDTH,
+			defaultWidth: CONTACTS_COLUMN_WIDTH,
+		},
+		...options.columns.map((column) => ({
+			id: column.id,
+			label: column.label,
+			width: column.width ?? 130,
+			defaultWidth: column.width ?? 130,
+		})),
+	];
+	const mergedWidths = mergeColumnWidths(
+		resizeColumns.map((column) => ({ id: column.id, width: column.width })),
+		options.columnWidths,
+	);
+	attachColumnResize(
+		table,
+		headerCells,
+		{
+			columns: resizeColumns.map((column) => ({
+				...column,
+				width: mergedWidths[column.id] ?? column.width,
+			})),
+			onChange: (widths) => options.onColumnWidthsChange?.(widths),
+		},
+	);
 
 	const rowElements = new Map<string, HTMLTableRowElement>();
 	const rowCheckboxes = new Map<string, HTMLInputElement>();
@@ -136,7 +186,6 @@ export function renderCustomerTable(
 
 		for (const column of options.columns) {
 			const td = tr.createEl("td");
-			if (column.width) td.style.width = `${column.width}px`;
 			const value = column.render(row);
 			if (value instanceof Node) {
 				td.appendChild(value);

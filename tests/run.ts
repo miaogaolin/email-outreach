@@ -15,6 +15,7 @@ import "./contact-log.test";
 import "./obsidian-dom.test";
 import "./models.test";
 import "./view-scroll.test";
+import "./column-widths.test";
 import { runAll } from "./harness";
 
 void runAll();

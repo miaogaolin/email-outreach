@@ -218,6 +218,15 @@ export class WorkbenchView extends ItemView {
 				records.length === 0
 					? "客户目录为空：请先在插件设置里指定客户目录"
 					: "没有符合筛选条件的客户",
+			columnWidths: plugin.settings.columnWidths.customers,
+			onColumnWidthsChange: (widths) => {
+				// 保留暂时隐藏的列的宽度：重新勾选时还能沿用。
+				plugin.settings.columnWidths.customers = {
+					...plugin.settings.columnWidths.customers,
+					...widths,
+				};
+				void plugin.saveSettings();
+			},
 		});
 		fillContactCounts(
 			plugin.repo,

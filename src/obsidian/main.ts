@@ -13,6 +13,7 @@ import {
 	setEmailStatus,
 } from "../core/ai-file";
 import type { AILogEntry } from "../core/ai-log";
+import { normalizeTableColumnWidths } from "../core/column-widths";
 import { findContactByEmail } from "../core/contact-parser";
 import {
 	CONTACT_LOG_LAST_CONTACT_KEY,
@@ -403,6 +404,10 @@ export default class EmailOutreachPlugin
 		// 手改坏的 data.json 不能让筛选/冷却失效。
 		merged.generationFilter = normalizeGenerationFilter(
 			(stored as Partial<Settings> | null)?.generationFilter,
+		);
+		// 列宽同理：非法值丢弃，旧版本没有这个字段时用空表（各列默认宽度）。
+		merged.columnWidths = normalizeTableColumnWidths(
+			(stored as Partial<Settings> | null)?.columnWidths,
 		);
 		const cooldown = Number(merged.generateCooldownHours);
 		merged.generateCooldownHours =

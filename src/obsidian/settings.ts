@@ -1,5 +1,6 @@
 import type { FilterConfig } from "../core/filters";
 import type { GenerationFilter } from "../core/generation";
+import type { TableColumnWidths } from "../core/column-widths";
 import {
 	DEFAULT_EMAIL_SYSTEM_PROMPT,
 	DEFAULT_RULE_SYSTEM_PROMPT,
@@ -47,6 +48,8 @@ export interface Settings {
 	builtinColumns: ColumnPreference[] | null;
 	builtinFilters: FilterConfig;
 	builtinSort: { key: string; dir: 1 | -1 } | null;
+	/** 客户列表 / 邮件列表里用户拖过的列宽（px，按列 id）。 */
+	columnWidths: TableColumnWidths;
 
 	// Prompt budget
 	truncateBodyChars: number;
@@ -88,6 +91,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	builtinColumns: null,
 	builtinFilters: { conditions: [], showExcluded: false },
 	builtinSort: null,
+	columnWidths: { customers: {}, emails: {} },
 
 	truncateBodyChars: 6000,
 	maxKnowledgeChars: 60000,

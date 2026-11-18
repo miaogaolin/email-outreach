@@ -1,5 +1,6 @@
 import { ItemView, Notice, type WorkspaceLeaf } from "obsidian";
 import { emailUpdatedAt, formatEmailTime } from "../core/ai-file";
+import { mergeColumnWidths } from "../core/column-widths";
 import {
 	filterEmailRows,
 	matchesCustomerFilter,
@@ -14,6 +15,7 @@ import { formatBeijingTime } from "../core/send-time";
 import type { EmailRow, EmailStatus } from "../core/types";
 import { EMAIL_STATUSES } from "../core/types";
 import type { OutreachPluginApi } from "./plugin-api";
+import { attachColumnResize } from "./column-resize";
 import { confirm } from "./modals/confirm";
 import { PreviewController } from "./preview-popover";
 import { captureViewScroll, restoreViewScroll } from "./scroll-preserve";
@@ -24,6 +26,22 @@ const STATUS_LABELS: Record<EmailStatus | "all", string> = {
 	Accepted: "已验收",
 	Rejected: "已拒绝",
 };
+
+/**
+ * 邮件列表的列定义：id 用于保存列宽，width 是新用户的默认宽度。
+ * 顺序即渲染顺序；`__select` 是勾选列，渲染时特殊处理。
+ */
+const EMAIL_COLUMNS = [
+	{ id: "__select", label: "选择", width: 40 },
+	{ id: "customer", label: "客户", width: 170 },
+	{ id: "contact", label: "联系人", width: 110 },
+	{ id: "email", label: "邮箱", width: 210 },
+	{ id: "summary", label: "中文摘要", width: 320 },
+	{ id: "time", label: "建议发送时间（北京）", width: 175 },
+	{ id: "status", label: "状态", width: 90 },
+	{ id: "updated", label: "更新时间", width: 110 },
+	{ id: "versions", label: "版本", width: 56 },
+] as const;
 
 export class EmailListView extends ItemView {
 	private statusFilter: EmailStatus | "all" = "all";
@@ -248,31 +266,46 @@ export class EmailListView extends ItemView {
 
 		const table = target.createEl("table", { cls: "eo-table eo-email-table" });
 		const head = table.createEl("thead").createEl("tr");
-		const selectTh = head.createEl("th", { cls: "eo-col-select" });
-		this.selectAllInput = selectTh.createEl("input", {
-			type: "checkbox",
-			attr: { "aria-label": "全选当前邮件" },
-		});
-		this.selectAllInput.addEventListener("change", () => {
-			if (this.selectAllInput?.checked) {
-				for (const key of this.visibleKeys) this.selected.add(key);
-			} else {
-				this.selected.clear();
+		const headerCells: HTMLElement[] = [];
+		for (const column of EMAIL_COLUMNS) {
+			if (column.id === "__select") {
+				const selectTh = head.createEl("th", { cls: "eo-col-select" });
+				headerCells.push(selectTh);
+				this.selectAllInput = selectTh.createEl("input", {
+					type: "checkbox",
+					attr: { "aria-label": "全选当前邮件" },
+				});
+				this.selectAllInput.addEventListener("change", () => {
+					if (this.selectAllInput?.checked) {
+						for (const key of this.visibleKeys) this.selected.add(key);
+					} else {
+						this.selected.clear();
+					}
+					this.syncSelectionUi();
+				});
+				continue;
 			}
-			this.syncSelectionUi();
-		});
-		for (const label of [
-			"客户",
-			"联系人",
-			"邮箱",
-			"中文摘要",
-			"建议发送时间（北京）",
-			"状态",
-			"更新时间",
-			"版本",
-		]) {
-			head.createEl("th", { text: label });
+			headerCells.push(head.createEl("th", { text: column.label }));
 		}
+
+		// 列宽和客户列表一样可以拖，并且记在设置里（按列 id）。
+		const storedWidths = this.plugin.settings.columnWidths.emails;
+		const mergedWidths = mergeColumnWidths(
+			EMAIL_COLUMNS.map((column) => ({ id: column.id, width: column.width })),
+			storedWidths,
+		);
+		attachColumnResize(table, headerCells, {
+			columns: EMAIL_COLUMNS.map((column) => ({
+				id: column.id,
+				label: column.label,
+				width: mergedWidths[column.id] ?? column.width,
+				defaultWidth: column.width,
+			})),
+			onChange: (widths) => {
+				this.plugin.settings.columnWidths.emails = widths;
+				void this.plugin.saveSettings();
+			},
+		});
 
 		const body = table.createEl("tbody");
 		for (const row of rows) {
