@@ -10,6 +10,8 @@ import "./email-list.test";
 import "./core.test";
 import "./email-regenerate.test";
 import "./reminder.test";
+import "./channel-labels.test";
+import "./contact-log.test";
 import "./obsidian-dom.test";
 import "./models.test";
 import { runAll } from "./harness";

@@ -7,9 +7,9 @@
 - 插件只做：筛选客户、解析联系人、调用 AI 生成开发邮件、审核、把邮件写回 Markdown。
 - **不发送邮件**，不监控回复，不抓客户网站。
 - 一个客户可以针对多位适合的联系人各生成一封邮件（每客户每次最多 5 封）；本地没有带邮箱联系人不调用 AI，AI 判断没有合适联系人时只标记提醒。
-- 客户原始笔记只允许写：`AI开发信息`。
+- 客户原始笔记只允许写：`AI开发信息`，以及用户勾选发送提醒并确认发送后更新的 `最近联系时间` / `跟进次数`。
   - `AI开发信息` 只在验收通过时写入一个双链。
-  - `跟进次数` / `最近联系时间` 改为只读：插件不再写，只用于计算发送时间。
+  - `最近联系时间` 只写日期 `YYYY-MM-DD`；`跟进次数` 加 1。两者只在用户勾选发送提醒主任务并在确认框确认后写入，验收本身不写。
   - 验收提醒写入 AI 开发信息文件的 `## 发送提醒` 区段，不写客户笔记正文。
 - 旧 AI 文件里的 `## AI 分析` 区段仍会解析，作为写邮件的参考上下文；新生成不再产生分析结果，也不再自动写客户分析字段。
 - AI 输出结构由插件定义（`src/core/schema.ts`），指令文件只能提供业务知识，不能改变字段。
@@ -42,7 +42,7 @@ node scripts/smoke-load.cjs
 1. `src/core/**` 不得 `import "obsidian"`；所有 Obsidian API 只能在 `src/obsidian/**`。
 2. AI 返回必须先 `parseJsonLoose` → `validateAIResult` → 才能落盘。禁止跳过校验。
 3. 收件邮箱只能来自本地联系人解析结果；AI 返回的邮箱仅用于比对。
-4. 写客户 frontmatter 只能经 `adapter.updateFrontmatter`，且只允许写验收双链；`跟进次数` / `最近联系时间` 只读。
+4. 写客户 frontmatter 只能经 `adapter.updateFrontmatter`：验收时只写 `AI开发信息` 双链；`最近联系时间` / `跟进次数` 只能在用户勾选发送提醒并确认后写入。
 5. 修改邮件只能在原邮件块上追加版本（`addEmailVersion`），不新建「副本文件」。
 6. 一个客户 = 一个 `{客户名} - AI开发信息.md`；客户属性只放一个双链（默认 `AI开发信息`）。
 7. API 失败/取消不得删除已生成内容；失败原始响应写 `{输出目录}/.state/`；已有 AI 文件无法解析时不得覆盖。
@@ -54,8 +54,9 @@ node scripts/smoke-load.cjs
 - 一个客户可以有多封邮件（多位适合联系人），全部追加在同一个 AI 开发信息文件里，ID 连续。
 - 发送时间由 `src/core/send-time.ts` 计算，不从 AI 接收；依据客户地区时区、`跟进次数`、`最近联系时间`，以及旧版本遗留的已发送记录（只读）。
 - 邮件状态只有 `Generated` / `Accepted` / `Rejected`；旧文件里的 `Revision` 在解析时归一化为 `Generated`。
-- 验收通过时在 AI 文件末尾维护 `## 发送提醒` 区段：`src/core/reminder.ts` 的 `buildEmailReminder` / `upsertEmailReminderInContent` / `removeEmailReminderFromContent`；任务用 `(@YYYY-MM-DD HH:mm)`（北京时间），并用 `<!-- eo-reminder: ID -->` 幂等关联邮件。
-- 联系人 `#Contact/...` 渠道由 `src/core/contact-parser.ts` 解析到 `Contact.channels`，验收提醒会带上标签与内容。
+- 验收通过时在 AI 文件末尾维护 `## 发送提醒` 区段：`src/core/reminder.ts` 的 `buildEmailReminders` / `upsertEmailRemindersInContent` / `removeEmailReminderFromContent`；主任务用同文件标题链接 `[[#邮件 NNN · 联系人 · 状态]]`，时间用 `(@YYYY-MM-DD HH:mm)`（北京时间），并用 `<!-- eo-reminder: ID -->` 幂等关联邮件。
+- 联系人 `#Contact/...` 渠道由 `src/core/contact-parser.ts` 解析到 `Contact.channels`；提醒里用独立的其它渠道任务 `<!-- eo-reminder-contact: ID -->`，标签经 `src/core/channel-labels.ts` 转成可读名称（WA → WhatsApp），内容原样展示。
+- 插件加载时自动把未勾选的旧格式提醒迁移成新格式；已勾选/已带 sent 标记的提醒保持原样。勾选新格式主任务会弹确认框，确认后经 `adapter.updateFrontmatter` 写 `最近联系时间`（`YYYY-MM-DD`）和 `跟进次数 + 1`，并写 `<!-- eo-reminder-sent: ID -->` 防重复。
 - 不写 `customer_path`；客户定位只用 `customer: "[[...]]"`。
 - 旧 AI 文件的分析区段仍按原格式解析；新生成不再写分析字段。
 - `email_summary_zh` 必须简体中文，30–60 字仅告警、不拦截。
@@ -78,7 +79,7 @@ node scripts/smoke-load.cjs
 - 客户改名时双链会自动更新，但 AI 文件名不会自动改；有「同步 AI 文件名」需求时另做命令。
 - `.obsidian/` 不被 vault 索引，也不是 fast-note-sync 的同步对象；备份靠 git push。
 - 发送时间用 `Intl.DateTimeFormat` 按客户 IANA 时区计算，测试传固定 `now`；不要用运行机器本地时区猜客户时间。
-- AI 文件末尾的 `## 发送提醒` 属于 `trailing`，不是邮件块；改邮件时用 `updateEmailInContent` 会保留它，单独增删提醒用 `src/core/reminder.ts`。
+- AI 文件末尾的 `## 发送提醒` 属于 `trailing`，不是邮件块；改邮件时用 `updateEmailInContent` 会保留它，单独增删提醒用 `src/core/reminder.ts`。提醒的邮件链接是**同文件**标题链接 `[[#邮件 ...]]`，不要改成文件路径；勾选确认的幂等依赖 `eo-reminder-sent` 标记，删除任务时必须一起清理。
 
 ## 提交约定
 

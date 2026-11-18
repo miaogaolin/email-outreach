@@ -643,11 +643,14 @@ function renderVersions(versions: EmailVersion[]): string {
 	return lines.join("\n").trimEnd();
 }
 
+/** 邮件块标题（不含 `### `）。提醒里的同文件标题链接必须与它完全一致。 */
+export function emailHeadingText(record: EmailRecord): string {
+	return `邮件 ${record.id} · ${sanitizeMetaValue(record.contact)} · ${record.status}`;
+}
+
 export function renderEmailBlock(record: EmailRecord): string {
 	const lines: string[] = [];
-	lines.push(
-		`### 邮件 ${record.id} · ${sanitizeMetaValue(record.contact)} · ${record.status}`,
-	);
+	lines.push(`### ${emailHeadingText(record)}`);
 	lines.push("");
 	lines.push(`- contact: ${sanitizeMetaValue(record.contact)}`);
 	lines.push(`- email: ${sanitizeMetaValue(record.email)}`);

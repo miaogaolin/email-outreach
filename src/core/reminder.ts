@@ -1,7 +1,8 @@
 import { parseCustomerAIFile, renderCustomerAIFile } from "./ai-file";
+import { channelDisplayLabel } from "./channel-labels";
 import { formatBeijingTime } from "./send-time";
 import type { ContactChannel } from "./types";
-import { pathToLinkTarget, toWikilink } from "./wikilinks";
+import { toWikilink } from "./wikilinks";
 
 /**
  * 已验收邮件的 Reminder 任务。
@@ -10,22 +11,32 @@ import { pathToLinkTarget, toWikilink } from "./wikilinks";
  * 用隐藏的 `<!-- eo-reminder: ID -->` 标记与邮件 ID 关联，方便重复验收时
  * 替换而不是追加。时间用北京时间，格式与 Reminder 插件兼容：
  * `(@YYYY-MM-DD HH:mm)`。
+ *
+ * 邮件内容与提醒在同一个文件里，所以邮件链接直接用同文件标题链接
+ * `[[#邮件 NNN · 联系人 · 状态]]`，不带文件路径。
  */
 
 export const REMINDER_SECTION_HEADING = "## 发送提醒";
 
 const SECTION_HEADING_RE = /^##\s+发送提醒\s*$/;
 const TASK_LINE_RE = /^- \[[ xX]\] /;
-const MARKER_PREFIX = "<!-- eo-reminder:";
+const CHECKED_TASK_RE = /^- \[[xX]\] /;
+const EMAIL_MARKER_PREFIX = "<!-- eo-reminder:";
+const CONTACT_MARKER_PREFIX = "<!-- eo-reminder-contact:";
+const DONE_MARKER_PREFIX = "<!-- eo-reminder-sent:";
+const H1_H2_RE = /^#{1,2}\s+/;
+
+export type ReminderKind = "email" | "contact";
 
 export interface EmailReminderInput {
 	customerName: string;
+	/** 客户双链目标，例如 `BDG Safety`。 */
+	customerLink: string;
 	emailId: string;
-	/** AI 开发信息文件路径；提醒里链接回这个文件。 */
-	aiFilePath: string;
+	/** 邮件块标题（不含 `### `），由 `emailHeadingText` 生成。 */
+	emailHeading: string;
 	contact: string;
 	email: string;
-	subject: string;
 	summaryZh: string;
 	/** 客户当地时间的建议发送时间。 */
 	suggestedTime: string | null;
@@ -36,6 +47,7 @@ export interface EmailReminderInput {
 
 export interface EmailReminder {
 	emailId: string;
+	kind: ReminderKind;
 	/** 北京时间 `YYYY-MM-DD HH:mm`。 */
 	time: string;
 	/** 隐藏标记，用于幂等更新/删除。 */
@@ -44,50 +56,148 @@ export interface EmailReminder {
 	block: string;
 }
 
+export interface EmailReminderSet {
+	email: EmailReminder | null;
+	contact: EmailReminder | null;
+}
+
+export interface ReminderTaskInfo {
+	emailId: string;
+	kind: ReminderKind;
+	checked: boolean;
+	done: boolean;
+	/** 任务块原文（含子项与标记）。 */
+	block: string;
+}
+
+interface MarkerRef {
+	index: number;
+	kind: ReminderKind;
+	emailId: string;
+}
+
+interface TaskRange {
+	start: number;
+	end: number;
+	ref: MarkerRef;
+}
+
 function oneLine(value: string | null | undefined): string {
 	return (value ?? "").replace(/\s*[\r\n]+\s*/g, " ").trim();
 }
 
-export function reminderMarker(emailId: string): string {
-	return `${MARKER_PREFIX} ${oneLine(emailId)} -->`;
+function markerFor(prefix: string, emailId: string): string {
+	return `${prefix} ${oneLine(emailId)} -->`;
 }
 
-/** 为一个已验收邮件构建 Reminder 任务；没有可用的建议发送时间时返回 null。 */
-export function buildEmailReminder(
-	input: EmailReminderInput,
-): EmailReminder | null {
+export function reminderMarker(emailId: string): string {
+	return markerFor(EMAIL_MARKER_PREFIX, emailId);
+}
+
+export function contactReminderMarker(emailId: string): string {
+	return markerFor(CONTACT_MARKER_PREFIX, emailId);
+}
+
+export function reminderSentMarker(emailId: string): string {
+	return markerFor(DONE_MARKER_PREFIX, emailId);
+}
+
+function markerId(line: string, prefix: string): string | null {
+	const trimmed = line.trim();
+	if (!trimmed.startsWith(prefix) || !trimmed.endsWith("-->")) return null;
+	const id = trimmed.slice(prefix.length, -3).trim();
+	return id || null;
+}
+
+function isAnyMarkerLine(line: string): boolean {
+	const trimmed = line.trim();
+	return (
+		markerId(trimmed, EMAIL_MARKER_PREFIX) !== null ||
+		markerId(trimmed, CONTACT_MARKER_PREFIX) !== null ||
+		markerId(trimmed, DONE_MARKER_PREFIX) !== null
+	);
+}
+
+function customerTarget(input: EmailReminderInput): string {
+	return oneLine(input.customerLink) || oneLine(input.customerName) || "客户";
+}
+
+function contactLabel(input: EmailReminderInput): string {
+	return oneLine(input.contact) || oneLine(input.email) || "联系人";
+}
+
+/**
+ * 同文件标题链接。标题里有 `|` / `#` / `[]` 或联系人为空时，Obsidian 的
+ * wikilink 解析不可靠，降级成纯文本邮件编号。
+ */
+function emailLink(input: EmailReminderInput): string {
+	const heading = oneLine(input.emailHeading);
+	if (!heading || !oneLine(input.contact) || /[\[\]|#\r\n]/.test(heading)) {
+		return `邮件 ${oneLine(input.emailId) || "001"}`;
+	}
+	return `[[#${heading}]]`;
+}
+
+/** 为一个已验收邮件构建主任务与（有渠道时的）其它渠道任务。 */
+export function buildEmailReminders(input: EmailReminderInput): EmailReminderSet {
 	const time = formatBeijingTime(input.suggestedTime, input.timezone);
-	if (!time) return null;
+	if (!time) return { email: null, contact: null };
 
 	const emailId = oneLine(input.emailId) || "001";
-	const contact = oneLine(input.contact) || oneLine(input.email) || "联系人";
-	const customer = oneLine(input.customerName);
-	const subject = oneLine(input.subject) || "（无主题）";
-	const title = `${customer ? `${customer} · ` : ""}发送开发邮件给 ${contact}：${subject}`;
+	const customerLink = toWikilink(customerTarget(input));
+	const contact = contactLabel(input);
+	const link = emailLink(input);
 
-	const lines: string[] = [
-		`- [ ] ${title} (@${time})`,
-		`    - 邮件：${toWikilink(pathToLinkTarget(input.aiFilePath))} · 邮件 ${emailId}`,
+	const emailLines: string[] = [
+		`- [ ] ${customerLink} · 发送邮件给 ${contact} (@${time})`,
+		`    - 邮件：${link}`,
 	];
 	const email = oneLine(input.email);
-	if (email) lines.push(`    - 邮箱：${email}`);
+	if (email) emailLines.push(`    - 邮箱：${email}`);
 	const summary = oneLine(input.summaryZh);
-	if (summary) lines.push(`    - 摘要：${summary}`);
+	if (summary) emailLines.push(`    - 摘要：${summary}`);
 	const suggested = oneLine(input.suggestedTime);
 	const timezone = oneLine(input.timezone);
 	if (suggested && timezone && timezone !== "Asia/Shanghai") {
-		lines.push(`    - 客户当地时间：${suggested} · ${timezone}`);
+		emailLines.push(`    - 客户当地时间：${suggested} · ${timezone}`);
 	}
-	for (const channel of input.channels ?? []) {
-		const tag = oneLine(channel.tag);
-		if (!tag) continue;
-		const content = oneLine(channel.content);
-		lines.push(content ? `    - ${tag}：${content}` : `    - ${tag}`);
+	const emailMarker = reminderMarker(emailId);
+	emailLines.push(emailMarker);
+
+	const emailReminder: EmailReminder = {
+		emailId,
+		kind: "email",
+		time,
+		marker: emailMarker,
+		block: emailLines.join("\n"),
+	};
+
+	const channels = (input.channels ?? []).filter(
+		(channel) => oneLine(channel.tag) !== "",
+	);
+	let contactReminder: EmailReminder | null = null;
+	if (channels.length > 0) {
+		const lines: string[] = [
+			`- [ ] ${customerLink} · 其它渠道联系 ${contact} (@${time})`,
+			`    - 邮件：${link}`,
+		];
+		for (const channel of channels) {
+			const label = channelDisplayLabel(oneLine(channel.tag));
+			const content = oneLine(channel.content);
+			lines.push(content ? `    - ${label}：${content}` : `    - ${label}`);
+		}
+		const marker = contactReminderMarker(emailId);
+		lines.push(marker);
+		contactReminder = {
+			emailId,
+			kind: "contact",
+			time,
+			marker,
+			block: lines.join("\n"),
+		};
 	}
 
-	const marker = reminderMarker(emailId);
-	lines.push(marker);
-	return { emailId, time, marker, block: lines.join("\n") };
+	return { email: emailReminder, contact: contactReminder };
 }
 
 function findSection(lines: string[]): { start: number; end: number } | null {
@@ -95,7 +205,7 @@ function findSection(lines: string[]): { start: number; end: number } | null {
 	if (start < 0) return null;
 	let end = lines.length;
 	for (let i = start + 1; i < lines.length; i++) {
-		if (/^#{1,2}\s+/.test(lines[i] ?? "")) {
+		if (H1_H2_RE.test(lines[i] ?? "")) {
 			end = i;
 			break;
 		}
@@ -103,92 +213,203 @@ function findSection(lines: string[]): { start: number; end: number } | null {
 	return { start, end };
 }
 
-function findMarkerIndex(lines: string[], marker: string): number {
-	return lines.findIndex((line) => line.trim() === marker);
-}
-
-/** 从标记行往上找到所属任务行；遇到别的标记/标题就停，避免误伤。 */
+/** 从标记行往上找到所属任务行；遇到别的标记/标题就返回 -1。 */
 function findTaskStart(lines: string[], markerIndex: number): number {
 	for (let i = markerIndex - 1; i >= 0; i--) {
 		const line = lines[i] ?? "";
 		if (TASK_LINE_RE.test(line)) return i;
-		if (line.trim().startsWith(MARKER_PREFIX)) return markerIndex;
-		if (/^#{1,2}\s+/.test(line)) return markerIndex;
+		if (isAnyMarkerLine(line)) return -1;
+		if (H1_H2_RE.test(line)) return -1;
 	}
-	return markerIndex;
+	return -1;
+}
+
+/**
+ * 任务块结束位置：下一条顶级任务/标题，或第一条不属于任务的顶级内容。
+ * 缩进子项、标记行和空行都算任务块的一部分。
+ */
+function findTaskEnd(lines: string[], start: number): number {
+	let end = start + 1;
+	while (end < lines.length) {
+		const line = lines[end] ?? "";
+		if (H1_H2_RE.test(line) || TASK_LINE_RE.test(line)) break;
+		if (line.trim() === "" || /^\s/.test(line) || isAnyMarkerLine(line)) {
+			end++;
+			continue;
+		}
+		break;
+	}
+	return end;
+}
+
+function findMarkerRefs(lines: string[]): MarkerRef[] {
+	const refs: MarkerRef[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i] ?? "";
+		const emailId = markerId(line, EMAIL_MARKER_PREFIX);
+		if (emailId) {
+			refs.push({ index: i, kind: "email", emailId });
+			continue;
+		}
+		const contactId = markerId(line, CONTACT_MARKER_PREFIX);
+		if (contactId) refs.push({ index: i, kind: "contact", emailId: contactId });
+	}
+	return refs;
+}
+
+function taskRanges(
+	lines: string[],
+	predicate: (ref: MarkerRef) => boolean,
+): TaskRange[] {
+	const ranges: TaskRange[] = [];
+	for (const ref of findMarkerRefs(lines)) {
+		if (!predicate(ref)) continue;
+		const start = findTaskStart(lines, ref.index);
+		if (start < 0) continue;
+		ranges.push({ start, end: findTaskEnd(lines, start), ref });
+	}
+	return ranges;
+}
+
+function removeRanges(lines: string[], ranges: TaskRange[]): string[] {
+	if (ranges.length === 0) return lines;
+	const next = [...lines];
+	for (const range of [...ranges].sort((a, b) => b.start - a.start)) {
+		next.splice(range.start, range.end - range.start);
+	}
+	return next;
+}
+
+function hasDoneMarker(lines: string[], emailId: string): boolean {
+	const marker = reminderSentMarker(emailId);
+	return lines.some((line) => line.trim() === marker);
 }
 
 function joinTrailing(lines: string[]): string {
 	return lines.join("\n").trim();
 }
 
-/**
- * 在 AI 文件内容里追加或更新一条发送提醒。
- *
- * - 同一邮件 ID 的旧任务会被整块替换；
- * - 没有 `## 发送提醒` 区段时在文件末尾新建；
- * - 不触碰 trailing 里的其他用户内容。
- */
-export function upsertEmailReminderInContent(
-	content: string,
-	reminder: EmailReminder,
-): string {
+/** 列出 trailing 里的发送提醒任务；已勾选/已处理状态也一并返回。 */
+export function listEmailReminderTasks(content: string): ReminderTaskInfo[] {
 	const parsed = parseCustomerAIFile(content);
 	const lines = parsed.file.trailing
 		? parsed.file.trailing.split("\n")
 		: [];
-	const blockLines = reminder.block.split("\n");
-	const markerIndex = findMarkerIndex(lines, reminder.marker);
+	const tasks: ReminderTaskInfo[] = [];
+	for (const ref of findMarkerRefs(lines)) {
+		const start = findTaskStart(lines, ref.index);
+		if (start < 0) continue;
+		const end = findTaskEnd(lines, start);
+		const blockLines = lines.slice(start, end);
+		const doneMarker = reminderSentMarker(ref.emailId);
+		tasks.push({
+			emailId: ref.emailId,
+			kind: ref.kind,
+			checked: CHECKED_TASK_RE.test(lines[start] ?? ""),
+			done: blockLines.some((line) => line.trim() === doneMarker),
+			block: blockLines.join("\n").trim(),
+		});
+	}
+	return tasks;
+}
 
-	let next: string[];
-	if (markerIndex >= 0) {
-		const start = findTaskStart(lines, markerIndex);
-		next = [
-			...lines.slice(0, start),
-			...blockLines,
-			...lines.slice(markerIndex + 1),
-		];
-	} else {
-		const section = findSection(lines);
-		if (section) {
-			// 插到区段最后一个非空行之后；保留区段尾部的空行。
-			let insertAt = section.end;
-			while (
-				insertAt > section.start + 1 &&
-				(lines[insertAt - 1] ?? "").trim() === ""
-			) {
-				insertAt--;
-			}
-			next = lines.slice(0, insertAt);
-			if (next.length > 0 && next[next.length - 1]!.trim() !== "") {
-				next.push("");
-			}
-			next.push(...blockLines);
-			if (
-				insertAt < lines.length &&
-				(lines[insertAt] ?? "").trim() !== ""
-			) {
-				next.push("");
-			}
-			next.push(...lines.slice(insertAt));
-		} else {
-			next = [...lines];
-			while (next.length > 0 && next[next.length - 1]!.trim() === "") {
-				next.pop();
-			}
-			if (next.length > 0) next.push("");
-			next.push(REMINDER_SECTION_HEADING, "", ...blockLines);
-		}
+/**
+ * 旧版提醒格式：标题带“发送开发邮件给”、邮件子项是文件链接，或
+ * 主任务下直接挂了 `#Contact/...` 渠道行。
+ */
+export function isLegacyReminderBlock(block: string): boolean {
+	const lines = block.split("\n");
+	if ((lines[0] ?? "").includes("发送开发邮件给")) return true;
+	if (/^\s+- #Contact\//m.test(block)) return true;
+	const emailLine = lines.find((line) => /^\s+- 邮件：/.test(line));
+	if (!emailLine) return false;
+	const value = emailLine.replace(/^\s+- 邮件：/, "").trim();
+	return value.startsWith("[[") && !value.startsWith("[[#");
+}
+
+function insertBlocks(lines: string[], blocks: string[]): string[] {
+	if (blocks.length === 0) return lines;
+	const blockLines: string[] = [];
+	for (let index = 0; index < blocks.length; index++) {
+		if (index > 0) blockLines.push("");
+		blockLines.push(...blocks[index]!.split("\n"));
 	}
 
-	parsed.file.trailing = joinTrailing(next);
+	const section = findSection(lines);
+	if (section) {
+		// 插到区段最后一个非空行之后；保留区段尾部的空行。
+		let insertAt = section.end;
+		while (
+			insertAt > section.start + 1 &&
+			(lines[insertAt - 1] ?? "").trim() === ""
+		) {
+			insertAt--;
+		}
+		const next = lines.slice(0, insertAt);
+		if (next.length > 0 && next[next.length - 1]!.trim() !== "") {
+			next.push("");
+		}
+		next.push(...blockLines);
+		if (insertAt < lines.length && (lines[insertAt] ?? "").trim() !== "") {
+			next.push("");
+		}
+		next.push(...lines.slice(insertAt));
+		return next;
+	}
+
+	const next = [...lines];
+	while (next.length > 0 && next[next.length - 1]!.trim() === "") {
+		next.pop();
+	}
+	if (next.length > 0) next.push("");
+	next.push(REMINDER_SECTION_HEADING, "", ...blockLines);
+	return next;
+}
+
+/**
+ * 在 AI 文件内容里写入一整套提醒（主任务 + 渠道任务）。
+ *
+ * - 同一邮件 ID 的旧主任务/渠道任务会被整块替换；
+ * - 已存在的 sent 标记会保留，并把主任务保持为勾选，避免重复验收清掉已确认状态；
+ * - 没有 `## 发送提醒` 区段时在文件末尾新建；
+ * - 不触碰 trailing 里的其他用户内容。
+ */
+export function upsertEmailRemindersInContent(
+	content: string,
+	set: EmailReminderSet,
+): string {
+	const emailId = set.email?.emailId ?? set.contact?.emailId;
+	if (!emailId) return content;
+
+	const parsed = parseCustomerAIFile(content);
+	const lines = parsed.file.trailing
+		? parsed.file.trailing.split("\n")
+		: [];
+	const wasDone = hasDoneMarker(lines, emailId);
+	const ranges = taskRanges(lines, (ref) => ref.emailId === emailId);
+	let next = removeRanges(lines, ranges);
+	const doneMarker = reminderSentMarker(emailId);
+	next = next.filter((line) => line.trim() !== doneMarker);
+
+	const blocks: string[] = [];
+	if (set.email) {
+		let block = set.email.block;
+		if (wasDone) {
+			block = block.replace(/^- \[ \] /, "- [x] ");
+			block += `\n${doneMarker}`;
+		}
+		blocks.push(block);
+	}
+	if (set.contact) blocks.push(set.contact.block);
+
+	parsed.file.trailing = joinTrailing(insertBlocks(next, blocks));
 	return renderCustomerAIFile(parsed.file);
 }
 
 /**
- * 删除某封邮件的提醒。没有对应标记时原样返回，避免无意义地重写文件。
- * 区段删空后连同 `## 发送提醒` 标题一起移除；区段里还有用户内容或其他任务
- * 时保留标题。
+ * 删除某封邮件的全部提醒（主任务 + 渠道任务 + sent 标记）。
+ * 没有对应标记时原样返回，避免无意义地重写文件。
+ * 区段删空后连同 `## 发送提醒` 标题一起移除。
  */
 export function removeEmailReminderFromContent(
 	content: string,
@@ -198,14 +419,13 @@ export function removeEmailReminderFromContent(
 	const lines = parsed.file.trailing
 		? parsed.file.trailing.split("\n")
 		: [];
-	const markerIndex = findMarkerIndex(lines, reminderMarker(emailId));
-	if (markerIndex < 0) return content;
+	const doneMarker = reminderSentMarker(emailId);
+	const ranges = taskRanges(lines, (ref) => ref.emailId === emailId);
+	const hasOrphanDone = lines.some((line) => line.trim() === doneMarker);
+	if (ranges.length === 0 && !hasOrphanDone) return content;
 
-	const start = findTaskStart(lines, markerIndex);
-	let next = [
-		...lines.slice(0, start),
-		...lines.slice(markerIndex + 1),
-	];
+	let next = removeRanges(lines, ranges);
+	next = next.filter((line) => line.trim() !== doneMarker);
 
 	const section = findSection(next);
 	if (section) {
@@ -214,6 +434,70 @@ export function removeEmailReminderFromContent(
 			next = [...next.slice(0, section.start), ...next.slice(section.end)];
 		}
 	}
+
+	parsed.file.trailing = joinTrailing(next);
+	return renderCustomerAIFile(parsed.file);
+}
+
+/** 在已勾选的主任务标记下一行写入 sent 标记；幂等。 */
+export function markEmailReminderSentInContent(
+	content: string,
+	emailId: string,
+): string {
+	const parsed = parseCustomerAIFile(content);
+	const lines = parsed.file.trailing
+		? parsed.file.trailing.split("\n")
+		: [];
+	const doneMarker = reminderSentMarker(emailId);
+	if (lines.some((line) => line.trim() === doneMarker)) return content;
+
+	const ref = findMarkerRefs(lines).find(
+		(item) => item.kind === "email" && item.emailId === emailId,
+	);
+	if (!ref) return content;
+	const start = findTaskStart(lines, ref.index);
+	if (start < 0) return content;
+	if (!CHECKED_TASK_RE.test(lines[start] ?? "")) {
+		lines[start] = (lines[start] ?? "").replace(/^- \[ \] /, "- [x] ");
+	}
+
+	lines.splice(ref.index + 1, 0, doneMarker);
+	parsed.file.trailing = joinTrailing(lines);
+	return renderCustomerAIFile(parsed.file);
+}
+
+/**
+ * 把指定主任务恢复为未勾选，并移除 sent 标记。
+ *
+ * 用于取消确认框、或写客户属性失败后的回滚。已勾选但没有 sent 标记的
+ * 用户内容不受影响。
+ */
+export function uncheckEmailReminderInContent(
+	content: string,
+	emailId: string,
+): string {
+	const parsed = parseCustomerAIFile(content);
+	const lines = parsed.file.trailing
+		? parsed.file.trailing.split("\n")
+		: [];
+	const doneMarker = reminderSentMarker(emailId);
+	const ref = findMarkerRefs(lines).find(
+		(item) => item.kind === "email" && item.emailId === emailId,
+	);
+	let changed = false;
+	if (ref) {
+		const start = findTaskStart(lines, ref.index);
+		if (start >= 0) {
+			const line = lines[start] ?? "";
+			if (CHECKED_TASK_RE.test(line)) {
+				lines[start] = line.replace(/^- \[[xX]\] /, "- [ ] ");
+				changed = true;
+			}
+		}
+	}
+	const next = lines.filter((line) => line.trim() !== doneMarker);
+	if (next.length !== lines.length) changed = true;
+	if (!changed) return content;
 
 	parsed.file.trailing = joinTrailing(next);
 	return renderCustomerAIFile(parsed.file);

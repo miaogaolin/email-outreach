@@ -8,11 +8,18 @@ import {
 	analysisRecordToResult,
 	addEmailVersion,
 	currentEmailVersion,
+	emailHeadingText,
 	parseCustomerAIFile,
 	setEmailStatus,
 } from "../core/ai-file";
 import type { AILogEntry } from "../core/ai-log";
 import { findContactByEmail } from "../core/contact-parser";
+import {
+	CONTACT_LOG_FOLLOW_UP_KEY,
+	CONTACT_LOG_LAST_CONTACT_KEY,
+	planContactLog,
+} from "../core/contact-log";
+import { parseFollowUpCount } from "../core/follow-up";
 import {
 	collectPropertyKeys,
 	isExcluded,
@@ -28,6 +35,8 @@ import {
 	type GenerationIndex,
 } from "../core/generation";
 import {
+	AI_FILE_SUFFIX,
+	customerNameFromAIFile,
 	feedbackFilePath,
 	isoNow,
 	localStamp,
@@ -47,9 +56,14 @@ import {
 	type RuleDraft,
 } from "../core/prompt";
 import {
-	buildEmailReminder,
+	buildEmailReminders,
+	isLegacyReminderBlock,
+	listEmailReminderTasks,
+	markEmailReminderSentInContent,
 	removeEmailReminderFromContent,
-	upsertEmailReminderInContent,
+	uncheckEmailReminderInContent,
+	upsertEmailRemindersInContent,
+	type EmailReminderSet,
 } from "../core/reminder";
 import { summarizeRunStatuses, mergeDevStatuses } from "../core/run-status";
 import { parseJsonLoose, validateAIResult } from "../core/schema";
@@ -61,6 +75,7 @@ import type {
 	CustomerDevStatus,
 	CustomerRecord,
 	DevStatusMap,
+	EmailRecord,
 	EmailRow,
 	RunOutcome,
 	RunStatusFile,
@@ -141,6 +156,8 @@ export default class EmailOutreachPlugin
 	private devStatus: DevStatusMap = {};
 	private lastRunStatusFile: RunStatusFile | null = null;
 	private running = false;
+	private reminderCheckTimers = new Map<string, number>();
+	private reminderCheckInFlight = new Set<string>();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -209,6 +226,10 @@ export default class EmailOutreachPlugin
 		if (this.refreshTimer !== null) {
 			window.clearTimeout(this.refreshTimer);
 		}
+		for (const timer of this.reminderCheckTimers.values()) {
+			window.clearTimeout(timer);
+		}
+		this.reminderCheckTimers.clear();
 		if (this.selectionSaveTimer !== null) {
 			window.clearTimeout(this.selectionSaveTimer);
 			this.selectionSaveTimer = null;
@@ -222,6 +243,8 @@ export default class EmailOutreachPlugin
 		} catch (error) {
 			console.error("[email-outreach] 初始加载邮件失败", error);
 		}
+		// 旧版提醒只在加载时迁移一次；失败不影响后续启动/使用。
+		await this.migrateLegacyReminders();
 		// 修复历史空文件留下的「上次已生成」：启动时按当前文件状态清一次。
 		await this.clearStaleGeneratedStatuses();
 	}
@@ -314,6 +337,15 @@ export default class EmailOutreachPlugin
 				}
 			}),
 		);
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (!(file instanceof TFile)) return;
+				if (file.extension !== "md") return;
+				if (!this.isInside(file.path, this.settings.outputDir)) return;
+				if (!file.basename.includes(AI_FILE_SUFFIX)) return;
+				this.scheduleReminderCheck(file.path);
+			}),
+		);
 	}
 
 	private isInside(path: string, dir: string): boolean {
@@ -331,6 +363,18 @@ export default class EmailOutreachPlugin
 
 	private scheduleWorkbenchRefresh(): void {
 		window.setTimeout(() => this.refreshWorkbenchViews(), 600);
+	}
+
+	private scheduleReminderCheck(path: string): void {
+		const existing = this.reminderCheckTimers.get(path);
+		if (existing !== undefined) window.clearTimeout(existing);
+		const timer = window.setTimeout(() => {
+			this.reminderCheckTimers.delete(path);
+			void this.checkCheckedReminders(path).catch((error) => {
+				console.error("[email-outreach] 检查发送提醒失败", path, error);
+			});
+		}, 400);
+		this.reminderCheckTimers.set(path, timer);
 	}
 
 	// ---------------------------------------------------------------- settings
@@ -1146,16 +1190,17 @@ export default class EmailOutreachPlugin
 		}
 
 		const channels = await this.loadContactChannels(customer, row);
-		const reminder = buildEmailReminder({
+		const updated = setEmailStatus(row.record, "Accepted");
+		const reminders: EmailReminderSet = buildEmailReminders({
 			customerName: row.customerName,
-			emailId: row.record.id,
-			aiFilePath: row.filePath,
-			contact: row.record.contact,
-			email: row.record.email,
-			subject: row.record.subject,
-			summaryZh: row.record.summaryZh,
-			suggestedTime: row.record.suggestedTime,
-			timezone: row.record.timezone,
+			customerLink: link ?? row.customerName,
+			emailId: updated.id,
+			emailHeading: emailHeadingText(updated),
+			contact: updated.contact,
+			email: updated.email,
+			summaryZh: updated.summaryZh,
+			suggestedTime: updated.suggestedTime,
+			timezone: updated.timezone,
 			channels,
 		});
 
@@ -1166,16 +1211,20 @@ export default class EmailOutreachPlugin
 				container.createEl("p", {
 					text: "验收通过代表邮件内容审核通过，不代表已经发送。",
 				});
-				if (reminder) {
+				if (reminders.email) {
 					container.createEl("p", {
-						text: `会在 AI 开发信息文件生成发送提醒（北京时间 ${reminder.time}）。`,
+						text: `会在 AI 开发信息文件生成发送提醒（北京时间 ${reminders.email.time}）。`,
 					});
-					if (channels.length > 0) {
+					if (reminders.contact) {
 						container.createEl("p", {
 							cls: "eo-muted",
-							text: `联系人带 ${channels.length} 个 #Contact 渠道，会一起写入提醒。`,
+							text: "联系人带其它渠道，会另生成一条独立的渠道提醒。",
 						});
 					}
+					container.createEl("p", {
+						cls: "eo-muted",
+						text: "发送后勾选发送提醒主任务，会先弹出确认框；确认后才更新客户最近联系时间和跟进次数。",
+					});
 				} else {
 					container.createEl("p", {
 						cls: "eo-muted",
@@ -1203,12 +1252,12 @@ export default class EmailOutreachPlugin
 		});
 		if (!confirmed) return;
 
-		const updated = setEmailStatus(row.record, "Accepted");
+		const hasReminder = Boolean(reminders.email || reminders.contact);
 		let reminderError: string | null = null;
-		const transform = reminder
+		const transform = hasReminder
 			? (content: string): string => {
 					try {
-						return upsertEmailReminderInContent(content, reminder);
+						return upsertEmailRemindersInContent(content, reminders);
 					} catch (error) {
 						reminderError =
 							error instanceof Error ? error.message : String(error);
@@ -1235,18 +1284,296 @@ export default class EmailOutreachPlugin
 				);
 			}
 		}
-		if (!reminder) {
+		if (!hasReminder) {
 			messages.push("没有可用的建议发送时间，未生成提醒");
 		} else if (reminderError) {
 			messages.push(`发送提醒生成失败：${reminderError}`);
 		} else {
-			messages.push(`已生成发送提醒（北京时间 ${reminder.time}）`);
+			const time = reminders.email?.time;
+			messages.push(
+				time ? `已生成发送提醒（北京时间 ${time}）` : "已生成渠道提醒",
+			);
+			if (reminders.contact) messages.push("及独立的渠道提醒");
 		}
 		new Notice(messages.join("；"), reminderError ? 9000 : undefined);
 
 		this.repo.invalidate();
 		this.refreshWorkbenchViews();
 		await this.refreshEmailList();
+	}
+
+	/**
+	 * 把升级前已生成、仍未勾选的旧格式提醒转换为新格式。
+	 * 已勾选或已带 sent 标记的提醒保持原样，不参与自动更新。
+	 */
+	private async migrateLegacyReminders(): Promise<void> {
+		if (!this.settings.outputDir.trim()) return;
+		const files = this.adapter
+			.listMarkdown(this.settings.outputDir)
+			.filter((file) => file.basename.includes(AI_FILE_SUFFIX));
+		const warnings: string[] = [];
+		let migrated = 0;
+
+		for (const file of files) {
+			try {
+				const content = await this.adapter.read(file.path);
+				const parsed = parseCustomerAIFile(content);
+				const tasks = listEmailReminderTasks(content).filter(
+					(task) =>
+						task.kind === "email" &&
+						!task.checked &&
+						!task.done &&
+						isLegacyReminderBlock(task.block),
+				);
+				if (tasks.length === 0) continue;
+
+				const link = parsed.file.customerLink;
+				const customer = await this.resolveCustomer(file.path, link);
+				const fallbackName = customerNameFromAIFile(file.basename);
+				const customerName = customer?.name ?? fallbackName;
+				const contacts = customer
+					? (await this.repo.load(customer, 500)).contacts.contacts
+					: [];
+				let updated = content;
+				let changed = false;
+				let fileMigrated = 0;
+
+				for (const task of tasks) {
+					const record = parsed.file.emails.find(
+						(item) => item.id === task.emailId,
+					);
+					if (!record || record.status !== "Accepted") {
+						warnings.push(
+							`${file.path} · 邮件 ${task.emailId}：没有可迁移的已验收邮件`,
+						);
+						continue;
+					}
+					const contact = findContactByEmail(
+						contacts,
+						record.email,
+						record.contact,
+					);
+					const channels = contact?.channels ?? [];
+					if (
+						channels.length === 0 &&
+						/^\s+- #Contact\//m.test(task.block)
+					) {
+						warnings.push(
+							`${file.path} · 邮件 ${task.emailId}：无法解析联系人渠道，保留旧提醒`,
+						);
+						continue;
+					}
+					const reminders = buildEmailReminders({
+						customerName,
+						customerLink: link || fallbackName,
+						emailId: record.id,
+						emailHeading: emailHeadingText(record),
+						contact: record.contact,
+						email: record.email,
+						summaryZh: record.summaryZh,
+						suggestedTime: record.suggestedTime,
+						timezone: record.timezone,
+						channels,
+					});
+					if (!reminders.email) {
+						warnings.push(
+							`${file.path} · 邮件 ${task.emailId}：建议发送时间无效，保留旧提醒`,
+						);
+						continue;
+					}
+					updated = upsertEmailRemindersInContent(updated, reminders);
+					changed = true;
+					fileMigrated++;
+				}
+
+				if (changed && updated !== content) {
+					await this.adapter.write(file.path, updated);
+					migrated += fileMigrated;
+				}
+			} catch (error) {
+				console.error(
+					"[email-outreach] 迁移旧发送提醒失败",
+					file.path,
+					error,
+				);
+				warnings.push(`${file.path}：迁移失败`);
+			}
+		}
+
+		if (warnings.length > 0) {
+			console.warn("[email-outreach] 旧发送提醒迁移提示", warnings);
+		}
+		if (migrated > 0) {
+			await this.emailStore.refresh();
+			this.refreshWorkbenchViews();
+			new Notice(`已转换 ${migrated} 条旧格式发送提醒`);
+		}
+	}
+
+	/** 文件里的主任务被勾选后，弹确认框并更新客户联系记录。 */
+	private async checkCheckedReminders(path: string): Promise<void> {
+		if (!this.settings.outputDir.trim()) return;
+		let content: string;
+		try {
+			content = await this.adapter.read(path);
+		} catch {
+			return;
+		}
+		const parsed = parseCustomerAIFile(content);
+		const candidates = listEmailReminderTasks(content).filter(
+			(task) =>
+				task.kind === "email" &&
+				task.checked &&
+				!task.done &&
+				!isLegacyReminderBlock(task.block),
+		);
+		for (const task of candidates) {
+			const key = `${path}\u0000${task.emailId}`;
+			if (this.reminderCheckInFlight.has(key)) continue;
+			const record = parsed.file.emails.find(
+				(item) => item.id === task.emailId,
+			);
+			if (!record || record.status !== "Accepted") continue;
+			this.reminderCheckInFlight.add(key);
+			try {
+				const keepGoing = await this.handleCheckedReminder(
+					path,
+					record,
+					parsed.file.customerLink,
+				);
+				if (!keepGoing) break;
+			} finally {
+				this.reminderCheckInFlight.delete(key);
+			}
+		}
+	}
+
+	private async handleCheckedReminder(
+		path: string,
+		record: EmailRecord,
+		customerLink: string,
+	): Promise<boolean> {
+		let content: string;
+		try {
+			content = await this.adapter.read(path);
+		} catch {
+			return true;
+		}
+		const task = listEmailReminderTasks(content).find(
+			(item) =>
+				item.kind === "email" &&
+				item.emailId === record.id &&
+				item.checked &&
+				!item.done &&
+				!isLegacyReminderBlock(item.block),
+		);
+		if (!task) return true;
+
+		const customer = await this.resolveCustomer(path, customerLink);
+		if (!customer) {
+			new Notice(`找不到客户文件，未更新联系记录：邮件 ${record.id}`);
+			await this.restoreReminderUnchecked(path, record.id);
+			return true;
+		}
+
+		const now = new Date();
+		const currentCount = parseFollowUpCount(
+			customer.fm[CONTACT_LOG_FOLLOW_UP_KEY],
+		);
+		const planned = planContactLog(customer.fm, now);
+		const rawLast = customer.fm[CONTACT_LOG_LAST_CONTACT_KEY];
+		const lastText =
+			rawLast === undefined ||
+			rawLast === null ||
+			String(rawLast).trim() === ""
+				? "（空）"
+				: String(rawLast);
+		const confirmed = await confirm(this.app, {
+			title: "确认已发送？",
+			confirmText: "确认已发送",
+			build: (container) => {
+				container.createEl("p", { text: `客户：${customer.name}` });
+				container.createEl("p", {
+					text: `邮件：${record.id} · ${record.contact || record.email || "（无联系人）"}`,
+				});
+				container.createEl("p", {
+					text: `最近联系时间：${lastText} → ${planned.lastContact}`,
+				});
+				container.createEl("p", {
+					text: `跟进次数：${currentCount} → ${currentCount + 1}`,
+				});
+				container.createEl("p", {
+					cls: "eo-muted",
+					text: "勾选只表示准备发送，确认后才更新客户记录；取消会恢复未勾选。",
+				});
+			},
+		});
+		if (!confirmed) {
+			await this.restoreReminderUnchecked(path, record.id);
+			return false;
+		}
+
+		// 先写 sent 标记，避免同一任务在保存期间再次弹确认。
+		try {
+			const latest = await this.adapter.read(path);
+			const stillPending = listEmailReminderTasks(latest).some(
+				(item) =>
+					item.kind === "email" &&
+					item.emailId === record.id &&
+					item.checked &&
+					!item.done,
+			);
+			if (!stillPending) return true;
+			const withSent = markEmailReminderSentInContent(latest, record.id);
+			if (withSent !== latest) {
+				await this.adapter.write(path, withSent);
+			}
+		} catch (error) {
+			console.error("[email-outreach] 写入发送标记失败", error);
+			await this.restoreReminderUnchecked(path, record.id);
+			new Notice("写入发送标记失败，未更新客户联系记录");
+			return true;
+		}
+
+		try {
+			await this.adapter.updateFrontmatter(customer.path, (frontmatter) => {
+				frontmatter[CONTACT_LOG_LAST_CONTACT_KEY] = planned.lastContact;
+				frontmatter[CONTACT_LOG_FOLLOW_UP_KEY] =
+					parseFollowUpCount(
+						frontmatter[CONTACT_LOG_FOLLOW_UP_KEY],
+					) + 1;
+			});
+		} catch (error) {
+			console.error("[email-outreach] 更新客户联系记录失败", error);
+			await this.restoreReminderUnchecked(path, record.id);
+			new Notice(
+				`更新客户联系记录失败：${error instanceof Error ? error.message : String(error)}`,
+				9000,
+			);
+			return true;
+		}
+
+		new Notice(
+			`已记录发送：最近联系时间 ${planned.lastContact}；跟进次数 ${planned.followUpCount}`,
+		);
+		this.repo.invalidate();
+		this.refreshWorkbenchViews();
+		await this.refreshEmailList();
+		return true;
+	}
+
+	private async restoreReminderUnchecked(
+		path: string,
+		emailId: string,
+	): Promise<void> {
+		try {
+			const content = await this.adapter.read(path);
+			const next = uncheckEmailReminderInContent(content, emailId);
+			if (next !== content) await this.adapter.write(path, next);
+		} catch (error) {
+			console.error("[email-outreach] 恢复发送提醒失败", error);
+			new Notice("恢复发送提醒失败，请手动取消勾选", 9000);
+		}
 	}
 
 	async rejectEmail(row: EmailRow): Promise<void> {
