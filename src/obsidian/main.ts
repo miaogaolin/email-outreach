@@ -244,7 +244,11 @@ export default class EmailOutreachPlugin
 			console.error("[email-outreach] 初始加载邮件失败", error);
 		}
 		// 旧版提醒只在加载时迁移一次；失败不影响后续启动/使用。
-		await this.migrateLegacyReminders();
+		try {
+			await this.migrateLegacyReminders();
+		} catch (error) {
+			console.error("[email-outreach] 旧发送提醒迁移失败", error);
+		}
 		// 修复历史空文件留下的「上次已生成」：启动时按当前文件状态清一次。
 		await this.clearStaleGeneratedStatuses();
 	}
