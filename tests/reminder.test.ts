@@ -9,6 +9,7 @@ import {
 } from "../src/core/ai-file";
 import {
 	buildEmailReminders,
+	cleanupOrphanReminderMarkersInContent,
 	isLegacyReminderBlock,
 	listEmailReminderTasks,
 	markEmailReminderSentInContent,
@@ -376,5 +377,37 @@ test("旧格式识别", () => {
 			].join("\n"),
 		),
 		"纯文本降级不误判",
+	);
+});
+
+test("清理没有对应任务的孤立标记", () => {
+	const orphan = `${emailContent()}\n## 发送提醒\n\n \n<!-- eo-reminder: 001 -->\n\n<!-- eo-reminder-sent: 001 -->\n\n<!-- eo-reminder-contact: 002 -->\n`;
+	const cleaned = cleanupOrphanReminderMarkersInContent(orphan);
+	assert(!cleaned.includes("eo-reminder: 001"), "孤立主标记已清理");
+	assert(!cleaned.includes("eo-reminder-sent: 001"), "孤立 sent 标记已清理");
+	assert(!cleaned.includes("eo-reminder-contact: 002"), "孤立渠道标记已清理");
+	assert(!cleaned.includes("## 发送提醒"), "空区段标题已移除");
+	assert(cleaned.includes("A qualified second source"), "邮件内容保留");
+
+	const valid = withReminders();
+	assertEqual(cleanupOrphanReminderMarkersInContent(valid), valid, "有效任务不变");
+});
+
+test("删除/重新写入时不会留下孤立标记", () => {
+	const orphan = `${emailContent()}\n## 发送提醒\n\n<!-- eo-reminder: 001 -->\n`;
+	const removed = removeEmailReminderFromContent(orphan, "001");
+	assert(!removed.includes("eo-reminder: 001"), "删除清理孤立标记");
+	assert(!removed.includes("## 发送提醒"), "清理空区段");
+
+	const rewritten = upsertEmailRemindersInContent(
+		orphan,
+		buildEmailReminders(input()),
+	);
+	const tasks = listEmailReminderTasks(rewritten);
+	assertEqual(tasks.length, 2, "重建主任务与渠道任务");
+	assertEqual(
+		rewritten.match(/<!-- eo-reminder: 001 -->/g)?.length ?? 0,
+		1,
+		"主标记不重复",
 	);
 });

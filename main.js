@@ -1071,55 +1071,57 @@ class EmailOutreachPlugin extends obsidian_1.Plugin {
         for (const file of files) {
             try {
                 const content = await this.adapter.read(file.path);
-                const parsed = (0, ai_file_1.parseCustomerAIFile)(content);
-                const tasks = (0, reminder_1.listEmailReminderTasks)(content).filter((task) => task.kind === "email" &&
+                // 用户手动删除任务行后可能留下孤立标记；先清掉，再处理旧格式转换。
+                const cleaned = (0, reminder_1.cleanupOrphanReminderMarkersInContent)(content);
+                const parsed = (0, ai_file_1.parseCustomerAIFile)(cleaned);
+                const tasks = (0, reminder_1.listEmailReminderTasks)(cleaned).filter((task) => task.kind === "email" &&
                     !task.checked &&
                     !task.done &&
                     (0, reminder_1.isLegacyReminderBlock)(task.block));
-                if (tasks.length === 0)
-                    continue;
-                const link = parsed.file.customerLink;
-                const customer = await this.resolveCustomer(file.path, link);
-                const fallbackName = (0, filenames_1.customerNameFromAIFile)(file.basename);
-                const customerName = (_a = customer === null || customer === void 0 ? void 0 : customer.name) !== null && _a !== void 0 ? _a : fallbackName;
-                const contacts = customer
-                    ? (await this.repo.load(customer, 500)).contacts.contacts
-                    : [];
-                let updated = content;
-                let changed = false;
+                let updated = cleaned;
+                let changed = cleaned !== content;
                 let fileMigrated = 0;
-                for (const task of tasks) {
-                    const record = parsed.file.emails.find((item) => item.id === task.emailId);
-                    if (!record || record.status !== "Accepted") {
-                        warnings.push(`${file.path} · 邮件 ${task.emailId}：没有可迁移的已验收邮件`);
-                        continue;
+                if (tasks.length > 0) {
+                    const link = parsed.file.customerLink;
+                    const customer = await this.resolveCustomer(file.path, link);
+                    const fallbackName = (0, filenames_1.customerNameFromAIFile)(file.basename);
+                    const customerName = (_a = customer === null || customer === void 0 ? void 0 : customer.name) !== null && _a !== void 0 ? _a : fallbackName;
+                    const contacts = customer
+                        ? (await this.repo.load(customer, 500)).contacts.contacts
+                        : [];
+                    for (const task of tasks) {
+                        const record = parsed.file.emails.find((item) => item.id === task.emailId);
+                        if (!record || record.status !== "Accepted") {
+                            warnings.push(`${file.path} · 邮件 ${task.emailId}：没有可迁移的已验收邮件`);
+                            continue;
+                        }
+                        const contact = (0, contact_parser_1.findContactByEmail)(contacts, record.email, record.contact);
+                        const channels = (_b = contact === null || contact === void 0 ? void 0 : contact.channels) !== null && _b !== void 0 ? _b : [];
+                        if (channels.length === 0 &&
+                            /^\s+- #Contact\//m.test(task.block)) {
+                            warnings.push(`${file.path} · 邮件 ${task.emailId}：无法解析联系人渠道，保留旧提醒`);
+                            continue;
+                        }
+                        const reminders = (0, reminder_1.buildEmailReminders)({
+                            customerName,
+                            customerLink: link || fallbackName,
+                            emailId: record.id,
+                            emailHeading: (0, ai_file_1.emailHeadingText)(record),
+                            contact: record.contact,
+                            email: record.email,
+                            summaryZh: record.summaryZh,
+                            suggestedTime: record.suggestedTime,
+                            timezone: record.timezone,
+                            channels,
+                        });
+                        if (!reminders.email) {
+                            warnings.push(`${file.path} · 邮件 ${task.emailId}：建议发送时间无效，保留旧提醒`);
+                            continue;
+                        }
+                        updated = (0, reminder_1.upsertEmailRemindersInContent)(updated, reminders);
+                        changed = true;
+                        fileMigrated++;
                     }
-                    const contact = (0, contact_parser_1.findContactByEmail)(contacts, record.email, record.contact);
-                    const channels = (_b = contact === null || contact === void 0 ? void 0 : contact.channels) !== null && _b !== void 0 ? _b : [];
-                    if (channels.length === 0 &&
-                        /^\s+- #Contact\//m.test(task.block)) {
-                        warnings.push(`${file.path} · 邮件 ${task.emailId}：无法解析联系人渠道，保留旧提醒`);
-                        continue;
-                    }
-                    const reminders = (0, reminder_1.buildEmailReminders)({
-                        customerName,
-                        customerLink: link || fallbackName,
-                        emailId: record.id,
-                        emailHeading: (0, ai_file_1.emailHeadingText)(record),
-                        contact: record.contact,
-                        email: record.email,
-                        summaryZh: record.summaryZh,
-                        suggestedTime: record.suggestedTime,
-                        timezone: record.timezone,
-                        channels,
-                    });
-                    if (!reminders.email) {
-                        warnings.push(`${file.path} · 邮件 ${task.emailId}：建议发送时间无效，保留旧提醒`);
-                        continue;
-                    }
-                    updated = (0, reminder_1.upsertEmailRemindersInContent)(updated, reminders);
-                    changed = true;
-                    fileMigrated++;
                 }
                 if (changed && updated !== content) {
                     await this.adapter.write(file.path, updated);
@@ -5176,6 +5178,7 @@ exports.reminderMarker = reminderMarker;
 exports.contactReminderMarker = contactReminderMarker;
 exports.reminderSentMarker = reminderSentMarker;
 exports.buildEmailReminders = buildEmailReminders;
+exports.cleanupOrphanReminderMarkersInContent = cleanupOrphanReminderMarkersInContent;
 exports.listEmailReminderTasks = listEmailReminderTasks;
 exports.isLegacyReminderBlock = isLegacyReminderBlock;
 exports.upsertEmailRemindersInContent = upsertEmailRemindersInContent;
@@ -5399,6 +5402,56 @@ function hasDoneMarker(lines, emailId) {
 function joinTrailing(lines) {
     return lines.join("\n").trim();
 }
+/**
+ * 清理没有对应任务的孤立标记。
+ *
+ * 用户手动删除任务行时，隐藏标记可能残留；它们不再对应任何任务，
+ * 留着只会干扰后续 upsert/删除。只清理插件自己写的标记，不动用户内容。
+ */
+function cleanupOrphanReminderMarkersInContent(content) {
+    var _a;
+    const parsed = (0, ai_file_1.parseCustomerAIFile)(content);
+    const lines = parsed.file.trailing
+        ? parsed.file.trailing.split("\n")
+        : [];
+    const emailIdsWithTask = new Set();
+    const orphanMarkerIndexes = new Set();
+    for (const ref of findMarkerRefs(lines)) {
+        const start = findTaskStart(lines, ref.index);
+        if (start < 0) {
+            orphanMarkerIndexes.add(ref.index);
+            continue;
+        }
+        if (ref.kind === "email")
+            emailIdsWithTask.add(ref.emailId);
+    }
+    let changed = false;
+    let next = [];
+    for (let index = 0; index < lines.length; index++) {
+        if (orphanMarkerIndexes.has(index)) {
+            changed = true;
+            continue;
+        }
+        const line = (_a = lines[index]) !== null && _a !== void 0 ? _a : "";
+        const doneId = markerId(line, DONE_MARKER_PREFIX);
+        if (doneId && !emailIdsWithTask.has(doneId)) {
+            changed = true;
+            continue;
+        }
+        next.push(line);
+    }
+    if (!changed)
+        return content;
+    const section = findSection(next);
+    if (section) {
+        const body = next.slice(section.start + 1, section.end);
+        if (body.every((line) => line.trim() === "")) {
+            next = [...next.slice(0, section.start), ...next.slice(section.end)];
+        }
+    }
+    parsed.file.trailing = joinTrailing(next);
+    return (0, ai_file_1.renderCustomerAIFile)(parsed.file);
+}
 /** 列出 trailing 里的发送提醒任务；已勾选/已处理状态也一并返回。 */
 function listEmailReminderTasks(content) {
     var _a;
@@ -5499,8 +5552,16 @@ function upsertEmailRemindersInContent(content, set) {
     const wasDone = hasDoneMarker(lines, emailId);
     const ranges = taskRanges(lines, (ref) => ref.emailId === emailId);
     let next = removeRanges(lines, ranges);
+    const emailMarker = reminderMarker(emailId);
+    const contactMarker = contactReminderMarker(emailId);
     const doneMarker = reminderSentMarker(emailId);
-    next = next.filter((line) => line.trim() !== doneMarker);
+    // 任务被手动删除时标记可能残留，先按 ID 清掉所有插件标记再重建。
+    next = next.filter((line) => {
+        const trimmed = line.trim();
+        return (trimmed !== emailMarker &&
+            trimmed !== contactMarker &&
+            trimmed !== doneMarker);
+    });
     const blocks = [];
     if (set.email) {
         let block = set.email.block;
@@ -5525,13 +5586,25 @@ function removeEmailReminderFromContent(content, emailId) {
     const lines = parsed.file.trailing
         ? parsed.file.trailing.split("\n")
         : [];
+    const emailMarker = reminderMarker(emailId);
+    const contactMarker = contactReminderMarker(emailId);
     const doneMarker = reminderSentMarker(emailId);
     const ranges = taskRanges(lines, (ref) => ref.emailId === emailId);
-    const hasOrphanDone = lines.some((line) => line.trim() === doneMarker);
-    if (ranges.length === 0 && !hasOrphanDone)
+    const hasMarker = lines.some((line) => {
+        const trimmed = line.trim();
+        return (trimmed === emailMarker ||
+            trimmed === contactMarker ||
+            trimmed === doneMarker);
+    });
+    if (ranges.length === 0 && !hasMarker)
         return content;
     let next = removeRanges(lines, ranges);
-    next = next.filter((line) => line.trim() !== doneMarker);
+    next = next.filter((line) => {
+        const trimmed = line.trim();
+        return (trimmed !== emailMarker &&
+            trimmed !== contactMarker &&
+            trimmed !== doneMarker);
+    });
     const section = findSection(next);
     if (section) {
         const body = next.slice(section.start + 1, section.end);

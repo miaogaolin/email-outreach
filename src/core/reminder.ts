@@ -289,6 +289,57 @@ function joinTrailing(lines: string[]): string {
 	return lines.join("\n").trim();
 }
 
+/**
+ * 清理没有对应任务的孤立标记。
+ *
+ * 用户手动删除任务行时，隐藏标记可能残留；它们不再对应任何任务，
+ * 留着只会干扰后续 upsert/删除。只清理插件自己写的标记，不动用户内容。
+ */
+export function cleanupOrphanReminderMarkersInContent(content: string): string {
+	const parsed = parseCustomerAIFile(content);
+	const lines = parsed.file.trailing
+		? parsed.file.trailing.split("\n")
+		: [];
+	const emailIdsWithTask = new Set<string>();
+	const orphanMarkerIndexes = new Set<number>();
+	for (const ref of findMarkerRefs(lines)) {
+		const start = findTaskStart(lines, ref.index);
+		if (start < 0) {
+			orphanMarkerIndexes.add(ref.index);
+			continue;
+		}
+		if (ref.kind === "email") emailIdsWithTask.add(ref.emailId);
+	}
+
+	let changed = false;
+	let next: string[] = [];
+	for (let index = 0; index < lines.length; index++) {
+		if (orphanMarkerIndexes.has(index)) {
+			changed = true;
+			continue;
+		}
+		const line = lines[index] ?? "";
+		const doneId = markerId(line, DONE_MARKER_PREFIX);
+		if (doneId && !emailIdsWithTask.has(doneId)) {
+			changed = true;
+			continue;
+		}
+		next.push(line);
+	}
+	if (!changed) return content;
+
+	const section = findSection(next);
+	if (section) {
+		const body = next.slice(section.start + 1, section.end);
+		if (body.every((line) => line.trim() === "")) {
+			next = [...next.slice(0, section.start), ...next.slice(section.end)];
+		}
+	}
+
+	parsed.file.trailing = joinTrailing(next);
+	return renderCustomerAIFile(parsed.file);
+}
+
 /** 列出 trailing 里的发送提醒任务；已勾选/已处理状态也一并返回。 */
 export function listEmailReminderTasks(content: string): ReminderTaskInfo[] {
 	const parsed = parseCustomerAIFile(content);
@@ -388,8 +439,18 @@ export function upsertEmailRemindersInContent(
 	const wasDone = hasDoneMarker(lines, emailId);
 	const ranges = taskRanges(lines, (ref) => ref.emailId === emailId);
 	let next = removeRanges(lines, ranges);
+	const emailMarker = reminderMarker(emailId);
+	const contactMarker = contactReminderMarker(emailId);
 	const doneMarker = reminderSentMarker(emailId);
-	next = next.filter((line) => line.trim() !== doneMarker);
+	// 任务被手动删除时标记可能残留，先按 ID 清掉所有插件标记再重建。
+	next = next.filter((line) => {
+		const trimmed = line.trim();
+		return (
+			trimmed !== emailMarker &&
+			trimmed !== contactMarker &&
+			trimmed !== doneMarker
+		);
+	});
 
 	const blocks: string[] = [];
 	if (set.email) {
@@ -419,13 +480,29 @@ export function removeEmailReminderFromContent(
 	const lines = parsed.file.trailing
 		? parsed.file.trailing.split("\n")
 		: [];
+	const emailMarker = reminderMarker(emailId);
+	const contactMarker = contactReminderMarker(emailId);
 	const doneMarker = reminderSentMarker(emailId);
 	const ranges = taskRanges(lines, (ref) => ref.emailId === emailId);
-	const hasOrphanDone = lines.some((line) => line.trim() === doneMarker);
-	if (ranges.length === 0 && !hasOrphanDone) return content;
+	const hasMarker = lines.some((line) => {
+		const trimmed = line.trim();
+		return (
+			trimmed === emailMarker ||
+			trimmed === contactMarker ||
+			trimmed === doneMarker
+		);
+	});
+	if (ranges.length === 0 && !hasMarker) return content;
 
 	let next = removeRanges(lines, ranges);
-	next = next.filter((line) => line.trim() !== doneMarker);
+	next = next.filter((line) => {
+		const trimmed = line.trim();
+		return (
+			trimmed !== emailMarker &&
+			trimmed !== contactMarker &&
+			trimmed !== doneMarker
+		);
+	});
 
 	const section = findSection(next);
 	if (section) {

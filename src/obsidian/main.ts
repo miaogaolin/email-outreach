@@ -57,6 +57,7 @@ import {
 } from "../core/prompt";
 import {
 	buildEmailReminders,
+	cleanupOrphanReminderMarkersInContent,
 	isLegacyReminderBlock,
 	listEmailReminderTasks,
 	markEmailReminderSentInContent,
@@ -1321,73 +1322,76 @@ export default class EmailOutreachPlugin
 		for (const file of files) {
 			try {
 				const content = await this.adapter.read(file.path);
-				const parsed = parseCustomerAIFile(content);
-				const tasks = listEmailReminderTasks(content).filter(
+				// 用户手动删除任务行后可能留下孤立标记；先清掉，再处理旧格式转换。
+				const cleaned = cleanupOrphanReminderMarkersInContent(content);
+				const parsed = parseCustomerAIFile(cleaned);
+				const tasks = listEmailReminderTasks(cleaned).filter(
 					(task) =>
 						task.kind === "email" &&
 						!task.checked &&
 						!task.done &&
 						isLegacyReminderBlock(task.block),
 				);
-				if (tasks.length === 0) continue;
-
-				const link = parsed.file.customerLink;
-				const customer = await this.resolveCustomer(file.path, link);
-				const fallbackName = customerNameFromAIFile(file.basename);
-				const customerName = customer?.name ?? fallbackName;
-				const contacts = customer
-					? (await this.repo.load(customer, 500)).contacts.contacts
-					: [];
-				let updated = content;
-				let changed = false;
+				let updated = cleaned;
+				let changed = cleaned !== content;
 				let fileMigrated = 0;
 
-				for (const task of tasks) {
-					const record = parsed.file.emails.find(
-						(item) => item.id === task.emailId,
-					);
-					if (!record || record.status !== "Accepted") {
-						warnings.push(
-							`${file.path} · 邮件 ${task.emailId}：没有可迁移的已验收邮件`,
+				if (tasks.length > 0) {
+					const link = parsed.file.customerLink;
+					const customer = await this.resolveCustomer(file.path, link);
+					const fallbackName = customerNameFromAIFile(file.basename);
+					const customerName = customer?.name ?? fallbackName;
+					const contacts = customer
+						? (await this.repo.load(customer, 500)).contacts.contacts
+						: [];
+
+					for (const task of tasks) {
+						const record = parsed.file.emails.find(
+							(item) => item.id === task.emailId,
 						);
-						continue;
-					}
-					const contact = findContactByEmail(
-						contacts,
-						record.email,
-						record.contact,
-					);
-					const channels = contact?.channels ?? [];
-					if (
-						channels.length === 0 &&
-						/^\s+- #Contact\//m.test(task.block)
-					) {
-						warnings.push(
-							`${file.path} · 邮件 ${task.emailId}：无法解析联系人渠道，保留旧提醒`,
+						if (!record || record.status !== "Accepted") {
+							warnings.push(
+								`${file.path} · 邮件 ${task.emailId}：没有可迁移的已验收邮件`,
+							);
+							continue;
+						}
+						const contact = findContactByEmail(
+							contacts,
+							record.email,
+							record.contact,
 						);
-						continue;
+						const channels = contact?.channels ?? [];
+						if (
+							channels.length === 0 &&
+							/^\s+- #Contact\//m.test(task.block)
+						) {
+							warnings.push(
+								`${file.path} · 邮件 ${task.emailId}：无法解析联系人渠道，保留旧提醒`,
+							);
+							continue;
+						}
+						const reminders = buildEmailReminders({
+							customerName,
+							customerLink: link || fallbackName,
+							emailId: record.id,
+							emailHeading: emailHeadingText(record),
+							contact: record.contact,
+							email: record.email,
+							summaryZh: record.summaryZh,
+							suggestedTime: record.suggestedTime,
+							timezone: record.timezone,
+							channels,
+						});
+						if (!reminders.email) {
+							warnings.push(
+								`${file.path} · 邮件 ${task.emailId}：建议发送时间无效，保留旧提醒`,
+							);
+							continue;
+						}
+						updated = upsertEmailRemindersInContent(updated, reminders);
+						changed = true;
+						fileMigrated++;
 					}
-					const reminders = buildEmailReminders({
-						customerName,
-						customerLink: link || fallbackName,
-						emailId: record.id,
-						emailHeading: emailHeadingText(record),
-						contact: record.contact,
-						email: record.email,
-						summaryZh: record.summaryZh,
-						suggestedTime: record.suggestedTime,
-						timezone: record.timezone,
-						channels,
-					});
-					if (!reminders.email) {
-						warnings.push(
-							`${file.path} · 邮件 ${task.emailId}：建议发送时间无效，保留旧提醒`,
-						);
-						continue;
-					}
-					updated = upsertEmailRemindersInContent(updated, reminders);
-					changed = true;
-					fileMigrated++;
 				}
 
 				if (changed && updated !== content) {

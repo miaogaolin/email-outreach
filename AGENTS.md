@@ -56,7 +56,7 @@ node scripts/smoke-load.cjs
 - 邮件状态只有 `Generated` / `Accepted` / `Rejected`；旧文件里的 `Revision` 在解析时归一化为 `Generated`。
 - 验收通过时在 AI 文件末尾维护 `## 发送提醒` 区段：`src/core/reminder.ts` 的 `buildEmailReminders` / `upsertEmailRemindersInContent` / `removeEmailReminderFromContent`；主任务用同文件标题链接 `[[#邮件 NNN · 联系人 · 状态]]`，时间用 `(@YYYY-MM-DD HH:mm)`（北京时间），并用 `<!-- eo-reminder: ID -->` 幂等关联邮件。
 - 联系人 `#Contact/...` 渠道由 `src/core/contact-parser.ts` 解析到 `Contact.channels`；提醒里用独立的其它渠道任务 `<!-- eo-reminder-contact: ID -->`，标签经 `src/core/channel-labels.ts` 转成可读名称（WA → WhatsApp），内容原样展示。
-- 插件加载时自动把未勾选的旧格式提醒迁移成新格式；已勾选/已带 sent 标记的提醒保持原样。勾选新格式主任务会弹确认框，确认后经 `adapter.updateFrontmatter` 写 `最近联系时间`（`YYYY-MM-DD`）和 `跟进次数 + 1`，并写 `<!-- eo-reminder-sent: ID -->` 防重复。
+- 插件加载时自动把未勾选的旧格式提醒迁移成新格式，并用 `cleanupOrphanReminderMarkersInContent` 清理没有对应任务的孤立标记；已勾选/已带 sent 标记的提醒保持原样。勾选新格式主任务会弹确认框，确认后经 `adapter.updateFrontmatter` 写 `最近联系时间`（`YYYY-MM-DD`）和 `跟进次数 + 1`，并写 `<!-- eo-reminder-sent: ID -->` 防重复。
 - 不写 `customer_path`；客户定位只用 `customer: "[[...]]"`。
 - 旧 AI 文件的分析区段仍按原格式解析；新生成不再写分析字段。
 - `email_summary_zh` 必须简体中文，30–60 字仅告警、不拦截。
