@@ -1,6 +1,7 @@
 node_modules/
 .test-build/
 .npm-cache/
+.dsh/
 data.json
 .write-probe
 *.tmpdir/
